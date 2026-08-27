@@ -6,6 +6,22 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def service_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Provide deterministic dummy service configuration for isolated unit tests."""
+    values = {
+        "POSTGRES_DATABASE": "testdb",
+        "POSTGRES_HOST": "localhost",
+        "POSTGRES_PASSWORD": "test-password",
+        "POSTGRES_USERNAME": "test-user",
+        "RABBITMQ_HOST": "localhost",
+        "RABBITMQ_PASSWORD": "guest",
+        "RABBITMQ_USERNAME": "guest",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+
+
 @pytest.fixture
 def mock_async_pool():
     """Mock AsyncPostgreSQLPool with async context manager support.

@@ -42,6 +42,7 @@ from brainztableinator.catalog_contract import (
 )
 from brainztableinator.config import BrainztableinatorConfig
 
+
 logger = structlog.get_logger(__name__)
 
 # Config will be initialized in main
@@ -83,13 +84,9 @@ current_progress = 0.0
 
 # Consumer management
 consumer_tags: dict[str, str] = {}  # {"artists": "consumer-tag-123", ...}
-consumer_cancel_tasks: dict[
-    str, asyncio.Task[None]
-] = {}  # {"artists": asyncio.Task, ...}
+consumer_cancel_tasks: dict[str, asyncio.Task[None]] = {}  # {"artists": asyncio.Task, ...}
 queues: dict[str, Any] = {}  # {"artists": queue_object, ...}
-CONSUMER_CANCEL_DELAY = int(
-    os.environ.get("CONSUMER_CANCEL_DELAY", "300")
-)  # Default 5 minutes
+CONSUMER_CANCEL_DELAY = int(os.environ.get("CONSUMER_CANCEL_DELAY", "300"))  # Default 5 minutes
 
 # Periodic queue checking settings
 QUEUE_CHECK_INTERVAL = int(
@@ -97,17 +94,11 @@ QUEUE_CHECK_INTERVAL = int(
 )  # Default 1 hour - how often to check for new messages when connection is closed
 
 # Interval for checking stuck state (consumers died unexpectedly)
-STUCK_CHECK_INTERVAL = int(
-    os.environ.get("STUCK_CHECK_INTERVAL", "30")
-)  # Default 30 seconds - how often to check for stuck state
+STUCK_CHECK_INTERVAL = int(os.environ.get("STUCK_CHECK_INTERVAL", "30"))  # Default 30 seconds - how often to check for stuck state
 
 # Idle mode settings - reduce log noise when no messages arrive after startup
-STARTUP_IDLE_TIMEOUT = int(
-    os.environ.get("STARTUP_IDLE_TIMEOUT", "30")
-)  # Seconds after startup with no messages before entering idle mode
-IDLE_LOG_INTERVAL = int(
-    os.environ.get("IDLE_LOG_INTERVAL", "300")
-)  # 5 min between idle status logs
+STARTUP_IDLE_TIMEOUT = int(os.environ.get("STARTUP_IDLE_TIMEOUT", "30"))  # Seconds after startup with no messages before entering idle mode
+IDLE_LOG_INTERVAL = int(os.environ.get("IDLE_LOG_INTERVAL", "300"))  # 5 min between idle status logs
 
 # Idle mode state
 idle_mode = False
@@ -122,9 +113,7 @@ connection_pool: AsyncPostgreSQLPool | None = None
 rabbitmq_manager: Any = None  # Will hold AsyncResilientRabbitMQ instance
 active_connection: Any = None  # Current active connection
 active_channel: Any = None  # Current active channel
-connection_check_task: asyncio.Task[None] | None = (
-    None  # Background task for periodic queue checks
-)
+connection_check_task: asyncio.Task[None] | None = None  # Background task for periodic queue checks
 
 
 def get_health_data() -> dict[str, Any]:
@@ -225,10 +214,8 @@ async def schedule_consumer_cancellation(data_type: str, queue: Any) -> None:
                 if await check_all_consumers_idle():
                     logger.info("🔧 All consumers idle, closing RabbitMQ connection")
                     await close_rabbitmq_connection()
-        except Exception as e:  # noqa: BLE001 - consumer cancellation is best-effort
-            logger.error(
-                "❌ Failed to cancel consumer", data_type=data_type, error=str(e)
-            )
+        except Exception as e:
+            logger.error("❌ Failed to cancel consumer", data_type=data_type, error=str(e))
         finally:
             # Clean up the task reference
             consumer_cancel_tasks.pop(data_type, None)
@@ -258,7 +245,7 @@ async def cancel_all_consumers() -> None:
         try:
             await queue.cancel(consumer_tag, nowait=True)
             consumer_tags.pop(data_type, None)
-        except Exception as e:  # noqa: BLE001 - best-effort teardown; the connection is being discarded regardless
+        except Exception as e:
             logger.warning(
                 "⚠️ Failed to cancel consumer during shutdown",
                 data_type=data_type,
@@ -276,7 +263,7 @@ async def close_rabbitmq_connection() -> None:
             try:
                 await active_channel.close()
                 logger.info("🔧 Closed RabbitMQ channel - all consumers idle")
-            except Exception as e:  # noqa: BLE001 - best-effort teardown; the connection is being discarded regardless
+            except Exception as e:
                 logger.warning("⚠️ Error closing channel", error=str(e))
             active_channel = None
 
@@ -284,7 +271,7 @@ async def close_rabbitmq_connection() -> None:
             try:
                 await active_connection.close()
                 logger.info("🔧 Closed RabbitMQ connection - all consumers idle")
-            except Exception as e:  # noqa: BLE001 - best-effort teardown; the connection is being discarded regardless
+            except Exception as e:
                 logger.warning("⚠️ Error closing connection", error=str(e))
             active_connection = None
 
@@ -292,15 +279,13 @@ async def close_rabbitmq_connection() -> None:
             f"✅ RabbitMQ connection closed. Will check for new messages every {QUEUE_CHECK_INTERVAL}s",
             QUEUE_CHECK_INTERVAL=QUEUE_CHECK_INTERVAL,
         )
-    except Exception as e:  # noqa: BLE001 - best-effort teardown; the connection is being discarded regardless
+    except Exception as e:
         logger.error("❌ Error closing RabbitMQ connection", error=str(e))
 
 
 async def check_all_consumers_idle() -> bool:
     """Check if all consumers are cancelled (idle) AND all files completed."""
-    return len(consumer_tags) == 0 and len(MUSICBRAINZ_DATA_TYPES) == len(
-        completed_files
-    )
+    return len(consumer_tags) == 0 and len(MUSICBRAINZ_DATA_TYPES) == len(completed_files)
 
 
 async def check_consumers_unexpectedly_dead() -> bool:
@@ -335,8 +320,7 @@ async def periodic_queue_checker() -> None:
             # Check for stuck state (consumers died but work remains)
             if await check_consumers_unexpectedly_dead():
                 logger.warning(
-                    "⚠️ Detected stuck state: consumers died but files not completed. "
-                    "Attempting recovery...",
+                    "⚠️ Detected stuck state: consumers died but files not completed. Attempting recovery...",
                     active_consumers=len(consumer_tags),
                     completed_files=list(completed_files),
                     message_counts=message_counts,
@@ -360,7 +344,7 @@ async def periodic_queue_checker() -> None:
         except asyncio.CancelledError:
             logger.info("🛑 Queue checker task cancelled")
             break
-        except Exception as e:  # noqa: BLE001 - long-running loop must survive per-iteration faults
+        except Exception as e:
             logger.error("❌ Error in periodic queue checker", error=str(e))
 
 
@@ -372,10 +356,8 @@ async def _recover_consumers() -> None:
     if active_connection:
         try:
             await active_connection.close()
-        except Exception as e:  # noqa: BLE001 - the connection is already broken; recovery must proceed regardless
-            logger.warning(
-                "⚠️ Error closing broken connection during recovery", error=str(e)
-            )
+        except Exception as e:
+            logger.warning("⚠️ Error closing broken connection during recovery", error=str(e))
         active_connection = None
         active_channel = None
 
@@ -383,7 +365,7 @@ async def _recover_consumers() -> None:
     try:
         temp_connection = await rabbitmq_manager.connect()
         temp_channel = await temp_connection.channel()
-    except Exception as e:  # noqa: BLE001 - recovery must not raise into its caller
+    except Exception as e:
         logger.error("❌ Failed to connect to RabbitMQ for recovery", error=str(e))
         return
 
@@ -393,14 +375,10 @@ async def _recover_consumers() -> None:
         for data_type in MUSICBRAINZ_DATA_TYPES:
             queue_name = catalog_queue_name("brainztableinator", data_type)
 
-            declared_queue = await temp_channel.declare_queue(
-                name=queue_name, passive=True
-            )
+            declared_queue = await temp_channel.declare_queue(name=queue_name, passive=True)
 
             if declared_queue.declaration_result.message_count > 0:
-                queues_with_messages.append(
-                    (data_type, declared_queue.declaration_result.message_count)
-                )
+                queues_with_messages.append((data_type, declared_queue.declaration_result.message_count))
 
         if queues_with_messages:
             total_messages = sum(count for _, count in queues_with_messages)
@@ -414,21 +392,15 @@ async def _recover_consumers() -> None:
             active_channel = temp_channel
 
             # Channel-global QoS bounds total in-flight handlers to the pool capacity.
-            await active_channel.set_qos(
-                prefetch_count=_channel_prefetch(), global_=True
-            )
+            await active_channel.set_qos(prefetch_count=_channel_prefetch(), global_=True)
 
             # Declare per-data-type fanout exchanges and consumer-owned queues
             queues = {}
             for data_type in MUSICBRAINZ_DATA_TYPES:
                 exchange_name = catalog_exchange_name("musicbrainz", data_type)
                 queue_name = catalog_queue_name("brainztableinator", data_type)
-                dlx_name = catalog_dead_letter_exchange_name(
-                    "brainztableinator", data_type
-                )
-                dlq_name = catalog_dead_letter_queue_name(
-                    "brainztableinator", data_type
-                )
+                dlx_name = catalog_dead_letter_exchange_name("brainztableinator", data_type)
+                dlq_name = catalog_dead_letter_queue_name("brainztableinator", data_type)
 
                 exchange = await active_channel.declare_exchange(
                     exchange_name,
@@ -499,12 +471,12 @@ async def _recover_consumers() -> None:
             await temp_channel.close()
             await temp_connection.close()
 
-    except Exception as e:  # noqa: BLE001 - recovery must not raise into its caller
+    except Exception as e:
         logger.error("❌ Error during consumer recovery", error=str(e))
         try:
             await temp_channel.close()
             await temp_connection.close()
-        except Exception as close_error:  # noqa: BLE001 - best-effort cleanup inside an error path
+        except Exception as close_error:
             logger.warning(
                 "⚠️ Error closing temporary connection after recovery failure",
                 error=str(close_error),
@@ -559,9 +531,7 @@ def _canonical_entity_type(entity_type: str) -> str:
     return _ENTITY_TYPE_ALIASES.get(entity_type, entity_type)
 
 
-async def _insert_relationships(
-    conn: Any, source_mbid: str, source_type: str, rels: list[dict[str, Any]]
-) -> None:
+async def _insert_relationships(conn: Any, source_mbid: str, source_type: str, rels: list[dict[str, Any]]) -> None:
     """Batch-insert relationship records for one entity into musicbrainz.relationships.
 
     All of an entity's relationships are written with a single ``executemany`` so the
@@ -629,9 +599,7 @@ async def _insert_relationships(
         )
 
 
-async def _insert_external_links(
-    conn: Any, mbid: str, entity_type: str, links: list[dict[str, Any]]
-) -> None:
+async def _insert_external_links(conn: Any, mbid: str, entity_type: str, links: list[dict[str, Any]]) -> None:
     """Batch-insert external link records for one entity into musicbrainz.external_links.
 
     Uses a single ``executemany`` for the same round-trip / transaction-window reasons
@@ -645,8 +613,7 @@ async def _insert_external_links(
             link.get("service", ""),
         )
         for link in links
-        if link.get("url")
-        and link.get("service")  # Skip links missing URL or service name
+        if link.get("url") and link.get("service")  # Skip links missing URL or service name
     ]
     if not params:
         return
@@ -769,9 +736,7 @@ async def process_release(conn: Any, record: dict[str, Any]) -> None:
 
     # Insert relationships and external links (batched into one round-trip each)
     await _insert_relationships(conn, mbid, "release", record.get("relations", []))
-    await _insert_external_links(
-        conn, mbid, "release", record.get("external_links", [])
-    )
+    await _insert_external_links(conn, mbid, "release", record.get("external_links", []))
 
 
 async def process_release_group(conn: Any, record: dict[str, Any]) -> None:
@@ -803,12 +768,8 @@ async def process_release_group(conn: Any, record: dict[str, Any]) -> None:
         )
 
     # Insert relationships and external links (batched into one round-trip each)
-    await _insert_relationships(
-        conn, mbid, "release-group", record.get("relations", [])
-    )
-    await _insert_external_links(
-        conn, mbid, "release-group", record.get("external_links", [])
-    )
+    await _insert_relationships(conn, mbid, "release-group", record.get("relations", []))
+    await _insert_external_links(conn, mbid, "release-group", record.get("external_links", []))
 
 
 # Map data types to their processing functions
@@ -849,10 +810,7 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
         # Check if this is a file completion message
         if data.get("type") == "file_complete":
             total_processed = data.get("total_processed", 0)
-            logger.info(
-                f"✅ File processing complete for {data_type}! "
-                f"Total records processed: {total_processed}"
-            )
+            logger.info(f"✅ File processing complete for {data_type}! Total records processed: {total_processed}")
 
             # Schedule consumer cancellation if enabled
             if CONSUMER_CANCEL_DELAY > 0 and data_type in queues:
@@ -927,7 +885,7 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
             record_name=record_name,
         )
 
-    except Exception as e:  # noqa: BLE001 - per-message fault must nack rather than kill the consumer
+    except Exception as e:
         logger.error("❌ Failed to parse message", error=str(e))
         await message.nack(requeue=False)
         return
@@ -996,13 +954,13 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
         )
         try:
             await message.nack(requeue=False)
-        except Exception as nack_error:  # noqa: BLE001 - the nack path itself is best-effort; the broker will redeliver
+        except Exception as nack_error:
             logger.warning("⚠️ Failed to nack message", error=str(nack_error))
-    except Exception as e:  # noqa: BLE001 - per-message fault must nack rather than kill the consumer
+    except Exception as e:
         logger.error("❌ Failed to process message", data_type=data_type, error=str(e))
         try:
             await message.nack(requeue=True)
-        except Exception as nack_error:  # noqa: BLE001 - the nack path itself is best-effort; the broker will redeliver
+        except Exception as nack_error:
             logger.warning("⚠️ Failed to nack message", error=str(nack_error))
 
 
@@ -1029,16 +987,11 @@ async def progress_reporter() -> None:
         current_time = time.time()
 
         # Idle mode detection
-        if (
-            not idle_mode
-            and total == 0
-            and (current_time - startup_time) >= STARTUP_IDLE_TIMEOUT
-        ):
+        if not idle_mode and total == 0 and (current_time - startup_time) >= STARTUP_IDLE_TIMEOUT:
             idle_mode = True
             last_idle_log = current_time
             logger.info(
-                f"😴 No messages received after {STARTUP_IDLE_TIMEOUT}s, entering idle mode. "
-                "Consumers remain connected, reporting paused.",
+                f"😴 No messages received after {STARTUP_IDLE_TIMEOUT}s, entering idle mode. Consumers remain connected, reporting paused.",
                 startup_idle_timeout=STARTUP_IDLE_TIMEOUT,
             )
             continue
@@ -1058,50 +1011,27 @@ async def progress_reporter() -> None:
         # Check for stalled consumers (skip completed files)
         stalled_consumers = []
         for data_type, last_time in last_message_time.items():
-            if (
-                data_type not in completed_files
-                and last_time > 0
-                and (current_time - last_time) > 120
-            ):
+            if data_type not in completed_files and last_time > 0 and (current_time - last_time) > 120:
                 stalled_consumers.append(data_type)
 
         if stalled_consumers:
-            logger.error(
-                f"⚠️ Stalled consumers detected: {stalled_consumers}. "
-                f"No messages processed for >2 minutes."
-            )
+            logger.error(f"⚠️ Stalled consumers detected: {stalled_consumers}. No messages processed for >2 minutes.")
 
         # Build progress string with completion emojis
         progress_parts = []
         for data_type in ["artists", "labels", "release-groups", "releases"]:
             emoji = "✅ " if data_type in completed_files else ""
-            progress_parts.append(
-                f"{emoji}{data_type.capitalize()}: {message_counts[data_type]}"
-            )
+            progress_parts.append(f"{emoji}{data_type.capitalize()}: {message_counts[data_type]}")
 
-        logger.info(
-            f"📊 MusicBrainz PostgreSQL Progress: {total} total messages processed "
-            f"({', '.join(progress_parts)})"
-        )
+        logger.info(f"📊 MusicBrainz PostgreSQL Progress: {total} total messages processed ({', '.join(progress_parts)})")
 
         # Log current processing state
         if total == 0:
             logger.info("⏳ Waiting for messages to process...")
-        elif all(
-            current_time - last_time < 5
-            for last_time in last_message_time.values()
-            if last_time > 0
-        ):
+        elif all(current_time - last_time < 5 for last_time in last_message_time.values() if last_time > 0):
             logger.info("✅ All consumers actively processing")
-        elif any(
-            last_time > 0 and 5 < current_time - last_time < 120
-            for last_time in last_message_time.values()
-        ):
-            slow_consumers = [
-                dt
-                for dt, lt in last_message_time.items()
-                if lt > 0 and 5 < current_time - lt < 120
-            ]
+        elif any(last_time > 0 and 5 < current_time - last_time < 120 for last_time in last_message_time.values()):
+            slow_consumers = [dt for dt, lt in last_message_time.items() if lt > 0 and 5 < current_time - lt < 120]
             logger.warning(
                 f"⚠️ Slow consumers detected: {slow_consumers}",
                 slow_consumers=slow_consumers,
@@ -1109,11 +1039,7 @@ async def progress_reporter() -> None:
 
         # Log consumer status
         active_consumers = list(consumer_tags.keys())
-        canceled_consumers = [
-            dt
-            for dt in MUSICBRAINZ_DATA_TYPES
-            if dt not in consumer_tags and dt in completed_files
-        ]
+        canceled_consumers = [dt for dt in MUSICBRAINZ_DATA_TYPES if dt not in consumer_tags and dt in completed_files]
 
         if canceled_consumers:
             logger.info(
@@ -1129,24 +1055,14 @@ async def progress_reporter() -> None:
 
 async def main() -> None:
     """Main entry point for the brainztableinator service."""
-    global \
-        connection_pool, \
-        config, \
-        connection_params, \
-        queues, \
-        rabbitmq_manager, \
-        active_connection, \
-        active_channel, \
-        connection_check_task
+    global connection_pool, config, connection_params, queues, rabbitmq_manager, active_connection, active_channel, connection_check_task
 
     # Set up signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
     setup_logging("brainztableinator", log_file=Path("/logs/brainztableinator.log"))
-    logger.info(
-        "🚀 Starting MusicBrainz brainztableinator service with connection pooling"
-    )
+    logger.info("🚀 Starting MusicBrainz brainztableinator service with connection pooling")
 
     # Add startup delay for dependent services
     startup_delay = int(os.environ.get("STARTUP_DELAY", "5"))
@@ -1197,7 +1113,7 @@ async def main() -> None:
             config.postgres_pool_min_size,
             config.postgres_pool_max_size,
         )
-    except Exception as e:  # noqa: BLE001 - top-level guard: log and exit cleanly instead of a traceback
+    except Exception as e:
         logger.error("❌ Failed to initialize connection pool", error=str(e))
         return
 
@@ -1242,7 +1158,7 @@ async def main() -> None:
             amqp_connection = await rabbitmq_manager.connect()
             active_connection = amqp_connection
             break
-        except Exception as e:  # noqa: BLE001 - top-level guard: log and exit cleanly instead of a traceback
+        except Exception as e:
             startup_retry += 1
             if startup_retry < max_startup_retries:
                 wait_time = min(30, 5 * startup_retry)
@@ -1286,14 +1202,10 @@ async def main() -> None:
             dlq_name = catalog_dead_letter_queue_name("brainztableinator", data_type)
 
             # Declare fanout exchange (must match extractor)
-            exchange = await channel.declare_exchange(
-                exchange_name, AMQP_EXCHANGE_TYPE, durable=True, auto_delete=False
-            )
+            exchange = await channel.declare_exchange(exchange_name, AMQP_EXCHANGE_TYPE, durable=True, auto_delete=False)
 
             # Declare consumer-owned dead-letter exchange
-            dlx_exchange = await channel.declare_exchange(
-                dlx_name, AMQP_EXCHANGE_TYPE, durable=True, auto_delete=False
-            )
+            dlx_exchange = await channel.declare_exchange(dlx_name, AMQP_EXCHANGE_TYPE, durable=True, auto_delete=False)
 
             # Declare DLQ (classic queue for dead letters)
             dlq = await channel.declare_queue(
@@ -1381,19 +1293,24 @@ async def main() -> None:
                 if connection_pool:
                     await connection_pool.close()
                     logger.info("✅ Async connection pool closed")
-            except Exception as e:  # noqa: BLE001 - top-level guard: log and exit cleanly instead of a traceback
+            except Exception as e:
                 logger.warning("⚠️ Error closing connection pool", error=str(e))
 
         # Stop health server
         health_server.stop()
 
 
+def cli() -> None:
+    """Run the async service from a console-script entry point."""
+    run(main())
+
+
 if __name__ == "__main__":
     try:
-        run(main())
+        cli()
     except KeyboardInterrupt:
         logger.warning("⚠️ Application interrupted")
-    except Exception as e:  # noqa: BLE001 - top-level guard: log and exit cleanly instead of a traceback
+    except Exception as e:
         logger.error("❌ Application error", error=str(e))
     finally:
         logger.info("✅ Brainztableinator service shutdown complete")

@@ -3417,9 +3417,8 @@ class TestOutageRequeueBackoff:
         so a message hit 20 deliveries in ~3 minutes and RabbitMQ dead-lettered
         a perfectly valid record part-way through a routine maintenance window.
         """
-        from psycopg.errors import OperationalError
-
         from common.outage_backoff import OutageBackoff
+        from psycopg.errors import OperationalError
 
         mock_message = AsyncMock()
         mock_message.body = b'{"id": "550e8400-e29b-41d4-a716-446655440000", "name": "Test"}'

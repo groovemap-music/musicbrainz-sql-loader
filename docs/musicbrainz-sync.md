@@ -2,7 +2,9 @@
 
 ## Overview
 
-The MusicBrainz integration imports data from MusicBrainz JSONL database dumps into the Discogsography platform. Data flows through the extractor (Rust) → RabbitMQ → brainzgraphinator (Neo4j) + brainztableinator (PostgreSQL).
+The MusicBrainz integration imports data from MusicBrainz JSONL database dumps into GrooveMap. Data flows from the
+`catalog-ingestion` Rust producer through RabbitMQ to the `musicbrainz-graph-enricher` Neo4j consumer and this
+`musicbrainz-sql-loader` PostgreSQL consumer.
 
 ## Data Flow
 

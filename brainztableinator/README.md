@@ -1,4 +1,4 @@
-# Brainztableinator Service
+# GrooveMap MusicBrainz SQL loader
 
 Consumes MusicBrainz data from AMQP queues and stores it in PostgreSQL relational database tables for structured querying and enrichment alongside Discogs data.
 
@@ -204,21 +204,21 @@ Each data type has its own consumer queue with dead letter exchange (DLX) and de
 ### Running Locally
 
 ```bash
-# Install dependencies
-uv sync --extra brainztableinator
+# Install pinned dependencies
+just setup
 
 # Run the brainztableinator
-uv run python brainztableinator/brainztableinator.py
+uv run musicbrainz-sql-loader
 ```
 
 ### Running Tests
 
 ```bash
 # Run brainztableinator tests
-just test-brainztableinator
+just test
 
 # Run with coverage
-uv run pytest tests/brainztableinator/ --cov=brainztableinator --cov-report=term-missing
+uv run pytest tests/ --cov=brainztableinator --cov-report=term-missing
 ```
 
 ## Docker
@@ -227,10 +227,11 @@ Build and run with Docker:
 
 ```bash
 # Build
-docker build -f brainztableinator/Dockerfile .
+just image
 
 # Run with docker-compose
-docker-compose up brainztableinator
+Use the separately versioned `groovemap-music/deployment` repository to run the service
+with PostgreSQL and RabbitMQ.
 ```
 
 ## Monitoring
