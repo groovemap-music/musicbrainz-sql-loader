@@ -23,7 +23,7 @@ ARG BUILD_DATE
 ARG BUILD_VERSION=0.1.0
 ARG VCS_REF
 
-LABEL org.opencontainers.image.title="GrooveMap MusicBrainz SQL loader" \
+LABEL org.opencontainers.image.title="musicbrainz-sql-loader" \
       org.opencontainers.image.description="Load the complete MusicBrainz catalog into PostgreSQL" \
       org.opencontainers.image.authors="Robert Wlodarczyk <robert@simplicityguy.com>" \
       org.opencontainers.image.url="https://groovemap.music" \

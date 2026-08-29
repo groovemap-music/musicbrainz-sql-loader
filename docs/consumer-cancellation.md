@@ -159,4 +159,4 @@ After all files finish, the extractor sends an `extraction_complete` message to 
 - **Graphinator**: Delete stub Neo4j nodes (no `sha256` property) created by cross-type MERGE operations
 - **Tableinator**: Purge stale PostgreSQL rows where `updated_at < started_at`
 
-This ensures database record counts match extractor counts after each run. See [File Completion Tracking](file-completion-tracking.md) and [Database Schema — Post-Extraction Cleanup](database-schema.md#post-extraction-cleanup) for details.
+This ensures database record counts match extractor counts after each run. See [File Completion Tracking](file-completion-tracking.md) and [Database Schema — Post-Extraction Cleanup](https://github.com/groovemap-music/database-schema) for details.

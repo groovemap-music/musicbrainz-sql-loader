@@ -1,5 +1,8 @@
 # GrooveMap MusicBrainz SQL loader
 
+See the repository [documentation index](../docs/README.md) for synchronization,
+resilience, and completion guidance.
+
 Consumes MusicBrainz data from AMQP queues and stores it in PostgreSQL relational database tables for structured querying and enrichment alongside Discogs data.
 
 ## Overview
@@ -27,13 +30,13 @@ Environment variables:
 ```bash
 # PostgreSQL connection
 POSTGRES_HOST=postgres
-POSTGRES_USERNAME=discogsography
-POSTGRES_PASSWORD=discogsography
-POSTGRES_DATABASE=discogsography
+POSTGRES_USERNAME=groovemap
+POSTGRES_PASSWORD=groovemap
+POSTGRES_DATABASE=groovemap
 
 # RabbitMQ (individual vars; also supports _FILE variants for Docker secrets)
-RABBITMQ_USERNAME=discogsography
-RABBITMQ_PASSWORD=discogsography
+RABBITMQ_USERNAME=groovemap
+RABBITMQ_PASSWORD=groovemap
 RABBITMQ_HOST=rabbitmq              # Default: rabbitmq
 RABBITMQ_PORT=5672                  # Default: 5672
 
@@ -192,10 +195,10 @@ MUSICBRAINZ_DATA_TYPES = ["artists", "labels", "release-groups", "releases"]
 
 Subscribes to four fanout exchanges:
 
-- `discogsography-musicbrainz-artists`
-- `discogsography-musicbrainz-labels`
-- `discogsography-musicbrainz-release-groups`
-- `discogsography-musicbrainz-releases`
+- `groovemap-musicbrainz-artists`
+- `groovemap-musicbrainz-labels`
+- `groovemap-musicbrainz-release-groups`
+- `groovemap-musicbrainz-releases`
 
 Each data type has its own consumer queue with dead letter exchange (DLX) and dead letter queue (DLQ).
 
