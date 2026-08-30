@@ -1,289 +1,43 @@
-# Database Resilience Documentation
+# Database resilience
 
-This document describes the database resilience features implemented in GrooveMap to handle nightly
-maintenance windows and other database outages.
+`musicbrainz-sql-loader` uses the pinned `groovemap-runtime` PostgreSQL and RabbitMQ
+adapters. The service is designed to pause safely during a transient database outage and
+resume from durable broker state.
 
-## Overview
-
-All services now use resilient database connections that automatically handle:
-
-- Nightly database maintenance windows
-- Temporary network issues
-- Database restarts
-- Connection timeouts
-- Service unavailability
-
-## Key Features
-
-### 1. Circuit Breaker Pattern
-
-Each database connection uses a circuit breaker to prevent cascading failures:
-
-- **Closed State**: Normal operation, all requests pass through
-- **Open State**: After 5 consecutive failures, rejects requests immediately
-- **Half-Open State**: After 30-60 seconds, allows one test request
-
-```python
-# Circuit breaker configuration
-failure_threshold: 5  # Number of failures before opening
-recovery_timeout: 30 - 60  # Seconds before trying half-open
+```mermaid
+flowchart LR
+    Queue[(RabbitMQ quorum queue)] --> Delivery[Catalog delivery]
+    Delivery --> Transaction[One PostgreSQL transaction]
+    Transaction -->|commit| Ack[Acknowledge]
+    Transaction -->|transient database error| Backoff[Bounded outage backoff]
+    Backoff --> Requeue[Requeue delivery]
+    Transaction -->|non-retryable data error| DeadLetter[Reject to DLQ]
 ```
 
-### 2. Exponential Backoff
+## PostgreSQL
 
-Failed connections retry with exponential backoff:
+The async pool defaults to 2–12 connections. Channel-global AMQP prefetch equals the
+configured pool maximum, so RabbitMQ never sends more concurrent work than the pool can
+service. Each catalog record uses one bounded transaction, and relationship and external
+link children use `executemany` to reduce round trips.
 
-```yaml
-# Backoff configuration
-initial_delay: 0.5-1.0    # Initial retry delay (seconds)
-max_delay: 30-60         # Maximum retry delay
-exponential_base: 2.0    # Delay multiplier
-jitter: 25%              # Random jitter to prevent thundering herd
-```
+`InterfaceError`, `OperationalError`, and `DatabaseUnavailableError` are transient. The
+loader waits before requeueing so a maintenance window cannot rapidly consume the quorum
+queue's finite delivery limit. Deterministic `DataError` and `IntegrityError` failures are
+rejected without retry and arrive in the dead-letter queue.
 
-### 3. Connection Health Monitoring
+## RabbitMQ and restart
 
-#### PostgreSQL
+The broker connection uses heartbeat monitoring and bounded reconnect attempts. Exchanges,
+quorum queues, dead-letter exchanges, and dead-letter queues are durable. Graceful process
+shutdown cancels subscriptions before closing the connection so unsettled records are
+redelivered once rather than churned.
 
-- Connection pool with 2-20 connections
-- Health checks every 30 seconds
-- Automatic removal of unhealthy connections
-- Maintains minimum connection pool size
+## Health
 
-#### Neo4j
+Port `8010` reports `starting` before the PostgreSQL pool exists, `unhealthy` for a
+detected stuck state, and `healthy` once the pool is available and consumer state is
+consistent. Connection strings and credentials are never returned or logged.
 
-- Driver-level connection pooling (max 50 connections)
-- Built-in keep-alive mechanism
-- Session-level health checks
-- Automatic reconnection on SessionExpired
-
-#### RabbitMQ
-
-- Robust connections with automatic recovery
-- Heartbeat monitoring (600 seconds)
-- Channel-level recovery
-- Publisher confirmations for reliability
-
-### 4. Message Durability
-
-During database outages:
-
-1. **Messages remain in RabbitMQ** (persistent storage)
-1. **Failed messages are requeued** with `nack(requeue=True)`
-1. **Idempotency prevents duplicates** using SHA256 hashes
-1. **No data loss** - messages wait until databases recover
-
-## Service-Specific Implementation
-
-### Python Services
-
-- Uses `ResilientRabbitMQConnection` for publishing
-- Buffers messages during connection issues
-- Retries failed publishes with backoff
-- Flushes pending messages on recovery
-
-### Graphinator Service (Neo4j)
-
-- Uses `ResilientNeo4jDriver` with automatic reconnection
-- Handles `ServiceUnavailable` and `SessionExpired` exceptions
-- Requeues messages on connection failures
-- Removed reactive 2-minute reconnection timer (now proactive)
-
-### Tableinator Service (PostgreSQL)
-
-- Uses `ResilientPostgreSQLPool` with health monitoring
-- Connection pool with min/max bounds (2-12 by default; see `POSTGRES_POOL_MIN_SIZE` / `POSTGRES_POOL_MAX_SIZE` in [Configuration Guide](../README.md#development))
-- Handles `InterfaceError` and `OperationalError`
-- Automatic connection recycling
-
-### Dashboard Service
-
-- Uses all three resilient connection types
-- Async implementations for non-blocking operations
-- Graceful degradation when services unavailable
-
-### Brainzgraphinator Service (Neo4j)
-
-- Uses `ResilientNeo4jDriver` with automatic reconnection
-- Enriches existing Neo4j nodes with MusicBrainz metadata
-- Handles `ServiceUnavailable` and `SessionExpired` exceptions
-- Requeues messages on connection failures
-
-### Brainztableinator Service (PostgreSQL)
-
-- Uses `ResilientPostgreSQLPool` with health monitoring
-- Stores MusicBrainz data in `musicbrainz` PostgreSQL schema
-- Connection pool with min/max bounds (2-12 by default; see `POSTGRES_POOL_MIN_SIZE` / `POSTGRES_POOL_MAX_SIZE` in [Configuration Guide](../README.md#development)); RabbitMQ prefetch (channel-global QoS) is coupled to the pool max instead of using batch flushing
-- Handles `InterfaceError` and `OperationalError`
-
-## Configuration
-
-### Environment Variables
-
-No changes required to existing environment variables. The resilient connections use the same configuration:
-
-```bash
-# Neo4j
-NEO4J_HOST=neo4j
-NEO4J_USERNAME=neo4j
-NEO4J_PASSWORD=password
-
-# PostgreSQL
-POSTGRES_HOST=postgres
-POSTGRES_DATABASE=groovemap
-POSTGRES_USERNAME=postgres
-POSTGRES_PASSWORD=postgres
-
-# RabbitMQ
-RABBITMQ_HOST=rabbitmq
-RABBITMQ_USERNAME=groovemap
-RABBITMQ_PASSWORD=groovemap
-```
-
-### Tuning Parameters
-
-The following parameters can be adjusted in the code if needed:
-
-```python
-# Circuit Breaker
-failure_threshold = 5  # Failures before circuit opens
-recovery_timeout = 30  # Seconds before recovery attempt
-
-# Retry Settings
-max_retries = 5  # Maximum connection attempts
-initial_delay = 1.0  # Initial retry delay
-max_delay = 60.0  # Maximum retry delay
-
-# Connection Pools
-postgres_min_connections = 2
-postgres_max_connections = 20
-postgres_health_check_interval = 30
-
-# Neo4j Settings
-neo4j_max_connection_lifetime = 1800  # 30 minutes
-neo4j_max_connection_pool_size = 50
-neo4j_connection_acquisition_timeout = 60.0
-```
-
-## Behavior During Maintenance
-
-When databases undergo nightly maintenance:
-
-1. **Connection Detection**: Services detect connection loss within seconds
-1. **Circuit Breaker Opens**: After 5 failures, prevents cascade
-1. **Message Queuing**: New messages remain in RabbitMQ
-1. **Exponential Backoff**: Retry attempts with increasing delays
-1. **Recovery**: When database returns, connections automatically restore
-1. **Message Processing**: Queued messages process in order
-1. **Idempotency**: Duplicate prevention via SHA256 hashes
-
-## Monitoring
-
-### Health Endpoints
-
-Each service exposes health data including connection status:
-
-- Extractor: `http://localhost:8000/health`
-- Graphinator: `http://localhost:8001/health`
-- Tableinator: `http://localhost:8002/health`
-- Dashboard: `http://localhost:8003/health`
-- API: `http://localhost:8005/health`
-- Explore: `http://localhost:8007/health`
-- Insights: `http://localhost:8009/health`
-- Brainztableinator: `http://localhost:8010/health`
-- Brainzgraphinator: `http://localhost:8011/health`
-
-### Logging
-
-Enhanced logging for connection events:
-
-```
-🔄 Creating new connection (attempt 1/5)
-⚠️ Connection attempt 1 failed: Connection refused. Retrying in 1.2 seconds...
-🔄 Creating new connection (attempt 2/5)
-✅ Connection established successfully
-🚨 Circuit breaker OPEN after 5 failures
-🔄 Circuit breaker entering HALF_OPEN state
-✅ Circuit breaker reset to CLOSED
-```
-
-### Metrics
-
-The dashboard service (`/metrics` endpoint) provides Prometheus metrics for monitoring.
-
-## Testing Database Outages
-
-To test the resilience features:
-
-### 1. Stop a Database
-
-```bash
-# Stop Neo4j
-docker-compose stop neo4j
-
-# Stop PostgreSQL
-docker-compose stop postgres
-
-# Stop RabbitMQ
-docker-compose stop rabbitmq
-```
-
-### 2. Observe Service Behavior
-
-Watch the logs to see connection failures and circuit breaker activation:
-
-```bash
-docker-compose logs -f graphinator
-docker-compose logs -f tableinator
-```
-
-### 3. Restart Database
-
-```bash
-# Restart the stopped service
-docker-compose start neo4j
-docker-compose start postgres
-docker-compose start rabbitmq
-```
-
-### 4. Verify Recovery
-
-- Services should automatically reconnect
-- Queued messages should process
-- No data should be lost
-
-## Best Practices
-
-1. **Don't Panic**: Services handle outages automatically
-1. **Monitor Logs**: Watch for extended outage warnings
-1. **Check Queues**: Monitor RabbitMQ queue depths during outages
-1. **Verify Recovery**: Ensure message processing resumes after recovery
-1. **Test Regularly**: Simulate outages in non-production environments
-
-## Troubleshooting
-
-### Services Not Recovering
-
-If services don't recover after database restart:
-
-1. Check circuit breaker state in logs
-1. Verify database is fully started and accepting connections
-1. Restart affected service if needed: `docker-compose restart [service]`
-
-### Messages Not Processing
-
-If messages remain queued after recovery:
-
-1. Check service health endpoints
-1. Verify database connectivity manually
-1. Look for poison messages causing repeated failures
-1. Check dead letter queues for poison messages (each consumer has its own DLQ)
-
-### Performance Issues
-
-If services are slow after recovery:
-
-1. Check for message backlog in RabbitMQ
-1. Monitor database connection pool usage
-1. Consider increasing prefetch counts temporarily
-1. Watch for circuit breaker flapping (rapid open/close)
+For capacity rationale and the prior pool-exhaustion diagnosis, see
+[PostgreSQL connection-budget analysis](postgres-pool-exhaustion-analysis.md).

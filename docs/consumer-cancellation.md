@@ -1,162 +1,41 @@
-# Consumer Cancellation Feature
+# Consumer cancellation and draining
 
-<div align="center">
-
-**Automatic consumer lifecycle management for completed file processing**
-
-Last Updated: March 2026
-
-</div>
-
-## Overview
-
-The consumer cancellation feature automatically closes RabbitMQ queue consumers after files have completed processing.
-This helps free up resources and provides clearer monitoring of active vs. completed file processing.
-
-## How It Works
-
-### Consumer Cancellation Lifecycle
+Each MusicBrainz stream has its own RabbitMQ consumer. Cancellation releases broker
+resources after a stream finishes without interrupting in-flight deliveries.
 
 ```mermaid
 sequenceDiagram
-    participant EXT as Extractor
-    participant RMQ as RabbitMQ
-    participant CONS as Consumer<br/>(Graphinator/Tableinator/<br/>Brainzgraphinator/Brainztableinator)
-    participant TIMER as Cancellation Timer
+    participant Producer as catalog-ingestion
+    participant Broker as RabbitMQ
+    participant Loader as musicbrainz-sql-loader
+    participant Timer as Grace-period timer
 
-    EXT->>RMQ: Publish file_complete to fanout exchange
-    RMQ->>CONS: Deliver file_complete via consumer queue
-    CONS->>CONS: Mark file as complete (🎉)
-    CONS->>TIMER: Schedule cancellation (300s grace period)
-
-    Note over CONS,TIMER: Grace period (5 minutes)
-
-    TIMER-->>CONS: Grace period expired
-    CONS->>RMQ: Cancel consumer for queue
-    CONS->>CONS: Update active consumers list
-    CONS->>CONS: Log consumer status
-
-    Note over CONS: Connection remains open<br/>for other queues
-
-    style EXT fill:#fff9c4
-    style RMQ fill:#fff3e0
-    style CONS fill:#e0f2f1
-    style TIMER fill:#ffebee
+    Producer->>Broker: file_complete(stream)
+    Broker->>Loader: deliver terminal marker
+    Loader->>Timer: schedule cancellation
+    Loader->>Broker: acknowledge marker
+    Timer-->>Loader: grace period expires
+    Loader->>Broker: cancel stream consumer
+    Note over Loader,Broker: Other stream consumers remain active
 ```
 
-### Process Steps
+`CONSUMER_CANCEL_DELAY` controls the grace period and defaults to 300 seconds. Set it to
+`0` to leave consumers subscribed. Duplicate completion markers do not schedule duplicate
+cancellation tasks.
 
-1. When the Python/Rust extractor sends a "file_complete" message, all consumers (graphinator, tableinator, brainzgraphinator, brainztableinator):
+## Graceful process shutdown
 
-   - Mark the file as complete (shows 🎉 in progress reports)
-   - Schedule the consumer for that queue to be canceled after a grace period
-   - The default grace period is 5 minutes (300 seconds)
+Process shutdown is a separate path from file completion:
 
-1. After the grace period expires:
+1. Stop all consumer subscriptions so no new deliveries arrive.
+2. Cancel progress, queue-check, and pending cancellation tasks.
+3. Close the RabbitMQ connection, which requeues any unsettled deliveries once.
+4. Close the PostgreSQL pool and health server.
 
-   - The consumer for that specific queue is canceled
-   - The connection and channel remain open for other queues
-   - Progress reports show which consumers are active vs. canceled
+An incoming delivery observed after shutdown begins is deliberately left unsettled. An
+immediate `nack(requeue=True)` while the subscription remains active would redeliver the
+same message in a tight loop and consume the quorum queue's delivery budget.
 
-1. Benefits:
-
-   - Frees up RabbitMQ resources (connections, channels, memory)
-   - Clearer monitoring - easy to see which files are still being processed
-   - Prevents unnecessary network traffic for completed queues
-
-## Configuration
-
-### Environment Variable
-
-- `CONSUMER_CANCEL_DELAY`: Number of seconds to wait before canceling a consumer after file completion
-  - Default: 300 (5 minutes)
-  - Set to 0 to disable consumer cancellation
-  - Can be set per service or globally
-
-### Examples
-
-```bash
-# Use default 5-minute delay
-docker-compose up
-
-# Use 30-second delay for faster testing
-CONSUMER_CANCEL_DELAY=30 docker-compose up
-
-# Disable consumer cancellation
-CONSUMER_CANCEL_DELAY=0 docker-compose up
-
-# Different delays per service
-CONSUMER_CANCEL_DELAY=60 docker-compose up tableinator
-CONSUMER_CANCEL_DELAY=120 docker-compose up graphinator
-```
-
-## Monitoring
-
-### Progress Reports
-
-The periodic progress reports now include consumer status:
-
-```
-📊 Progress: 1000 total messages processed (🎉 Artists: 500, Labels: 500, Masters: 0, Releases: 0)
-🔧 Canceled consumers: ['artists']
-✅ Active consumers: ['labels', 'masters', 'releases']
-```
-
-### Log Messages
-
-Watch for these log messages:
-
-- `🎉 File processing complete for {type}!` - File marked as complete
-- `🔧 Canceling consumer for {type} after {delay}s grace period` - Consumer cancellation scheduled
-- `✅ Consumer for {type} successfully canceled` - Consumer successfully canceled
-- `❌ Failed to cancel consumer for {type}` - Cancellation failed (non-fatal)
-
-## Testing
-
-Use the provided test scripts:
-
-1. **test_file_completion.py** - Tests the file completion message handling
-
-```bash
-# Run with short delay for testing
-CONSUMER_CANCEL_DELAY=10 docker-compose up -d tableinator graphinator
-
-# Watch the logs
-docker-compose logs -f tableinator graphinator
-```
-
-## Edge Cases Handled
-
-1. **Multiple Completion Messages**: If multiple completion messages are received, only one cancellation is scheduled
-1. **Service Restart**: Consumer tags are lost on restart, but the feature continues to work for new messages
-1. **Cancellation Failure**: Failures are logged but don't crash the service
-1. **Grace Period**: Ensures all in-flight messages are processed before cancellation
-
-## Technical Details
-
-- Uses aio_pika's `queue.cancel(consumer_tag, nowait=True)` to cancel consumers
-- Consumer tags are stored when consumers are created
-- Cancellation tasks are tracked to allow proper cleanup on shutdown
-- The `nowait=True` parameter prevents hanging if RabbitMQ is slow to respond
-
-## Extractor Integration
-
-The Rust extractor integrates with consumer cancellation by:
-
-1. **Sending File Completion Messages**: When a file finishes processing, the extractor sends a
-   "file_complete" message
-1. **Tracking Completed Files**: The extractor maintains a `completed_files` set to avoid false stalled warnings
-1. **Progress Monitoring**: Completed files are excluded from stalled detection logic
-
-This prevents the extractors from incorrectly reporting files as "stalled" when they have actually completed processing
-and their consumers have been canceled.
-
-### Extraction Completion Signal (March 2026)
-
-After all files finish, the extractor sends an `extraction_complete` message to all fanout exchanges for the active source. Consumers use this signal to:
-
-- **Flush remaining batches** before cleanup
-- **Graphinator**: Delete stub Neo4j nodes (no `sha256` property) created by cross-type MERGE operations
-- **Tableinator**: Purge stale PostgreSQL rows where `updated_at < started_at`
-
-This ensures database record counts match extractor counts after each run. See [File Completion Tracking](file-completion-tracking.md) and [Database Schema — Post-Extraction Cleanup](https://github.com/groovemap-music/database-schema) for details.
+Regression coverage for this ordering lives in
+[`tests/test_shutdown_delivery_churn.py`](../tests/test_shutdown_delivery_churn.py) and
+the drain tests in [`tests/test_brainztableinator.py`](../tests/test_brainztableinator.py).
