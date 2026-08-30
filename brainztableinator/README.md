@@ -17,7 +17,7 @@ The brainztableinator service:
 
 ## Architecture
 
-- **Language**: Python 3.13+
+- **Language**: Python 3.14
 - **Database**: PostgreSQL 18 (dedicated `musicbrainz` schema)
 - **Message Broker**: RabbitMQ 4.x (quorum queues)
 - **Health Port**: 8010
