@@ -40,31 +40,33 @@ from brainztableinator.catalog_contract import (
 from brainztableinator.catalog_contract import (
     queue_name as catalog_queue_name,
 )
-from brainztableinator.config import BrainztableinatorConfig
+from brainztableinator.config import MusicBrainzSQLLoaderConfig
 
 
 logger = structlog.get_logger(__name__)
 
+SERVICE_NAME = "musicbrainz-sql-loader"
+# The queue suffix is a durable broker identifier used by deployed installations.
+# Changing it would create new queues and strand messages in the existing queues.
+AMQP_CONSUMER_ID = "brainztableinator"
 STARTUP_BANNER = r"""
-              _    _             _                      _     _              _
- _ __ _  _ __(_)__| |__ _ _ __ _(_)_ _  ______ ___ __ _| |___| |___  __ _ __| |___ _ _
-| '  \ || (_-< / _| '_ \ '_/ _` | | ' \|_ /___(_-</ _` | |___| / _ \/ _` / _` / -_) '_|
-|_|_|_\_,_/__/_\__|_.__/_| \__,_|_|_||_/__|   /__/\__, |_|   |_\___/\__,_\__,_\___|_|
-                                                     |_|
-                                musicbrainz-sql-loader
++--------------------------------+
+| GrooveMap                      |
+| musicbrainz-sql-loader         |
++--------------------------------+
 """.strip("\n")
 
 # Config will be initialized in main
-config: BrainztableinatorConfig | None = None
+config: MusicBrainzSQLLoaderConfig | None = None
 
-# Fallback prefetch when config is not yet loaded (matches BrainztableinatorConfig default).
+# Fallback prefetch when config is not yet loaded (matches MusicBrainzSQLLoaderConfig default).
 _DEFAULT_POOL_MAX = 12
 
 
 def _channel_prefetch() -> int:
     """RabbitMQ prefetch coupled to the PostgreSQL pool capacity.
 
-    Unlike tableinator, brainztableinator opens one transaction per message, so every
+    This loader opens one transaction per message, so every
     in-flight handler holds a pooled connection for the duration of its write. Bounding
     the channel's total unacked deliveries (channel-global QoS) to the pool's ``max``
     means the broker — not the pool's exhausted-wait retry loop — applies backpressure,
@@ -86,8 +88,8 @@ completed_files: set[str] = set()  # Track which files have completed processing
 
 # Throttles requeues while PostgreSQL is unavailable, so an outage cannot burn
 # the quorum queue's x-delivery-limit budget and dead-letter valid records
-# (discogsography-rb05).
-outage_backoff = OutageBackoff("brainztableinator")
+# This prevents a database outage from exhausting the quorum queue's delivery budget.
+outage_backoff = OutageBackoff(SERVICE_NAME)
 current_task = None
 current_progress = 0.0
 
@@ -163,7 +165,7 @@ def get_health_data() -> dict[str, Any]:
 
     return {
         "status": status,
-        "service": "brainztableinator",
+        "service": SERVICE_NAME,
         "current_task": active_task,
         "progress": current_progress,
         "message_counts": message_counts.copy(),
@@ -382,7 +384,7 @@ async def _recover_consumers() -> None:
         # Check each queue for pending messages
         queues_with_messages = []
         for data_type in MUSICBRAINZ_DATA_TYPES:
-            queue_name = catalog_queue_name("brainztableinator", data_type)
+            queue_name = catalog_queue_name(AMQP_CONSUMER_ID, data_type)
 
             declared_queue = await temp_channel.declare_queue(name=queue_name, passive=True)
 
@@ -407,9 +409,9 @@ async def _recover_consumers() -> None:
             queues = {}
             for data_type in MUSICBRAINZ_DATA_TYPES:
                 exchange_name = catalog_exchange_name("musicbrainz", data_type)
-                queue_name = catalog_queue_name("brainztableinator", data_type)
-                dlx_name = catalog_dead_letter_exchange_name("brainztableinator", data_type)
-                dlq_name = catalog_dead_letter_queue_name("brainztableinator", data_type)
+                queue_name = catalog_queue_name(AMQP_CONSUMER_ID, data_type)
+                dlx_name = catalog_dead_letter_exchange_name(AMQP_CONSUMER_ID, data_type)
+                dlq_name = catalog_dead_letter_queue_name(AMQP_CONSUMER_ID, data_type)
 
                 exchange = await active_channel.declare_exchange(
                     exchange_name,
@@ -523,7 +525,7 @@ def _get_or(record: dict[str, Any], key: str, default: Any) -> Any:
     explicitly supplied NULL, and ``WHERE NOT ended`` silently drops those rows) and
     ``attributes`` landed as the jsonb scalar ``null`` (on which ``jsonb_array_length``
     errors outright). ON CONFLICT DO UPDATE then overwrote previously-correct values
-    with those nulls on reprocessing (discogsography-iud5).
+    with those nulls on reprocessing.
     """
     value = record.get(key)
     return default if value is None else value
@@ -552,7 +554,7 @@ async def _insert_relationships(conn: Any, source_mbid: str, source_type: str, r
     MusicBrainz relations are directional and materialized on both endpoints;
     ``direction`` == "backward" means the entity being processed is the
     relation's TARGET, not its source (mirrors the fix in
-    brainzgraphinator.create_relationship_edges). Swap source/target in that
+    the MusicBrainz graph enricher). Swap source/target in that
     case so the stored row always reflects the relationship's canonical
     orientation (e.g. member->band for "member of band"), regardless of
     which endpoint's record we happened to be processing.
@@ -594,11 +596,12 @@ async def _insert_relationships(conn: Any, source_mbid: str, source_type: str, r
             "INSERT INTO musicbrainz.relationships "
             "(source_mbid, source_entity_type, target_mbid, target_entity_type, relationship_type, attributes, begin_date, end_date, ended) "
             "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
-            # The conflict target must match relationships_natural_key (schema-init/postgres_schema.py),
+            # The conflict target must match relationships_natural_key in the
+            # database-schema repository's src/groovemap_schema/postgres.py,
             # which includes begin_date/end_date/attributes so that two distinct relationship
             # instances (e.g. a re-joined band membership with different date ranges, or a
             # multi-instrument performer credit) coexist as separate rows instead of one
-            # silently overwriting the other (discogsography-dgtg). begin_date/end_date/
+            # silently overwriting the other. begin_date/end_date/
             # attributes are now part of the conflict key so a genuine re-ingest conflict only
             # occurs when they already match; only `ended` (a mutable flag, not part of the
             # relationship's identity) needs refreshing on conflict.
@@ -809,7 +812,7 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
         # within milliseconds and nacked again, burning a quorum x-delivery-count
         # per cycle; at x-delivery-limit=20 valid records are dead-lettered within
         # a second of a routine restart. Returning without settling lets the
-        # connection close requeue them exactly once. See discogsography-lnn4.
+        # connection close requeue them exactly once.
         logger.debug("🛑 Shutdown requested, leaving message unacked for redelivery")
         return
 
@@ -848,7 +851,7 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
             # every 30s forever and check_all_consumers_idle() could never return True,
             # so the connection and idle consumers were held open until restart. A
             # plain restart between the file_complete ack and this delivery reaches the
-            # same terminal state (discogsography-ewvh).
+            # same terminal state.
             completed_files.add(data_type)
             if CONSUMER_CANCEL_DELAY > 0 and data_type in queues:
                 await schedule_consumer_cancellation(data_type, queues[data_type])
@@ -943,7 +946,7 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
         # x-delivery-limit=20 — a budget with no time dimension — so requeueing
         # immediately spends all 20 redeliveries in ~3 minutes and RabbitMQ
         # dead-letters a perfectly valid record part-way through a routine
-        # database maintenance window (discogsography-rb05).
+        # database maintenance window.
         await outage_backoff.wait()
         await message.nack(requeue=True)
     except (DataError, IntegrityError) as e:
@@ -954,7 +957,7 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
         # fail identically every time, so nack without requeue instead of churning
         # through the quorum queue's redelivery limit — 20 futile redeliveries, each
         # opening a pooled connection and rolling back a transaction, per bad record
-        # (discogsography-yuyg). None of the musicbrainz tables declare a foreign key,
+        # None of the musicbrainz tables declare a foreign key,
         # so no IntegrityError here is order-dependent/transient.
         logger.error(
             "❌ Non-retryable data error, nacking without requeue",
@@ -1063,15 +1066,15 @@ async def progress_reporter() -> None:
 
 
 async def main() -> None:
-    """Main entry point for the brainztableinator service."""
+    """Main entry point for the MusicBrainz SQL loader service."""
     global connection_pool, config, connection_params, queues, rabbitmq_manager, active_connection, active_channel, connection_check_task
 
     # Set up signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    setup_logging("brainztableinator", log_file=Path("/logs/brainztableinator.log"))
-    logger.info("🚀 Starting MusicBrainz brainztableinator service with connection pooling")
+    setup_logging(SERVICE_NAME, log_file=Path(f"/logs/{SERVICE_NAME}.log"))
+    logger.info("🚀 Starting GrooveMap musicbrainz-sql-loader with connection pooling")
 
     # Add startup delay for dependent services
     startup_delay = int(os.environ.get("STARTUP_DELAY", "5"))
@@ -1089,7 +1092,7 @@ async def main() -> None:
 
     # Initialize configuration
     try:
-        config = BrainztableinatorConfig.from_env()
+        config = MusicBrainzSQLLoaderConfig.from_env()
     except ValueError as e:
         logger.error("❌ Configuration error", error=str(e))
         return
@@ -1191,9 +1194,9 @@ async def main() -> None:
         queues = {}
         for data_type in MUSICBRAINZ_DATA_TYPES:
             exchange_name = catalog_exchange_name("musicbrainz", data_type)
-            queue_name = catalog_queue_name("brainztableinator", data_type)
-            dlx_name = catalog_dead_letter_exchange_name("brainztableinator", data_type)
-            dlq_name = catalog_dead_letter_queue_name("brainztableinator", data_type)
+            queue_name = catalog_queue_name(AMQP_CONSUMER_ID, data_type)
+            dlx_name = catalog_dead_letter_exchange_name(AMQP_CONSUMER_ID, data_type)
+            dlq_name = catalog_dead_letter_queue_name(AMQP_CONSUMER_ID, data_type)
 
             # Declare fanout exchange (must match extractor)
             exchange = await channel.declare_exchange(exchange_name, AMQP_EXCHANGE_TYPE, durable=True, auto_delete=False)
@@ -1231,7 +1234,7 @@ async def main() -> None:
             consumer_tags[data_type] = await queues[data_type].consume(handler)
 
         logger.info(
-            f"🚀 Brainztableinator started! Connected to AMQP broker ({len(MUSICBRAINZ_DATA_TYPES)} fanout exchanges). "
+            f"🚀 {SERVICE_NAME} started! Connected to AMQP broker ({len(MUSICBRAINZ_DATA_TYPES)} fanout exchanges). "
             f"Consuming from {len(MUSICBRAINZ_DATA_TYPES)} queues with connection pool (max {config.postgres_pool_max_size} connections). "
             "Ready to process MusicBrainz messages into PostgreSQL. Press CTRL+C to exit"
         )
@@ -1260,7 +1263,7 @@ async def main() -> None:
         finally:
             # Stop new deliveries FIRST, before the multi-second flush/teardown
             # below: a still-subscribed consumer keeps being handed messages it
-            # can only leave unacked (discogsography-lnn4).
+            # can only leave unacked.
             await cancel_all_consumers()
 
             # Cancel progress reporting
@@ -1307,4 +1310,4 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error("❌ Application error", error=str(e))
     finally:
-        logger.info("✅ Brainztableinator service shutdown complete")
+        logger.info(f"✅ {SERVICE_NAME} service shutdown complete")

@@ -1,4 +1,4 @@
-"""Tests for the brainztableinator service."""
+"""Tests for the MusicBrainz SQL loader implementation."""
 
 import asyncio
 import contextlib
@@ -57,7 +57,7 @@ class TestHealthData:
         ):
             health = get_health_data()
             assert health["status"] == "starting"
-            assert health["service"] == "brainztableinator"
+            assert health["service"] == "musicbrainz-sql-loader"
             assert health["current_task"] == "Initializing PostgreSQL connection"
 
     def test_health_data_healthy(self):
@@ -78,7 +78,7 @@ class TestHealthData:
         ):
             health = get_health_data()
             assert health["status"] == "healthy"
-            assert health["service"] == "brainztableinator"
+            assert health["service"] == "musicbrainz-sql-loader"
 
 
 # ===========================================================================
@@ -322,7 +322,7 @@ class TestInsertRelationships:
 
     @pytest.mark.asyncio
     async def test_insert_relationships_conflict_target_includes_discriminating_fields(self):
-        """discogsography-dgtg: the ON CONFLICT target must match the widened
+        """The ON CONFLICT target must match the widened
         relationships_natural_key constraint (begin_date/end_date/attributes included)
         so two relationship instances differing only by date range or attributes are
         stored as separate rows instead of one overwriting the other. Only `ended`
@@ -385,7 +385,7 @@ class TestInsertRelationships:
     @pytest.mark.asyncio
     async def test_insert_relationships_forward_direction_keeps_source(self):
         """direction == 'forward' (or absent) keeps the processed entity as the
-        row's source. Regression test for discogsography-cu2.31.
+        row's source.
         """
         mock_conn, mock_cursor = _make_mock_conn()
         rels = [
@@ -413,7 +413,7 @@ class TestInsertRelationships:
         TARGET, not its source. Persisting it unswapped would store a
         semantically inverted relationship (e.g. a band's own record, direction
         backward, target=member, would otherwise assert the band is a member of
-        the member). Regression test for discogsography-cu2.31.
+        the member).
         """
         mock_conn, mock_cursor = _make_mock_conn()
         rels = [
@@ -438,7 +438,7 @@ class TestInsertRelationships:
 
     @pytest.mark.asyncio
     async def test_insert_relationships_canonicalizes_release_group_entity_type(self):
-        """discogsography-06gd: MusicBrainz spells release groups 'release_group'
+        """MusicBrainz spells release groups 'release_group'
         while every call site here hardcodes 'release-group'. Passing the raw
         spelling through wrote two vocabularies into the same table, so the
         forward row and the mirrored backward row no longer collided on the
@@ -459,7 +459,7 @@ class TestInsertRelationships:
 
     @pytest.mark.asyncio
     async def test_insert_relationships_mirrored_rows_agree_on_entity_type(self):
-        """discogsography-06gd: the row written while processing endpoint A and the
+        """The row written while processing endpoint A and the
         swapped row written while processing endpoint B must be byte-identical in
         their type columns, otherwise ON CONFLICT never fires."""
         mock_conn_a, mock_cursor_a = _make_mock_conn()
@@ -496,7 +496,7 @@ class TestInsertRelationships:
 
     @pytest.mark.asyncio
     async def test_insert_relationships_canonicalizes_the_processed_entity_type(self):
-        """discogsography-06gd: normalization must also cover source_type, so a caller
+        """Normalization must also cover source_type, so a caller
         passing the underscore spelling cannot reintroduce the split vocabulary."""
         mock_conn, mock_cursor = _make_mock_conn()
 
@@ -550,7 +550,7 @@ class TestInsertExternalLinks:
 
 
 # ===========================================================================
-# Present-but-null field coalescing (discogsography-iud5)
+# Present-but-null field coalescing
 # ===========================================================================
 
 
@@ -769,7 +769,7 @@ class TestOnDataMessage:
             await on_data_message(mock_message, "artists")
 
             mock_message.ack.assert_called_once()
-            # discogsography-ewvh: the terminal signal must also (re-)mark the type
+            # The terminal signal must also (re-)mark the type
             # complete — _recover_consumers discards it for any type whose queue still
             # holds messages, and this signal is often the only one left.
             assert completed == {"artists"}
@@ -820,7 +820,7 @@ class TestOnDataMessage:
     async def test_shutdown_requested_nacks_with_requeue(self):
         """When shutdown_requested is True the message is left UNSETTLED.
 
-        discogsography-lnn4: a still-subscribed consumer would be redelivered a
+        A still-subscribed consumer would be redelivered a
         nacked message within milliseconds, burning one quorum x-delivery-count
         per cycle until x-delivery-limit=20 dead-letters a perfectly valid record.
         Leaving it unsettled defers redelivery to connection close.
@@ -959,7 +959,7 @@ class TestOnDataMessage:
 
     @pytest.mark.asyncio
     async def test_integrity_error_nacks_without_requeue(self):
-        """discogsography-yuyg: a NOT NULL violation is deterministic, not transient.
+        """A NOT NULL violation is deterministic, not transient.
 
         NotNullViolation derives from psycopg's IntegrityError, NOT DataError, so it
         used to fall through to the generic handler and be nacked with requeue=True —
@@ -1139,12 +1139,12 @@ class TestMakeDataHandler:
 # ===========================================================================
 
 
-class TestBrainztableinatorConfig:
-    """Tests for BrainztableinatorConfig.from_env."""
+class TestMusicBrainzSQLLoaderConfig:
+    """Tests for MusicBrainzSQLLoaderConfig.from_env."""
 
     def test_from_env_with_all_vars(self):
         """Config should load successfully when all required env vars are set."""
-        from brainztableinator.config import BrainztableinatorConfig
+        from brainztableinator.config import MusicBrainzSQLLoaderConfig
 
         env_vars = {
             "RABBITMQ_USERNAME": "guest",
@@ -1157,7 +1157,7 @@ class TestBrainztableinatorConfig:
         }
 
         with patch.dict("os.environ", env_vars, clear=False):
-            cfg = BrainztableinatorConfig.from_env()
+            cfg = MusicBrainzSQLLoaderConfig.from_env()
 
             assert cfg.postgres_username == "user"
             assert cfg.postgres_password == "secret"
@@ -1166,7 +1166,7 @@ class TestBrainztableinatorConfig:
 
     def test_from_env_missing_vars_raises(self):
         """Config should raise ValueError when required env vars are missing."""
-        from brainztableinator.config import BrainztableinatorConfig
+        from brainztableinator.config import MusicBrainzSQLLoaderConfig
 
         env_vars = {
             "RABBITMQ_USERNAME": "guest",
@@ -1182,7 +1182,24 @@ class TestBrainztableinatorConfig:
             patch.dict("os.environ", env_vars, clear=True),
             pytest.raises(ValueError, match="Missing required environment variables"),
         ):
-            BrainztableinatorConfig.from_env()
+            MusicBrainzSQLLoaderConfig.from_env()
+
+    def test_from_env_requires_rabbitmq_credentials(self):
+        """The service must not inherit legacy RabbitMQ credential defaults."""
+        from brainztableinator.config import MusicBrainzSQLLoaderConfig
+
+        env_vars = {
+            "POSTGRES_HOST": "localhost",
+            "POSTGRES_USERNAME": "user",
+            "POSTGRES_PASSWORD": "secret",
+            "POSTGRES_DATABASE": "testdb",
+        }
+
+        with (
+            patch.dict("os.environ", env_vars, clear=True),
+            pytest.raises(ValueError, match="RABBITMQ_USERNAME, RABBITMQ_PASSWORD"),
+        ):
+            MusicBrainzSQLLoaderConfig.from_env()
 
 
 # ===========================================================================
@@ -1900,7 +1917,7 @@ class TestGetHealthDataExtended:
         assert "last_message_time" in result
         assert "timestamp" in result
         assert result["status"] == "healthy"
-        assert result["service"] == "brainztableinator"
+        assert result["service"] == "musicbrainz-sql-loader"
         assert result["current_task"] == "Processing artists"
 
         bt.connection_pool = None
@@ -2262,7 +2279,7 @@ class TestMain:
 
         assert mock_pool_class.call_count == 1
         call_args = mock_pool_class.call_args
-        # Budget-aware defaults from BrainztableinatorConfig (resolve_postgres_pool_sizes).
+        # Budget-aware defaults from MusicBrainzSQLLoaderConfig (resolve_postgres_pool_sizes).
         assert call_args[1]["max_connections"] == 12
         assert call_args[1]["min_connections"] == 2
         mock_rabbitmq_class.assert_called_once()
@@ -2299,7 +2316,7 @@ class TestMain:
         mock_health_instance = MagicMock()
         mock_health_server.return_value = mock_health_instance
 
-        with patch("brainztableinator.brainztableinator.BrainztableinatorConfig") as mock_config_class:
+        with patch("brainztableinator.brainztableinator.MusicBrainzSQLLoaderConfig") as mock_config_class:
             mock_config_class.from_env.side_effect = ValueError("Missing env vars")
             await main()
 
@@ -3093,7 +3110,7 @@ class TestMainEdgeCases:
 
         with (
             patch("asyncio.sleep", side_effect=fast_sleep),
-            patch("brainztableinator.brainztableinator.BrainztableinatorConfig") as mock_config_class,
+            patch("brainztableinator.brainztableinator.MusicBrainzSQLLoaderConfig") as mock_config_class,
         ):
             mock_config_class.from_env.return_value = mock_config
             await main()
@@ -3397,7 +3414,7 @@ class TestRecoverConsumersClearsTagsBrainztableinator:
 
 
 class TestOutageRequeueBackoff:
-    """Regression tests for discogsography-rb05 (outage → mass dead-lettering)."""
+    """Regression tests for outage-triggered mass dead-lettering."""
 
     @staticmethod
     def _pool_raising(error: Exception) -> MagicMock:

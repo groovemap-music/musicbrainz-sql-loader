@@ -1,8 +1,12 @@
-# MusicBrainz SQL loader documentation
+# musicbrainz-sql-loader documentation
 
-- [MusicBrainz synchronization](musicbrainz-sync.md)
+- [Configuration reference](configuration.md)
+- [MusicBrainz import and restart behavior](musicbrainz-sync.md)
 - [Consumer cancellation and draining](consumer-cancellation.md)
-- [File completion tracking](file-completion-tracking.md)
+- [File and extraction completion](file-completion-tracking.md)
 - [Database resilience](database-resilience.md)
-- [PostgreSQL pool exhaustion analysis](postgres-pool-exhaustion-analysis.md)
+- [PostgreSQL connection-budget analysis](postgres-pool-exhaustion-analysis.md)
 - [Source-history provenance](extraction.md)
+
+The repository [README](../README.md) is the starting point for functionality,
+development, validation, image naming, and compatibility identifiers.
