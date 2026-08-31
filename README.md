@@ -44,7 +44,7 @@ See the [configuration reference](docs/configuration.md) for every variable and 
 
 ## Develop and validate
 
-The project uses Python 3.13 or newer and a pinned `groovemap-runtime` revision from
+The project uses Python 3.14 and a pinned `groovemap-runtime` revision from
 [`python-libraries`](https://github.com/groovemap-music/python-libraries).
 
 ```bash
@@ -90,6 +90,8 @@ the compatibility identifiers are implementation details.
 - `just source-check` verifies promoted files and the generated binding by SHA-256.
 - `just release-dry-run` validates release artifacts without tagging, pushing,
   publishing, or releasing.
+- [Release compliance](docs/release-compliance.md) describes the security, dependency,
+  history, and remote-approval boundaries for publication.
 
 The current tree is MIT licensed. Historical revisions retain their then-applicable
 license.
