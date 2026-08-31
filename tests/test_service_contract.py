@@ -46,3 +46,12 @@ def test_operator_docs_use_current_identity_and_mermaid_diagrams() -> None:
     combined = "\n".join(path.read_text() for path in operator_docs if path.name != "extraction.md")
     assert "discogsography" not in combined.casefold()
     assert "```mermaid" in (ROOT / "README.md").read_text()
+    assert "Python 3.14" in combined
+    assert "Python 3.13" not in combined
+
+
+def test_release_compliance_keeps_remote_mutations_separately_approved() -> None:
+    compliance = (ROOT / "docs" / "release-compliance.md").read_text()
+    assert "including Dependabot, runs the same required" in compliance
+    assert "explicit operator approval" in compliance
+    assert "Tags, packages, and container publication require" in compliance
