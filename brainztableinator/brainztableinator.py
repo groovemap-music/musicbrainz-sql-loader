@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import structlog
-from aio_pika.abc import AbstractIncomingMessage
+from aio_pika.abc import AbstractIncomingMessage  # noqa: TC002 - runtime annotation introspection
 from common import (
     AsyncPostgreSQLPool,
     AsyncResilientRabbitMQ,
@@ -879,7 +879,7 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
         # through the quorum queue's redelivery limit before dead-lettering.
         try:
             uuid.UUID(data_id)
-        except (ValueError, AttributeError, TypeError):
+        except ValueError, AttributeError, TypeError:
             logger.warning(
                 "⚠️ Nacking record with non-UUID mbid/id",
                 data_type=data_type,

@@ -25,7 +25,7 @@ class MusicBrainzSQLLoaderConfig:
     postgres_pool_max_size: int = 12
 
     @classmethod
-    def from_env(cls) -> "MusicBrainzSQLLoaderConfig":
+    def from_env(cls) -> MusicBrainzSQLLoaderConfig:
         """Create configuration from environment variables."""
         rabbitmq_username = get_secret("RABBITMQ_USERNAME")
         rabbitmq_password = get_secret("RABBITMQ_PASSWORD")
