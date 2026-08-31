@@ -13,7 +13,7 @@ from common.config import (
 
 
 @dataclass(frozen=True)
-class BrainztableinatorConfig:
+class MusicBrainzSQLLoaderConfig:
     """Configuration for the MusicBrainz SQL loader."""
 
     amqp_connection: str = field(repr=False)
@@ -25,14 +25,18 @@ class BrainztableinatorConfig:
     postgres_pool_max_size: int = 12
 
     @classmethod
-    def from_env(cls) -> BrainztableinatorConfig:
+    def from_env(cls) -> MusicBrainzSQLLoaderConfig:
         """Create configuration from environment variables."""
+        rabbitmq_username = get_secret("RABBITMQ_USERNAME")
+        rabbitmq_password = get_secret("RABBITMQ_PASSWORD")
         postgres_username = get_secret("POSTGRES_USERNAME")
         postgres_password = get_secret("POSTGRES_PASSWORD")
         postgres_database = getenv("POSTGRES_DATABASE")
         missing_vars = [
             name
             for name, value in (
+                ("RABBITMQ_USERNAME", rabbitmq_username),
+                ("RABBITMQ_PASSWORD", rabbitmq_password),
                 ("POSTGRES_HOST", getenv("POSTGRES_HOST")),
                 ("POSTGRES_USERNAME", postgres_username),
                 ("POSTGRES_PASSWORD", postgres_password),
@@ -52,3 +56,7 @@ class BrainztableinatorConfig:
             postgres_pool_min_size=pool_min,
             postgres_pool_max_size=pool_max,
         )
+
+
+# Compatibility alias for callers that imported the pre-extraction class name.
+BrainztableinatorConfig = MusicBrainzSQLLoaderConfig
