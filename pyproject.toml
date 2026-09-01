@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "groovemap-musicbrainz-sql-loader"
-version = "0.1.0"
+version = "0.1.1"
 description = "Consume MusicBrainz events and load the complete dataset into GrooveMap PostgreSQL"
 authors = [{name = "Robert Wlodarczyk", email = "robert@simplicityguy.com"}]
 readme = "README.md"
