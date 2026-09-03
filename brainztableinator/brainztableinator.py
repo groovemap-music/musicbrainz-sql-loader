@@ -7,6 +7,7 @@ import uuid
 from asyncio import run
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 import structlog
@@ -17,8 +18,11 @@ from common import (
     DatabaseUnavailableError,
     HealthServer,
     OutageBackoff,
+    get_meter,
     parse_postgres_host_port,
     setup_logging,
+    setup_telemetry,
+    shutdown_telemetry,
 )
 from orjson import loads
 from psycopg.errors import DataError, IntegrityError, InterfaceError, OperationalError
@@ -26,6 +30,7 @@ from psycopg.types.json import Jsonb
 
 from brainztableinator.catalog_contract import (
     AMQP_EXCHANGE_TYPE,
+    CONSUMER_SOURCES,
     MUSICBRAINZ_DATA_TYPES,
 )
 from brainztableinator.catalog_contract import (
@@ -55,6 +60,146 @@ STARTUP_BANNER = r"""
 | musicbrainz-sql-loader         |
 +--------------------------------+
 """.strip("\n")
+
+# === OpenTelemetry domain metrics ===
+#
+# One meter for this service, resolved lazily (see ``_instrument``) so the first real call
+# always lands after ``main`` has called ``setup_telemetry`` — before that, a message cannot
+# reach ``on_data_message`` and a batch cannot reach ``_insert_relationships`` /
+# ``_insert_external_links``, because no consumer is registered until after telemetry setup.
+METRICS_SCOPE = "groovemap.brainztableinator"
+
+# The closed source label for every pipeline instrument this service emits.
+PIPELINE_SOURCE = CONSUMER_SOURCES[AMQP_CONSUMER_ID]["source"]
+
+PIPELINE_MESSAGES = "groovemap.pipeline.messages"
+PIPELINE_MESSAGE_DURATION = "groovemap.pipeline.message.duration"
+PIPELINE_BATCH_SIZE = "groovemap.pipeline.batch.size"
+PIPELINE_BATCH_FLUSH_DURATION = "groovemap.pipeline.batch.flush.duration"
+PIPELINE_CONSUMERS_ACTIVE = "groovemap.pipeline.consumers.active"
+
+# messaging.client.consumed.messages / .operation.duration would normally come free from
+# common.process_message_with_retry, but this service acks/nacks its own aio-pika deliveries
+# instead of going through that wrapper, so they are recorded locally with identical names
+# and attributes.
+MESSAGING_CONSUMED_MESSAGES = "messaging.client.consumed.messages"
+MESSAGING_OPERATION_DURATION = "messaging.client.operation.duration"
+MESSAGING_SYSTEM = "rabbitmq"
+
+STORE = "postgresql"
+
+# MUSICBRAINZ_DATA_TYPES is plural ("release-groups"); every metric attribute uses the
+# singular canonical entity vocabulary already used at the _insert_relationships /
+# _insert_external_links call sites ("release-group"), so one closed vocabulary covers every
+# domain instrument.
+_ENTITY_LABELS = {
+    "artists": "artist",
+    "labels": "label",
+    "release-groups": "release-group",
+    "releases": "release",
+}
+
+_instruments_lock = Lock()
+_instruments: dict[str, Any] | None = None
+
+
+def _build_instruments() -> dict[str, Any]:
+    """Create every domain instrument from the currently installed meter provider."""
+    meter = get_meter(METRICS_SCOPE)
+    return {
+        PIPELINE_MESSAGES: meter.create_counter(
+            PIPELINE_MESSAGES,
+            description="MusicBrainz pipeline messages settled (acked or nacked).",
+        ),
+        PIPELINE_MESSAGE_DURATION: meter.create_histogram(
+            PIPELINE_MESSAGE_DURATION,
+            unit="s",
+            description="Duration of handling one MusicBrainz pipeline message.",
+        ),
+        PIPELINE_BATCH_SIZE: meter.create_histogram(
+            PIPELINE_BATCH_SIZE,
+            unit="{items}",
+            description="Records flushed to PostgreSQL in one relationship/external-link batch.",
+        ),
+        PIPELINE_BATCH_FLUSH_DURATION: meter.create_histogram(
+            PIPELINE_BATCH_FLUSH_DURATION,
+            unit="s",
+            description="Duration of flushing one relationship/external-link batch to PostgreSQL.",
+        ),
+        PIPELINE_CONSUMERS_ACTIVE: meter.create_up_down_counter(
+            PIPELINE_CONSUMERS_ACTIVE,
+            description="Active MusicBrainz pipeline consumers.",
+        ),
+        MESSAGING_CONSUMED_MESSAGES: meter.create_counter(
+            MESSAGING_CONSUMED_MESSAGES,
+            description="Messages consumed from the broker.",
+        ),
+        MESSAGING_OPERATION_DURATION: meter.create_histogram(
+            MESSAGING_OPERATION_DURATION,
+            unit="s",
+            description="Duration of a messaging client operation.",
+        ),
+    }
+
+
+def _instrument(name: str) -> Any:
+    """Return one cached OpenTelemetry instrument, building the cache on first use."""
+    global _instruments
+    with _instruments_lock:
+        if _instruments is None:
+            _instruments = _build_instruments()
+        return _instruments[name]
+
+
+def reset_metric_instruments() -> None:
+    """Drop the cached instruments so the next use rebuilds them. Test seam only."""
+    global _instruments
+    with _instruments_lock:
+        _instruments = None
+
+
+def _record_pipeline_message(entity: str, outcome: str, duration_s: float) -> None:
+    """Record one settled pipeline message against the shared molecule conventions."""
+    try:
+        _instrument(PIPELINE_MESSAGES).add(1, {"source": PIPELINE_SOURCE, "entity": entity, "outcome": outcome})
+        _instrument(PIPELINE_MESSAGE_DURATION).record(duration_s, {"source": PIPELINE_SOURCE, "entity": entity})
+    except Exception:
+        logger.debug("Could not record pipeline message metrics", exc_info=True)
+
+
+def _record_consumed_message(destination: str, duration_s: float, error_type: str | None) -> None:
+    """Record one consumed message locally, mirroring common.process_message_with_retry."""
+    attributes: dict[str, str] = {
+        "messaging.system": MESSAGING_SYSTEM,
+        "messaging.destination.name": destination,
+        "messaging.operation.name": "process",
+    }
+    if error_type is not None:
+        attributes["error.type"] = error_type
+    try:
+        _instrument(MESSAGING_CONSUMED_MESSAGES).add(1, attributes)
+        _instrument(MESSAGING_OPERATION_DURATION).record(duration_s, attributes)
+    except Exception:
+        logger.debug("Could not record consumed-message metrics", exc_info=True)
+
+
+def _record_batch_flush(entity: str, size: int, duration_s: float, outcome: str) -> None:
+    """Record one relationship/external-link batch flush to PostgreSQL."""
+    attributes = {"store": STORE, "entity": entity, "outcome": outcome}
+    try:
+        _instrument(PIPELINE_BATCH_SIZE).record(size, attributes)
+        _instrument(PIPELINE_BATCH_FLUSH_DURATION).record(duration_s, attributes)
+    except Exception:
+        logger.debug("Could not record batch flush metrics", exc_info=True)
+
+
+def _record_consumer_delta(delta: int) -> None:
+    """Adjust the active-consumer gauge by ``delta`` (+1 on start, -1 on stop)."""
+    try:
+        _instrument(PIPELINE_CONSUMERS_ACTIVE).add(delta, {"source": PIPELINE_SOURCE})
+    except Exception:
+        logger.debug("Could not record consumer count metric", exc_info=True)
+
 
 # Config will be initialized in main
 config: MusicBrainzSQLLoaderConfig | None = None
@@ -215,6 +360,7 @@ async def schedule_consumer_cancellation(data_type: str, queue: Any) -> None:
 
                 # Remove from tracking
                 del consumer_tags[data_type]
+                _record_consumer_delta(-1)
 
                 logger.info(
                     f"✅ Consumer for {data_type} successfully canceled",
@@ -252,10 +398,12 @@ async def cancel_all_consumers() -> None:
         queue = queues.get(data_type)
         if queue is None:
             consumer_tags.pop(data_type, None)
+            _record_consumer_delta(-1)
             continue
         try:
             await queue.cancel(consumer_tag, nowait=True)
             consumer_tags.pop(data_type, None)
+            _record_consumer_delta(-1)
         except Exception as e:
             logger.warning(
                 "⚠️ Failed to cancel consumer during shutdown",
@@ -461,6 +609,7 @@ async def _recover_consumers() -> None:
                     handler = make_data_handler(data_type)
                     consumer_tag = await queues[data_type].consume(handler)
                     consumer_tags[data_type] = consumer_tag
+                    _record_consumer_delta(1)
                     # Only un-complete a type that actually has a backlog, so
                     # genuinely-finished types stay marked complete.
                     if data_type in pending_counts:
@@ -499,6 +648,7 @@ async def _recover_consumers() -> None:
         # died with the now-closed connection. Leaving them behind would keep
         # len(consumer_tags) > 0 forever, permanently gating off both recovery
         # routes (stuck-check requires 0 tags) while health still reads healthy.
+        _record_consumer_delta(-len(consumer_tags))
         consumer_tags.clear()
 
 
@@ -559,6 +709,7 @@ async def _insert_relationships(conn: Any, source_mbid: str, source_type: str, r
     orientation (e.g. member->band for "member of band"), regardless of
     which endpoint's record we happened to be processing.
     """
+    canonical_source_type = _canonical_entity_type(source_type)
     params = []
     for rel in rels:
         # Skip relations missing a target MBID (would fail UUID cast), target entity
@@ -567,7 +718,6 @@ async def _insert_relationships(conn: Any, source_mbid: str, source_type: str, r
             continue
 
         rel_target_type = _canonical_entity_type(rel["target_type"])
-        canonical_source_type = _canonical_entity_type(source_type)
 
         if rel.get("direction") == "backward":
             row_source_mbid, row_source_type = rel["target_mbid"], rel_target_type
@@ -590,25 +740,32 @@ async def _insert_relationships(conn: Any, source_mbid: str, source_type: str, r
             )
         )
     if not params:
+        _record_batch_flush(canonical_source_type, 0, 0.0, "skipped")
         return
-    async with conn.cursor() as cursor:
-        await cursor.executemany(
-            "INSERT INTO musicbrainz.relationships "
-            "(source_mbid, source_entity_type, target_mbid, target_entity_type, relationship_type, attributes, begin_date, end_date, ended) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
-            # The conflict target must match relationships_natural_key in the
-            # database-schema repository's src/groovemap_schema/postgres.py,
-            # which includes begin_date/end_date/attributes so that two distinct relationship
-            # instances (e.g. a re-joined band membership with different date ranges, or a
-            # multi-instrument performer credit) coexist as separate rows instead of one
-            # silently overwriting the other. begin_date/end_date/
-            # attributes are now part of the conflict key so a genuine re-ingest conflict only
-            # occurs when they already match; only `ended` (a mutable flag, not part of the
-            # relationship's identity) needs refreshing on conflict.
-            "ON CONFLICT (source_mbid, target_mbid, source_entity_type, target_entity_type, relationship_type, begin_date, end_date, attributes) "
-            "DO UPDATE SET ended = EXCLUDED.ended",
-            params,
-        )
+    started = time.perf_counter()
+    try:
+        async with conn.cursor() as cursor:
+            await cursor.executemany(
+                "INSERT INTO musicbrainz.relationships "
+                "(source_mbid, source_entity_type, target_mbid, target_entity_type, relationship_type, attributes, begin_date, end_date, ended) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                # The conflict target must match relationships_natural_key in the
+                # database-schema repository's src/groovemap_schema/postgres.py,
+                # which includes begin_date/end_date/attributes so that two distinct relationship
+                # instances (e.g. a re-joined band membership with different date ranges, or a
+                # multi-instrument performer credit) coexist as separate rows instead of one
+                # silently overwriting the other. begin_date/end_date/
+                # attributes are now part of the conflict key so a genuine re-ingest conflict only
+                # occurs when they already match; only `ended` (a mutable flag, not part of the
+                # relationship's identity) needs refreshing on conflict.
+                "ON CONFLICT (source_mbid, target_mbid, source_entity_type, target_entity_type, relationship_type, begin_date, end_date, attributes) "
+                "DO UPDATE SET ended = EXCLUDED.ended",
+                params,
+            )
+    except Exception:
+        _record_batch_flush(canonical_source_type, len(params), time.perf_counter() - started, "failed")
+        raise
+    _record_batch_flush(canonical_source_type, len(params), time.perf_counter() - started, "processed")
 
 
 async def _insert_external_links(conn: Any, mbid: str, entity_type: str, links: list[dict[str, Any]]) -> None:
@@ -617,6 +774,7 @@ async def _insert_external_links(conn: Any, mbid: str, entity_type: str, links: 
     Uses a single ``executemany`` for the same round-trip / transaction-window reasons
     described in :func:`_insert_relationships`.
     """
+    canonical_entity_type = _canonical_entity_type(entity_type)
     params = [
         (
             mbid,
@@ -628,15 +786,22 @@ async def _insert_external_links(conn: Any, mbid: str, entity_type: str, links: 
         if link.get("url") and link.get("service")  # Skip links missing URL or service name
     ]
     if not params:
+        _record_batch_flush(canonical_entity_type, 0, 0.0, "skipped")
         return
-    async with conn.cursor() as cursor:
-        await cursor.executemany(
-            "INSERT INTO musicbrainz.external_links "
-            "(mbid, entity_type, url, service_name) "
-            "VALUES (%s, %s, %s, %s) "
-            "ON CONFLICT (mbid, entity_type, service_name, url) DO UPDATE SET url = EXCLUDED.url",
-            params,
-        )
+    started = time.perf_counter()
+    try:
+        async with conn.cursor() as cursor:
+            await cursor.executemany(
+                "INSERT INTO musicbrainz.external_links "
+                "(mbid, entity_type, url, service_name) "
+                "VALUES (%s, %s, %s, %s) "
+                "ON CONFLICT (mbid, entity_type, service_name, url) DO UPDATE SET url = EXCLUDED.url",
+                params,
+            )
+    except Exception:
+        _record_batch_flush(canonical_entity_type, len(params), time.perf_counter() - started, "failed")
+        raise
+    _record_batch_flush(canonical_entity_type, len(params), time.perf_counter() - started, "processed")
 
 
 async def process_artist(conn: Any, record: dict[str, Any]) -> None:
@@ -805,7 +970,15 @@ def make_data_handler(
 
 
 async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> None:
-    """Process an incoming MusicBrainz data message."""
+    """Process an incoming MusicBrainz data message.
+
+    Every settled message (acked or nacked below) is counted once against
+    ``groovemap.pipeline.messages`` / ``.message.duration`` and against
+    ``messaging.client.consumed.messages`` / ``.operation.duration``. The messaging pair
+    would normally come free from ``common.process_message_with_retry``, but this handler
+    acks/nacks its own aio-pika delivery instead of going through that wrapper, so it is
+    recorded locally here with the identical instrument names and attributes.
+    """
     if shutdown_requested:
         # Leave the delivery UNACKED — never nack(requeue=True) here. The
         # consumer is still subscribed at this point, so a requeue is redelivered
@@ -816,164 +989,198 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
         logger.debug("🛑 Shutdown requested, leaving message unacked for redelivery")
         return
 
+    entity = _ENTITY_LABELS.get(data_type, data_type)
     try:
-        data: dict[str, Any] = loads(message.body)
+        destination = catalog_queue_name(AMQP_CONSUMER_ID, data_type)
+    except ValueError:
+        # A closed, low-cardinality fallback for a data_type outside the known catalog
+        # vocabulary — never fall back to the raw (potentially free-text) data_type.
+        destination = "unknown"
+    started = time.perf_counter()
+    outcome = "processed"
+    error_type: str | None = None
 
-        # Check if this is a file completion message
-        if data.get("type") == "file_complete":
-            total_processed = data.get("total_processed", 0)
-            logger.info(f"✅ File processing complete for {data_type}! Total records processed: {total_processed}")
-
-            # Schedule consumer cancellation if enabled
-            if CONSUMER_CANCEL_DELAY > 0 and data_type in queues:
-                await schedule_consumer_cancellation(data_type, queues[data_type])
-
-            # Mark as completed AFTER scheduling cancellation so the stuck-state
-            # checker still fires for any in-flight messages during the delay.
-            completed_files.add(data_type)
-
-            await message.ack()
-            return
-
-        # Check if this is an extraction completion message
-        if data.get("type") == "extraction_complete":
-            logger.info(
-                "🏁 Received extraction_complete signal",
-                data_type=data_type,
-                version=data.get("version"),
-            )
-
-            # extraction_complete is this type's terminal signal, so it must also
-            # (re-)mark the type complete. completed_files is otherwise written only by
-            # file_complete and ERASED by _recover_consumers for any type whose queue
-            # still holds messages — and when the only pending message IS this signal,
-            # nothing ever restored the flag: the stall check then logged at ERROR
-            # every 30s forever and check_all_consumers_idle() could never return True,
-            # so the connection and idle consumers were held open until restart. A
-            # plain restart between the file_complete ack and this delivery reaches the
-            # same terminal state.
-            completed_files.add(data_type)
-            if CONSUMER_CANCEL_DELAY > 0 and data_type in queues:
-                await schedule_consumer_cancellation(data_type, queues[data_type])
-
-            await message.ack()
-            return
-
-        # Normal message processing - require 'id' field
-        if "id" not in data:
-            logger.error("❌ Message missing 'id' field", data=data)
-            await message.nack(requeue=False)
-            return
-
-        data_id: str = data["id"]
-
-        # Guard against empty mbid/id — would crash PostgreSQL UUID cast
-        if not data_id:
-            logger.warning("⚠️ Nacking record with empty mbid/id", data_type=data_type)
-            await message.nack(requeue=False)
-            return
-
-        # Guard against a non-UUID mbid/id — e.g. the extractor's "unknown" sentinel
-        # for a JSONL line missing its id. This would otherwise pass the emptiness
-        # check above, fail the PostgreSQL UUID cast deterministically, and churn
-        # through the quorum queue's redelivery limit before dead-lettering.
+    try:
         try:
-            uuid.UUID(data_id)
-        except ValueError, AttributeError, TypeError:
-            logger.warning(
-                "⚠️ Nacking record with non-UUID mbid/id",
-                data_type=data_type,
-                data_id=data_id,
-            )
-            await message.nack(requeue=False)
-            return
+            data: dict[str, Any] = loads(message.body)
 
-        # Extract record details for logging
-        record_name = data.get("name", "Unknown")
-        logger.debug(
-            "🔄 Processing record",
-            data_type=data_type[:-1],
-            data_id=data_id,
-            record_name=record_name,
-        )
+            # Check if this is a file completion message
+            if data.get("type") == "file_complete":
+                total_processed = data.get("total_processed", 0)
+                logger.info(f"✅ File processing complete for {data_type}! Total records processed: {total_processed}")
 
-    except Exception as e:
-        logger.error("❌ Failed to parse message", error=str(e))
-        await message.nack(requeue=False)
-        return
+                # Schedule consumer cancellation if enabled
+                if CONSUMER_CANCEL_DELAY > 0 and data_type in queues:
+                    await schedule_consumer_cancellation(data_type, queues[data_type])
 
-    # Process record using async connection pool
-    try:
-        if connection_pool is None:
-            raise RuntimeError("Connection pool not initialized")
+                # Mark as completed AFTER scheduling cancellation so the stuck-state
+                # checker still fires for any in-flight messages during the delay.
+                completed_files.add(data_type)
 
-        processor = PROCESSORS.get(data_type)
-        if processor is None:
-            logger.error("❌ No processor for data type", data_type=data_type)
-            await message.nack(requeue=False)
-            return
+                await message.ack()
+                outcome = "skipped"
+                return
 
-        async with connection_pool.connection() as conn:
-            await conn.set_autocommit(False)
-            async with conn.transaction():
-                await processor(conn, data)
-
-            logger.debug(
-                "🐘 Updated record in PostgreSQL",
-                data_type=data_type[:-1],
-                data_id=data_id,
-            )
-
-        await message.ack()
-
-        # PostgreSQL answered — clear the outage backoff.
-        outage_backoff.reset()
-
-        # Increment counter and update last message time only after successful ack
-        if data_type in message_counts:
-            message_counts[data_type] += 1
-            last_message_time[data_type] = time.time()
-            if message_counts[data_type] % progress_interval == 0:
+            # Check if this is an extraction completion message
+            if data.get("type") == "extraction_complete":
                 logger.info(
-                    "📊 Processed records in PostgreSQL",
-                    count=message_counts[data_type],
+                    "🏁 Received extraction_complete signal",
                     data_type=data_type,
+                    version=data.get("version"),
                 )
 
-    except (InterfaceError, OperationalError, DatabaseUnavailableError) as e:
-        logger.warning("⚠️ Database connection issue, will retry", error=str(e))
-        # Pause before requeueing. The main queues are quorum queues with
-        # x-delivery-limit=20 — a budget with no time dimension — so requeueing
-        # immediately spends all 20 redeliveries in ~3 minutes and RabbitMQ
-        # dead-letters a perfectly valid record part-way through a routine
-        # database maintenance window.
-        await outage_backoff.wait()
-        await message.nack(requeue=True)
-    except (DataError, IntegrityError) as e:
-        # Malformed data that deterministically fails a column cast (DataError, e.g. a
-        # non-UUID mbid that slipped past validation above) or a constraint
-        # (IntegrityError, e.g. NotNullViolation when the dump line carried no
-        # name/title, which the extractor forwards as "name": null). Retrying would
-        # fail identically every time, so nack without requeue instead of churning
-        # through the quorum queue's redelivery limit — 20 futile redeliveries, each
-        # opening a pooled connection and rolling back a transaction, per bad record
-        # None of the musicbrainz tables declare a foreign key,
-        # so no IntegrityError here is order-dependent/transient.
-        logger.error(
-            "❌ Non-retryable data error, nacking without requeue",
-            data_type=data_type,
-            error=str(e),
-        )
-        try:
+                # extraction_complete is this type's terminal signal, so it must also
+                # (re-)mark the type complete. completed_files is otherwise written only by
+                # file_complete and ERASED by _recover_consumers for any type whose queue
+                # still holds messages — and when the only pending message IS this signal,
+                # nothing ever restored the flag: the stall check then logged at ERROR
+                # every 30s forever and check_all_consumers_idle() could never return True,
+                # so the connection and idle consumers were held open until restart. A
+                # plain restart between the file_complete ack and this delivery reaches the
+                # same terminal state.
+                completed_files.add(data_type)
+                if CONSUMER_CANCEL_DELAY > 0 and data_type in queues:
+                    await schedule_consumer_cancellation(data_type, queues[data_type])
+
+                await message.ack()
+                outcome = "skipped"
+                return
+
+            # Normal message processing - require 'id' field
+            if "id" not in data:
+                logger.error("❌ Message missing 'id' field", data=data)
+                await message.nack(requeue=False)
+                outcome = "failed"
+                error_type = "ValidationError"
+                return
+
+            data_id: str = data["id"]
+
+            # Guard against empty mbid/id — would crash PostgreSQL UUID cast
+            if not data_id:
+                logger.warning("⚠️ Nacking record with empty mbid/id", data_type=data_type)
+                await message.nack(requeue=False)
+                outcome = "failed"
+                error_type = "ValidationError"
+                return
+
+            # Guard against a non-UUID mbid/id — e.g. the extractor's "unknown" sentinel
+            # for a JSONL line missing its id. This would otherwise pass the emptiness
+            # check above, fail the PostgreSQL UUID cast deterministically, and churn
+            # through the quorum queue's redelivery limit before dead-lettering.
+            try:
+                uuid.UUID(data_id)
+            except ValueError, AttributeError, TypeError:
+                logger.warning(
+                    "⚠️ Nacking record with non-UUID mbid/id",
+                    data_type=data_type,
+                    data_id=data_id,
+                )
+                await message.nack(requeue=False)
+                outcome = "failed"
+                error_type = "ValidationError"
+                return
+
+            # Extract record details for logging
+            record_name = data.get("name", "Unknown")
+            logger.debug(
+                "🔄 Processing record",
+                data_type=data_type[:-1],
+                data_id=data_id,
+                record_name=record_name,
+            )
+
+        except Exception as e:
+            logger.error("❌ Failed to parse message", error=str(e))
             await message.nack(requeue=False)
-        except Exception as nack_error:
-            logger.warning("⚠️ Failed to nack message", error=str(nack_error))
-    except Exception as e:
-        logger.error("❌ Failed to process message", data_type=data_type, error=str(e))
+            outcome = "failed"
+            error_type = type(e).__name__
+            return
+
+        # Process record using async connection pool
         try:
+            if connection_pool is None:
+                raise RuntimeError("Connection pool not initialized")
+
+            processor = PROCESSORS.get(data_type)
+            if processor is None:
+                logger.error("❌ No processor for data type", data_type=data_type)
+                await message.nack(requeue=False)
+                outcome = "failed"
+                error_type = "UnknownEntity"
+                return
+
+            async with connection_pool.connection() as conn:
+                await conn.set_autocommit(False)
+                async with conn.transaction():
+                    await processor(conn, data)
+
+                logger.debug(
+                    "🐘 Updated record in PostgreSQL",
+                    data_type=data_type[:-1],
+                    data_id=data_id,
+                )
+
+            await message.ack()
+
+            # PostgreSQL answered — clear the outage backoff.
+            outage_backoff.reset()
+
+            # Increment counter and update last message time only after successful ack
+            if data_type in message_counts:
+                message_counts[data_type] += 1
+                last_message_time[data_type] = time.time()
+                if message_counts[data_type] % progress_interval == 0:
+                    logger.info(
+                        "📊 Processed records in PostgreSQL",
+                        count=message_counts[data_type],
+                        data_type=data_type,
+                    )
+
+        except (InterfaceError, OperationalError, DatabaseUnavailableError) as e:
+            logger.warning("⚠️ Database connection issue, will retry", error=str(e))
+            # Pause before requeueing. The main queues are quorum queues with
+            # x-delivery-limit=20 — a budget with no time dimension — so requeueing
+            # immediately spends all 20 redeliveries in ~3 minutes and RabbitMQ
+            # dead-letters a perfectly valid record part-way through a routine
+            # database maintenance window.
+            await outage_backoff.wait()
             await message.nack(requeue=True)
-        except Exception as nack_error:
-            logger.warning("⚠️ Failed to nack message", error=str(nack_error))
+            outcome = "failed"
+            error_type = type(e).__name__
+        except (DataError, IntegrityError) as e:
+            # Malformed data that deterministically fails a column cast (DataError, e.g. a
+            # non-UUID mbid that slipped past validation above) or a constraint
+            # (IntegrityError, e.g. NotNullViolation when the dump line carried no
+            # name/title, which the extractor forwards as "name": null). Retrying would
+            # fail identically every time, so nack without requeue instead of churning
+            # through the quorum queue's redelivery limit — 20 futile redeliveries, each
+            # opening a pooled connection and rolling back a transaction, per bad record
+            # None of the musicbrainz tables declare a foreign key,
+            # so no IntegrityError here is order-dependent/transient.
+            logger.error(
+                "❌ Non-retryable data error, nacking without requeue",
+                data_type=data_type,
+                error=str(e),
+            )
+            try:
+                await message.nack(requeue=False)
+            except Exception as nack_error:
+                logger.warning("⚠️ Failed to nack message", error=str(nack_error))
+            outcome = "failed"
+            error_type = type(e).__name__
+        except Exception as e:
+            logger.error("❌ Failed to process message", data_type=data_type, error=str(e))
+            try:
+                await message.nack(requeue=True)
+            except Exception as nack_error:
+                logger.warning("⚠️ Failed to nack message", error=str(nack_error))
+            outcome = "failed"
+            error_type = type(e).__name__
+    finally:
+        duration = time.perf_counter() - started
+        _record_pipeline_message(entity, outcome, duration)
+        _record_consumed_message(destination, duration, error_type)
 
 
 async def progress_reporter() -> None:
@@ -1074,6 +1281,7 @@ async def main() -> None:
     signal.signal(signal.SIGTERM, signal_handler)
 
     setup_logging(SERVICE_NAME, log_file=Path(f"/logs/{SERVICE_NAME}.log"))
+    setup_telemetry(AMQP_CONSUMER_ID)
     logger.info("🚀 Starting GrooveMap musicbrainz-sql-loader with connection pooling")
 
     # Add startup delay for dependent services
@@ -1232,6 +1440,7 @@ async def main() -> None:
         for data_type in MUSICBRAINZ_DATA_TYPES:
             handler = make_data_handler(data_type)
             consumer_tags[data_type] = await queues[data_type].consume(handler)
+            _record_consumer_delta(1)
 
         logger.info(
             f"🚀 {SERVICE_NAME} started! Connected to AMQP broker ({len(MUSICBRAINZ_DATA_TYPES)} fanout exchanges). "
@@ -1295,6 +1504,9 @@ async def main() -> None:
 
         # Stop health server
         health_server.stop()
+
+        # Force-flush and shut down telemetry so the last export lands.
+        shutdown_telemetry()
 
 
 def cli() -> None:
