@@ -6,6 +6,30 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 
+# Every standard OpenTelemetry variable that changes what the SDK records or exports. The
+# telemetry suites assert on what an in-memory provider recorded, so they must not inherit
+# ambient OTEL configuration — a CI runner or a developer's shell may set OTEL_SDK_DISABLED
+# or a real collector endpoint, which would otherwise make those assertions fail silently
+# (an empty collection, no error) or reach out to a real endpoint.
+OTEL_ENVIRONMENT = (
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+    "OTEL_METRICS_EXEMPLAR_FILTER",
+    "OTEL_METRICS_EXPORTER",
+    "OTEL_METRIC_EXPORT_INTERVAL",
+    "OTEL_RESOURCE_ATTRIBUTES",
+    "OTEL_SDK_DISABLED",
+    "OTEL_SERVICE_NAME",
+)
+
+
+@pytest.fixture(autouse=True)
+def isolated_otel_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run every test against a known-empty OpenTelemetry configuration."""
+    for name in OTEL_ENVIRONMENT:
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture(autouse=True)
 def service_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     """Provide deterministic dummy service configuration for isolated unit tests."""
