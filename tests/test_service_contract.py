@@ -7,8 +7,8 @@ from typing import get_type_hints
 from aio_pika.abc import AbstractIncomingMessage
 
 import brainztableinator.brainztableinator as service
-from brainztableinator.catalog_contract import AMQP_EXCHANGE_TYPE, MUSICBRAINZ_DATA_TYPES, MUSICBRAINZ_EXCHANGE_PREFIX
 from brainztableinator.config import BrainztableinatorConfig, MusicBrainzSQLLoaderConfig
+from brainztableinator.queue_names import AMQP_EXCHANGE_TYPE, MUSICBRAINZ_DATA_TYPES, MUSICBRAINZ_EXCHANGE_PREFIX
 
 
 ROOT = Path(__file__).parent.parent
