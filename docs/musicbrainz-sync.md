@@ -32,6 +32,23 @@ The `musicbrainz` schema and its tables are initialized by the separately releas
 `database-schema` image. This loader performs upserts only; it does not run migrations or
 embed a competing schema definition.
 
+## Canonical media block
+
+`musicbrainz.releases.media` holds the canonical media block from ADR 0007 (see the
+`design` repository), indexed with a GIN index on `media -> 'families'` for medium-level
+queries. `process_release` writes it on every upsert:
+
+- A release event that already carries the precomputed `media` object (a producer at or
+  after the media rollout) writes that block verbatim.
+- A release event carrying only the raw `media_raw` medium list (a producer that predates
+  the field) derives a best-effort block from it through the shared `common.media` mapper,
+  along with `status`/`packaging`/`release_group` when present.
+- A release with neither field still writes a schema-valid empty block, so the column is
+  never NULL for a row this loader writes.
+
+The raw medium list (`media_raw`, when the event carries it) is untouched and stored as
+received inside the `data` column, alongside every other raw field.
+
 ## Restart guarantees
 
 Normal records that are being processed during shutdown remain unacknowledged. The

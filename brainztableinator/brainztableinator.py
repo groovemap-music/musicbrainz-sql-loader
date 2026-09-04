@@ -19,6 +19,7 @@ from common import (
     HealthServer,
     OutageBackoff,
     get_meter,
+    map_musicbrainz_release,
     parse_postgres_host_port,
     setup_logging,
     setup_telemetry,
@@ -28,24 +29,24 @@ from orjson import loads
 from psycopg.errors import DataError, IntegrityError, InterfaceError, OperationalError
 from psycopg.types.json import Jsonb
 
-from brainztableinator.catalog_contract import (
+from brainztableinator.config import MusicBrainzSQLLoaderConfig
+from brainztableinator.queue_names import (
     AMQP_EXCHANGE_TYPE,
     CONSUMER_SOURCES,
     MUSICBRAINZ_DATA_TYPES,
 )
-from brainztableinator.catalog_contract import (
+from brainztableinator.queue_names import (
     dead_letter_exchange_name as catalog_dead_letter_exchange_name,
 )
-from brainztableinator.catalog_contract import (
+from brainztableinator.queue_names import (
     dead_letter_queue_name as catalog_dead_letter_queue_name,
 )
-from brainztableinator.catalog_contract import (
+from brainztableinator.queue_names import (
     exchange_name as catalog_exchange_name,
 )
-from brainztableinator.catalog_contract import (
+from brainztableinator.queue_names import (
     queue_name as catalog_queue_name,
 )
-from brainztableinator.config import MusicBrainzSQLLoaderConfig
 
 
 logger = structlog.get_logger(__name__)
@@ -556,7 +557,7 @@ async def _recover_consumers() -> None:
             # Declare per-data-type fanout exchanges and consumer-owned queues
             queues = {}
             for data_type in MUSICBRAINZ_DATA_TYPES:
-                exchange_name = catalog_exchange_name("musicbrainz", data_type)
+                exchange_name = catalog_exchange_name(data_type)
                 queue_name = catalog_queue_name(AMQP_CONSUMER_ID, data_type)
                 dlx_name = catalog_dead_letter_exchange_name(AMQP_CONSUMER_ID, data_type)
                 dlq_name = catalog_dead_letter_queue_name(AMQP_CONSUMER_ID, data_type)
@@ -886,19 +887,46 @@ async def process_label(conn: Any, record: dict[str, Any]) -> None:
     await _insert_external_links(conn, mbid, "label", record.get("external_links", []))
 
 
+def _release_media_block(record: dict[str, Any]) -> dict[str, Any]:
+    """Return the release's canonical media block (ADR 0007).
+
+    A producer at or after the media rollout attaches the precomputed canonical
+    ``media`` block directly, so that block is used as-is. An event from a producer
+    that predates the field carries only the raw ``media_raw`` medium list (or
+    neither field at all); in both of those cases a best-effort block is derived
+    through the shared Python mapper, so the persisted column is never left NULL
+    for a row this loader writes. ``status``/``packaging``/``release_group`` ride
+    along on the derivation so a predates-media event still yields an edition/
+    packaging/release_kind-aware block, not just its medium items.
+    """
+    media = record.get("media")
+    if isinstance(media, dict):
+        return media
+
+    return map_musicbrainz_release(
+        {
+            "media": record.get("media_raw") or [],
+            "status": record.get("status"),
+            "packaging": record.get("packaging"),
+            "release_group": record.get("release_group"),
+        }
+    )
+
+
 async def process_release(conn: Any, record: dict[str, Any]) -> None:
     """Insert or update a MusicBrainz release record in PostgreSQL."""
     mbid = record.get("mbid", record.get("id", ""))
     async with conn.cursor() as cursor:
         await cursor.execute(
             "INSERT INTO musicbrainz.releases "
-            "(mbid, name, barcode, status, release_group_mbid, discogs_release_id, data) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+            "(mbid, name, barcode, status, release_group_mbid, discogs_release_id, media, data) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
             "ON CONFLICT (mbid) DO UPDATE SET "
             "name = EXCLUDED.name, barcode = EXCLUDED.barcode, "
             "status = EXCLUDED.status, "
             "release_group_mbid = EXCLUDED.release_group_mbid, "
             "discogs_release_id = EXCLUDED.discogs_release_id, "
+            "media = EXCLUDED.media, "
             "data = EXCLUDED.data, updated_at = NOW()",
             (
                 mbid,
@@ -907,6 +935,7 @@ async def process_release(conn: Any, record: dict[str, Any]) -> None:
                 record.get("status", ""),
                 record.get("release_group_mbid"),
                 record.get("discogs_release_id"),
+                Jsonb(_release_media_block(record)),
                 Jsonb(record),
             ),
         )
@@ -1401,7 +1430,7 @@ async def main() -> None:
         # Declare per-data-type fanout exchanges and consumer-owned queues
         queues = {}
         for data_type in MUSICBRAINZ_DATA_TYPES:
-            exchange_name = catalog_exchange_name("musicbrainz", data_type)
+            exchange_name = catalog_exchange_name(data_type)
             queue_name = catalog_queue_name(AMQP_CONSUMER_ID, data_type)
             dlx_name = catalog_dead_letter_exchange_name(AMQP_CONSUMER_ID, data_type)
             dlq_name = catalog_dead_letter_queue_name(AMQP_CONSUMER_ID, data_type)

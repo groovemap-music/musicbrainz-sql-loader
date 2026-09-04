@@ -1,7 +1,7 @@
 {
-  "binding_sha256": "0fe43d0ddbe0e36098271f5478122e9d49dd272b4ff7a927af02ee9b98bb4587",
-  "contract_sha256": "cfb094491b2a29ab5b3ba0078476387cd29c881535464cdecc82dcbb6d5fed03",
-  "migration_transform": "Rebranded disposable runtime exchange prefixes from Discogsography to GrooveMap.",
-  "producer_commit": "e7038d1492da54e91444bfa990598e8963972ce2",
-  "producer_repository": "https://github.com/groovemap-music/catalog-ingestion"
+  "binding_sha256": "5ec6d7e0317e39396b9b40effb4804e70242768b95499b922b161c6f300c1273",
+  "contract_sha256": "85ebbe7b94669f2abd38ca9c5c83b4019aa71b8aa3aa4b9d9fb7f78ba35095ef",
+  "migration_transform": "Repointed the producer pin from the retired combined catalog-ingestion contract to the musicbrainz-only musicbrainz-ingestion contract; the discogs consumers, sources, and fixtures are gone and MusicBrainz release fixtures now carry the media and media_raw fields.",
+  "producer_commit": "f0dae1037c809c6855863aebc35d0a7d21366482",
+  "producer_repository": "https://github.com/groovemap-music/musicbrainz-ingestion"
 }
