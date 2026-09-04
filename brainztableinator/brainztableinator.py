@@ -28,24 +28,24 @@ from orjson import loads
 from psycopg.errors import DataError, IntegrityError, InterfaceError, OperationalError
 from psycopg.types.json import Jsonb
 
-from brainztableinator.catalog_contract import (
+from brainztableinator.config import MusicBrainzSQLLoaderConfig
+from brainztableinator.queue_names import (
     AMQP_EXCHANGE_TYPE,
     CONSUMER_SOURCES,
     MUSICBRAINZ_DATA_TYPES,
 )
-from brainztableinator.catalog_contract import (
+from brainztableinator.queue_names import (
     dead_letter_exchange_name as catalog_dead_letter_exchange_name,
 )
-from brainztableinator.catalog_contract import (
+from brainztableinator.queue_names import (
     dead_letter_queue_name as catalog_dead_letter_queue_name,
 )
-from brainztableinator.catalog_contract import (
+from brainztableinator.queue_names import (
     exchange_name as catalog_exchange_name,
 )
-from brainztableinator.catalog_contract import (
+from brainztableinator.queue_names import (
     queue_name as catalog_queue_name,
 )
-from brainztableinator.config import MusicBrainzSQLLoaderConfig
 
 
 logger = structlog.get_logger(__name__)
@@ -556,7 +556,7 @@ async def _recover_consumers() -> None:
             # Declare per-data-type fanout exchanges and consumer-owned queues
             queues = {}
             for data_type in MUSICBRAINZ_DATA_TYPES:
-                exchange_name = catalog_exchange_name("musicbrainz", data_type)
+                exchange_name = catalog_exchange_name(data_type)
                 queue_name = catalog_queue_name(AMQP_CONSUMER_ID, data_type)
                 dlx_name = catalog_dead_letter_exchange_name(AMQP_CONSUMER_ID, data_type)
                 dlq_name = catalog_dead_letter_queue_name(AMQP_CONSUMER_ID, data_type)
@@ -1401,7 +1401,7 @@ async def main() -> None:
         # Declare per-data-type fanout exchanges and consumer-owned queues
         queues = {}
         for data_type in MUSICBRAINZ_DATA_TYPES:
-            exchange_name = catalog_exchange_name("musicbrainz", data_type)
+            exchange_name = catalog_exchange_name(data_type)
             queue_name = catalog_queue_name(AMQP_CONSUMER_ID, data_type)
             dlx_name = catalog_dead_letter_exchange_name(AMQP_CONSUMER_ID, data_type)
             dlq_name = catalog_dead_letter_queue_name(AMQP_CONSUMER_ID, data_type)

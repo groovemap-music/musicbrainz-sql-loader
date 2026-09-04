@@ -6,38 +6,16 @@
     },
     "brainztableinator": {
       "source": "musicbrainz"
-    },
-    "graphinator": {
-      "source": "discogs"
-    },
-    "tableinator": {
-      "source": "discogs"
     }
   },
   "contract": "groovemap.catalog-events",
   "event_schema": "schemas/event.schema.json",
+  "event_schema_sha256": "e89b24364448dd0496f96d1dc8b8d46198e358ac12dbd48d250dd6ef7f2967f0",
   "exchange": {
     "kind": "fanout",
     "name_template": "{exchange_prefix}-{entity}"
   },
-  "extraction_rules": "../../../extraction-rules.yaml",
   "fixture_payloads": {
-    "discogs": {
-      "artists": {
-        "name": "Contract Artist"
-      },
-      "labels": {
-        "name": "Contract Label"
-      },
-      "masters": {
-        "title": "Contract Master",
-        "year": 2000
-      },
-      "releases": {
-        "released": "2000-01-01",
-        "title": "Contract Release"
-      }
-    },
     "musicbrainz": {
       "artists": {
         "mb_type": "Person",
@@ -53,7 +31,54 @@
         "name": "Contract Release Group"
       },
       "releases": {
-        "name": "Contract Release"
+        "media": {
+          "container": null,
+          "edition": [],
+          "families": [
+            "vinyl"
+          ],
+          "flags": [],
+          "items": [
+            {
+              "appearance": [],
+              "channels": null,
+              "codec": null,
+              "family": "vinyl",
+              "medium": "vinyl_12",
+              "position": 1,
+              "qty": 1,
+              "size_inches": 12,
+              "source": {
+                "descriptions": [],
+                "name": "12\" Vinyl",
+                "provider": "musicbrainz",
+                "text": null
+              },
+              "speed_rpm": null,
+              "track_count": 9,
+              "variants": []
+            }
+          ],
+          "packaging": null,
+          "release_kind": null,
+          "taxonomy_version": "1",
+          "traits": [],
+          "unmapped": {
+            "descriptions": [],
+            "formats": []
+          }
+        },
+        "media_raw": [
+          {
+            "format": "12\" Vinyl",
+            "format_id": null,
+            "position": 1,
+            "title": "",
+            "track_count": 9
+          }
+        ],
+        "name": "Contract Release",
+        "status": "Official"
       }
     }
   },
@@ -62,17 +87,62 @@
     "dead_letter_queue_template": "{queue}.dlq",
     "name_template": "{exchange_prefix}-{consumer}-{entity}"
   },
-  "sources": {
-    "discogs": {
-      "default_exchange_prefix": "groovemap-discogs",
-      "entities": [
-        "artists",
-        "labels",
-        "masters",
-        "releases"
-      ],
-      "exchange_prefix_env": "DISCOGS_EXCHANGE_PREFIX"
+  "runtime_identifiers": {
+    "exchanges": {
+      "artists": "groovemap-musicbrainz-artists",
+      "labels": "groovemap-musicbrainz-labels",
+      "release-groups": "groovemap-musicbrainz-release-groups",
+      "releases": "groovemap-musicbrainz-releases"
     },
+    "queues": {
+      "brainzgraphinator": {
+        "artists": {
+          "dead_letter_exchange": "groovemap-musicbrainz-brainzgraphinator-artists.dlx",
+          "dead_letter_queue": "groovemap-musicbrainz-brainzgraphinator-artists.dlq",
+          "name": "groovemap-musicbrainz-brainzgraphinator-artists"
+        },
+        "labels": {
+          "dead_letter_exchange": "groovemap-musicbrainz-brainzgraphinator-labels.dlx",
+          "dead_letter_queue": "groovemap-musicbrainz-brainzgraphinator-labels.dlq",
+          "name": "groovemap-musicbrainz-brainzgraphinator-labels"
+        },
+        "release-groups": {
+          "dead_letter_exchange": "groovemap-musicbrainz-brainzgraphinator-release-groups.dlx",
+          "dead_letter_queue": "groovemap-musicbrainz-brainzgraphinator-release-groups.dlq",
+          "name": "groovemap-musicbrainz-brainzgraphinator-release-groups"
+        },
+        "releases": {
+          "dead_letter_exchange": "groovemap-musicbrainz-brainzgraphinator-releases.dlx",
+          "dead_letter_queue": "groovemap-musicbrainz-brainzgraphinator-releases.dlq",
+          "name": "groovemap-musicbrainz-brainzgraphinator-releases"
+        }
+      },
+      "brainztableinator": {
+        "artists": {
+          "dead_letter_exchange": "groovemap-musicbrainz-brainztableinator-artists.dlx",
+          "dead_letter_queue": "groovemap-musicbrainz-brainztableinator-artists.dlq",
+          "name": "groovemap-musicbrainz-brainztableinator-artists"
+        },
+        "labels": {
+          "dead_letter_exchange": "groovemap-musicbrainz-brainztableinator-labels.dlx",
+          "dead_letter_queue": "groovemap-musicbrainz-brainztableinator-labels.dlq",
+          "name": "groovemap-musicbrainz-brainztableinator-labels"
+        },
+        "release-groups": {
+          "dead_letter_exchange": "groovemap-musicbrainz-brainztableinator-release-groups.dlx",
+          "dead_letter_queue": "groovemap-musicbrainz-brainztableinator-release-groups.dlq",
+          "name": "groovemap-musicbrainz-brainztableinator-release-groups"
+        },
+        "releases": {
+          "dead_letter_exchange": "groovemap-musicbrainz-brainztableinator-releases.dlx",
+          "dead_letter_queue": "groovemap-musicbrainz-brainztableinator-releases.dlq",
+          "name": "groovemap-musicbrainz-brainztableinator-releases"
+        }
+      }
+    },
+    "source": "musicbrainz"
+  },
+  "sources": {
     "musicbrainz": {
       "default_exchange_prefix": "groovemap-musicbrainz",
       "entities": [
