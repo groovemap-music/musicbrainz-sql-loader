@@ -211,6 +211,153 @@ class TestProcessRelease:
         assert "INSERT INTO musicbrainz.releases" in sql
         assert "ON CONFLICT (mbid) DO UPDATE" in sql
 
+    @pytest.mark.asyncio
+    async def test_process_release_writes_media_column_and_sets_it_on_conflict(self):
+        """The `media` column and its ON CONFLICT update are wired into the upsert."""
+        mock_conn, mock_cursor = _make_mock_conn()
+        record = {
+            "mbid": "release-mbid-media",
+            "name": "Test Album",
+            "media": {
+                "taxonomy_version": "1",
+                "items": [],
+                "families": [],
+                "release_kind": None,
+                "traits": [],
+                "edition": [],
+                "packaging": None,
+                "container": None,
+                "flags": [],
+                "unmapped": {"formats": [], "descriptions": []},
+            },
+        }
+
+        await process_release(mock_conn, record)
+
+        sql = mock_cursor.execute.call_args_list[0][0][0]
+        assert "media" in sql
+        assert "media = EXCLUDED.media" in sql
+
+    @pytest.mark.asyncio
+    async def test_process_release_with_canonical_media_writes_it_verbatim(self):
+        """A multi-medium release event that already carries `media` writes that block as-is,
+        and the raw medium list stays untouched inside `data`."""
+        mock_conn, mock_cursor = _make_mock_conn()
+        media_block = {
+            "taxonomy_version": "1",
+            "items": [
+                {
+                    "family": "vinyl",
+                    "medium": "vinyl_12",
+                    "qty": 1,
+                    "size_inches": 12,
+                    "speed_rpm": None,
+                    "channels": None,
+                    "codec": None,
+                    "variants": [],
+                    "appearance": [],
+                    "position": 1,
+                    "track_count": 9,
+                    "source": {"provider": "musicbrainz", "name": '12" Vinyl', "descriptions": [], "text": None},
+                },
+                {
+                    "family": "optical",
+                    "medium": "optical_cd",
+                    "qty": 1,
+                    "size_inches": None,
+                    "speed_rpm": None,
+                    "channels": None,
+                    "codec": None,
+                    "variants": [],
+                    "appearance": [],
+                    "position": 2,
+                    "track_count": 12,
+                    "source": {"provider": "musicbrainz", "name": "CD", "descriptions": [], "text": None},
+                },
+            ],
+            "families": ["optical", "vinyl"],
+            "release_kind": None,
+            "traits": [],
+            "edition": [],
+            "packaging": None,
+            "container": None,
+            "flags": [],
+            "unmapped": {"formats": [], "descriptions": []},
+        }
+        media_raw = [
+            {"format": '12" Vinyl', "format_id": None, "position": 1, "title": "", "track_count": 9},
+            {"format": "CD", "format_id": None, "position": 2, "title": "", "track_count": 12},
+        ]
+        record = {
+            "mbid": "release-mbid-multi",
+            "name": "Multi-Medium Album",
+            "status": "Official",
+            "media": media_block,
+            "media_raw": media_raw,
+        }
+
+        await process_release(mock_conn, record)
+
+        params = mock_cursor.execute.call_args_list[0][0][1]
+        # (mbid, name, barcode, status, release_group_mbid, discogs_release_id, media, data)
+        assert params[6].obj == media_block
+        assert params[6].obj is media_block
+        assert params[7].obj["media_raw"] == media_raw
+
+    @pytest.mark.asyncio
+    async def test_process_release_without_media_but_with_media_raw_derives_block(self):
+        """An event carrying only the raw medium list derives a canonical block from it."""
+        mock_conn, mock_cursor = _make_mock_conn()
+        record = {
+            "mbid": "release-mbid-derived",
+            "name": "Derived Album",
+            "status": "Official",
+            "media_raw": [{"format": '12" Vinyl', "format_id": None, "position": 1, "title": "", "track_count": 9}],
+        }
+
+        await process_release(mock_conn, record)
+
+        params = mock_cursor.execute.call_args_list[0][0][1]
+        media = params[6].obj
+        assert media["families"] == ["vinyl"]
+        assert len(media["items"]) == 1
+        assert media["items"][0]["medium"] == "vinyl_12"
+        assert media["edition"] == []  # "Official" status maps to no edition fact
+
+    @pytest.mark.asyncio
+    async def test_process_release_without_media_or_media_raw_writes_empty_block(self):
+        """A release predating both fields still writes a schema-valid, never-NULL block."""
+        mock_conn, mock_cursor = _make_mock_conn()
+        record = {"mbid": "release-mbid-legacy", "name": "Legacy Album"}
+
+        await process_release(mock_conn, record)
+
+        params = mock_cursor.execute.call_args_list[0][0][1]
+        media = params[6].obj
+        assert media["items"] == []
+        assert media["families"] == []
+        assert media["taxonomy_version"] == "1"
+        assert media["unmapped"] == {"formats": [], "descriptions": []}
+
+    @pytest.mark.asyncio
+    async def test_process_release_media_reupsert_is_idempotent(self):
+        """Re-processing the same event twice writes the identical media block both times."""
+        mock_conn, mock_cursor = _make_mock_conn()
+        record = {
+            "mbid": "release-mbid-idempotent",
+            "name": "Repeated Album",
+            "status": "Official",
+            "media_raw": [{"format": '12" Vinyl', "format_id": None, "position": 1, "title": "", "track_count": 9}],
+        }
+
+        await process_release(mock_conn, record)
+        first_media = mock_cursor.execute.call_args_list[0][0][1][6].obj
+
+        await process_release(mock_conn, record)
+        second_media = mock_cursor.execute.call_args_list[1][0][1][6].obj
+
+        assert first_media == second_media
+
 
 class TestProcessReleaseGroup:
     """Tests for process_release_group."""
