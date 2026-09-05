@@ -5,6 +5,9 @@ import signal
 import time
 import uuid
 from asyncio import run
+from collections.abc import Iterator, Mapping  # noqa: TC003 - contextmanager return annotation
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Lock
@@ -18,13 +21,18 @@ from common import (
     DatabaseUnavailableError,
     HealthServer,
     OutageBackoff,
+    extract_context,
+    flush_span,
     get_meter,
+    get_tracer,
     map_musicbrainz_release,
     parse_postgres_host_port,
     setup_logging,
     setup_telemetry,
     shutdown_telemetry,
+    start_event_loop_monitor,
 )
+from opentelemetry.trace import SpanKind, Status, StatusCode
 from orjson import loads
 from psycopg.errors import DataError, IntegrityError, InterfaceError, OperationalError
 from psycopg.types.json import Jsonb
@@ -200,6 +208,108 @@ def _record_consumer_delta(delta: int) -> None:
         _instrument(PIPELINE_CONSUMERS_ACTIVE).add(delta, {"source": PIPELINE_SOURCE})
     except Exception:
         logger.debug("Could not record consumer count metric", exc_info=True)
+
+
+# === OpenTelemetry spans ===
+#
+# Spans report under the same instrumentation scope as the metrics above, so an operator
+# reads one scope name for both signals. The tracer is resolved per span rather than cached
+# at import time: ``main`` installs the TracerProvider inside ``setup_telemetry``, and a
+# tracer captured before that would keep pointing at whatever was installed then.
+#
+# Every span opened here sets ``record_exception=False`` / ``set_status_on_exception=False``
+# and marks a failure with a status plus ``error.type`` by hand, per the GrooveMap span
+# conventions: no message, no stack trace, no span event carrying a payload. The shared
+# helpers in ``common.tracing`` already do the same, so nesting reads consistently.
+
+# The CONSUMER span context of the delivery currently being processed, so a batch flush can
+# link back to the message spans it covers. A ContextVar rather than a parameter because the
+# flush helpers sit four frames below the handler behind the per-entity processors, and the
+# link is telemetry, not an argument any of them should have to carry.
+_message_span_context: ContextVar[Any | None] = ContextVar("brainztableinator_message_span", default=None)
+
+
+def _mark_span_failed(span: Any, error_type: str) -> None:
+    """Fail a span with ``error.type`` only. Never raises."""
+    if span is None:
+        return
+    try:
+        span.set_attribute("error.type", error_type)
+        span.set_status(Status(StatusCode.ERROR))
+    except Exception:
+        logger.debug("Could not mark a span as failed", exc_info=True)
+
+
+def _set_span_outcome(span: Any, outcome: str) -> None:
+    """Record the closed-set outcome on a span. Never raises."""
+    if span is None:
+        return
+    try:
+        span.set_attribute("outcome", outcome)
+    except Exception:
+        logger.debug("Could not record a span outcome", exc_info=True)
+
+
+@contextmanager
+def _consume_span(destination: str, headers: Mapping[str, Any] | None) -> Iterator[Any]:
+    """Open the CONSUMER span for one delivery: ``process {destination}``.
+
+    The span joins the trace the extractor's publish started, which reaches this process as
+    the ``traceparent`` header on the AMQP message; a delivery without a readable one starts
+    a new trace rather than failing. ``common.process_message_with_retry`` would open this
+    span for free, but this service acks/nacks its own aio-pika deliveries instead of going
+    through that wrapper (see :func:`on_data_message`), so it is opened here from the same
+    stable helpers with the identical name, kind, and attributes.
+
+    Yields ``None`` when no span could be started, so the caller stays branch-free.
+    """
+    try:
+        manager = get_tracer(METRICS_SCOPE).start_as_current_span(
+            f"process {destination}",
+            context=extract_context(headers) if headers else None,
+            kind=SpanKind.CONSUMER,
+            attributes={
+                "messaging.system": MESSAGING_SYSTEM,
+                "messaging.destination.name": destination,
+                "messaging.operation.name": "process",
+            },
+            record_exception=False,
+            set_status_on_exception=False,
+        )
+    except Exception:
+        logger.debug("Could not start the consumer span", exc_info=True)
+        yield None
+        return
+
+    with manager as span:
+        yield span
+
+
+def _span_context_of(span: Any) -> Any:
+    """Return a span's context, or None when there is no recording span to link to.
+
+    A no-op tracer yields the invalid span, whose context would otherwise become a link
+    pointing nowhere. Never raises.
+    """
+    if span is None:
+        return None
+    try:
+        context = span.get_span_context()
+    except Exception:
+        logger.debug("Could not read a span context", exc_info=True)
+        return None
+    return context if context is not None and context.is_valid else None
+
+
+def _flush_links() -> list[Any]:
+    """Return the message span contexts the batch flush about to run covers.
+
+    One delivery drives one flush in this service, so this is a single-element list.
+    ``common.flush_span`` applies the 64-link cap the conventions set, which is what bounds a
+    consumer that instead flushes many deliveries in one batch.
+    """
+    context = _message_span_context.get()
+    return [] if context is None else [context]
 
 
 # Config will be initialized in main
@@ -740,33 +850,39 @@ async def _insert_relationships(conn: Any, source_mbid: str, source_type: str, r
                 _get_or(rel, "ended", False),
             )
         )
-    if not params:
-        _record_batch_flush(canonical_source_type, 0, 0.0, "skipped")
-        return
-    started = time.perf_counter()
-    try:
-        async with conn.cursor() as cursor:
-            await cursor.executemany(
-                "INSERT INTO musicbrainz.relationships "
-                "(source_mbid, source_entity_type, target_mbid, target_entity_type, relationship_type, attributes, begin_date, end_date, ended) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
-                # The conflict target must match relationships_natural_key in the
-                # database-schema repository's src/groovemap_schema/postgres.py,
-                # which includes begin_date/end_date/attributes so that two distinct relationship
-                # instances (e.g. a re-joined band membership with different date ranges, or a
-                # multi-instrument performer credit) coexist as separate rows instead of one
-                # silently overwriting the other. begin_date/end_date/
-                # attributes are now part of the conflict key so a genuine re-ingest conflict only
-                # occurs when they already match; only `ended` (a mutable flag, not part of the
-                # relationship's identity) needs refreshing on conflict.
-                "ON CONFLICT (source_mbid, target_mbid, source_entity_type, target_entity_type, relationship_type, begin_date, end_date, attributes) "
-                "DO UPDATE SET ended = EXCLUDED.ended",
-                params,
-            )
-    except Exception:
-        _record_batch_flush(canonical_source_type, len(params), time.perf_counter() - started, "failed")
-        raise
-    _record_batch_flush(canonical_source_type, len(params), time.perf_counter() - started, "processed")
+    with flush_span(STORE, canonical_source_type, links=_flush_links()) as span:
+        if not params:
+            _record_batch_flush(canonical_source_type, 0, 0.0, "skipped")
+            _set_span_outcome(span, "skipped")
+            return
+        started = time.perf_counter()
+        try:
+            async with conn.cursor() as cursor:
+                await cursor.executemany(
+                    "INSERT INTO musicbrainz.relationships "
+                    "(source_mbid, source_entity_type, target_mbid, target_entity_type, relationship_type, attributes, begin_date, end_date, ended) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                    # The conflict target must match relationships_natural_key in the
+                    # database-schema repository's src/groovemap_schema/postgres.py,
+                    # which includes begin_date/end_date/attributes so that two distinct relationship
+                    # instances (e.g. a re-joined band membership with different date ranges, or a
+                    # multi-instrument performer credit) coexist as separate rows instead of one
+                    # silently overwriting the other. begin_date/end_date/
+                    # attributes are now part of the conflict key so a genuine re-ingest conflict only
+                    # occurs when they already match; only `ended` (a mutable flag, not part of the
+                    # relationship's identity) needs refreshing on conflict.
+                    "ON CONFLICT (source_mbid, target_mbid, source_entity_type, target_entity_type, relationship_type, begin_date, end_date, attributes) "
+                    "DO UPDATE SET ended = EXCLUDED.ended",
+                    params,
+                )
+        except Exception:
+            _record_batch_flush(canonical_source_type, len(params), time.perf_counter() - started, "failed")
+            _set_span_outcome(span, "failed")
+            # The re-raise leaves the flush span through common.flush_span, which sets the
+            # ERROR status and error.type itself; setting them again here would be duplicate.
+            raise
+        _record_batch_flush(canonical_source_type, len(params), time.perf_counter() - started, "processed")
+        _set_span_outcome(span, "processed")
 
 
 async def _insert_external_links(conn: Any, mbid: str, entity_type: str, links: list[dict[str, Any]]) -> None:
@@ -786,23 +902,29 @@ async def _insert_external_links(conn: Any, mbid: str, entity_type: str, links: 
         for link in links
         if link.get("url") and link.get("service")  # Skip links missing URL or service name
     ]
-    if not params:
-        _record_batch_flush(canonical_entity_type, 0, 0.0, "skipped")
-        return
-    started = time.perf_counter()
-    try:
-        async with conn.cursor() as cursor:
-            await cursor.executemany(
-                "INSERT INTO musicbrainz.external_links "
-                "(mbid, entity_type, url, service_name) "
-                "VALUES (%s, %s, %s, %s) "
-                "ON CONFLICT (mbid, entity_type, service_name, url) DO UPDATE SET url = EXCLUDED.url",
-                params,
-            )
-    except Exception:
-        _record_batch_flush(canonical_entity_type, len(params), time.perf_counter() - started, "failed")
-        raise
-    _record_batch_flush(canonical_entity_type, len(params), time.perf_counter() - started, "processed")
+    with flush_span(STORE, canonical_entity_type, links=_flush_links()) as span:
+        if not params:
+            _record_batch_flush(canonical_entity_type, 0, 0.0, "skipped")
+            _set_span_outcome(span, "skipped")
+            return
+        started = time.perf_counter()
+        try:
+            async with conn.cursor() as cursor:
+                await cursor.executemany(
+                    "INSERT INTO musicbrainz.external_links "
+                    "(mbid, entity_type, url, service_name) "
+                    "VALUES (%s, %s, %s, %s) "
+                    "ON CONFLICT (mbid, entity_type, service_name, url) DO UPDATE SET url = EXCLUDED.url",
+                    params,
+                )
+        except Exception:
+            _record_batch_flush(canonical_entity_type, len(params), time.perf_counter() - started, "failed")
+            _set_span_outcome(span, "failed")
+            # The re-raise leaves the flush span through common.flush_span, which sets the
+            # ERROR status and error.type itself; setting them again here would be duplicate.
+            raise
+        _record_batch_flush(canonical_entity_type, len(params), time.perf_counter() - started, "processed")
+        _set_span_outcome(span, "processed")
 
 
 async def process_artist(conn: Any, record: dict[str, Any]) -> None:
@@ -1026,190 +1148,201 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
         # vocabulary — never fall back to the raw (potentially free-text) data_type.
         destination = "unknown"
     started = time.perf_counter()
-    outcome = "processed"
-    error_type: str | None = None
+    # Every delivery is processed inside the CONSUMER span, which joins the trace the
+    # extractor's publish started through the ``traceparent`` AMQP header. The span stays
+    # open across the whole handler, so the pool's db spans and the batch flush spans below
+    # nest under it and one trace shows a record's path from the dump file into PostgreSQL.
+    with _consume_span(destination, message.headers) as span:
+        # Published for the batch flushes further down the call stack to link back to.
+        token = _message_span_context.set(_span_context_of(span))
+        outcome = "processed"
+        error_type: str | None = None
 
-    try:
         try:
-            data: dict[str, Any] = loads(message.body)
-
-            # Check if this is a file completion message
-            if data.get("type") == "file_complete":
-                total_processed = data.get("total_processed", 0)
-                logger.info(f"✅ File processing complete for {data_type}! Total records processed: {total_processed}")
-
-                # Schedule consumer cancellation if enabled
-                if CONSUMER_CANCEL_DELAY > 0 and data_type in queues:
-                    await schedule_consumer_cancellation(data_type, queues[data_type])
-
-                # Mark as completed AFTER scheduling cancellation so the stuck-state
-                # checker still fires for any in-flight messages during the delay.
-                completed_files.add(data_type)
-
-                await message.ack()
-                outcome = "skipped"
-                return
-
-            # Check if this is an extraction completion message
-            if data.get("type") == "extraction_complete":
-                logger.info(
-                    "🏁 Received extraction_complete signal",
-                    data_type=data_type,
-                    version=data.get("version"),
-                )
-
-                # extraction_complete is this type's terminal signal, so it must also
-                # (re-)mark the type complete. completed_files is otherwise written only by
-                # file_complete and ERASED by _recover_consumers for any type whose queue
-                # still holds messages — and when the only pending message IS this signal,
-                # nothing ever restored the flag: the stall check then logged at ERROR
-                # every 30s forever and check_all_consumers_idle() could never return True,
-                # so the connection and idle consumers were held open until restart. A
-                # plain restart between the file_complete ack and this delivery reaches the
-                # same terminal state.
-                completed_files.add(data_type)
-                if CONSUMER_CANCEL_DELAY > 0 and data_type in queues:
-                    await schedule_consumer_cancellation(data_type, queues[data_type])
-
-                await message.ack()
-                outcome = "skipped"
-                return
-
-            # Normal message processing - require 'id' field
-            if "id" not in data:
-                logger.error("❌ Message missing 'id' field", data=data)
-                await message.nack(requeue=False)
-                outcome = "failed"
-                error_type = "ValidationError"
-                return
-
-            data_id: str = data["id"]
-
-            # Guard against empty mbid/id — would crash PostgreSQL UUID cast
-            if not data_id:
-                logger.warning("⚠️ Nacking record with empty mbid/id", data_type=data_type)
-                await message.nack(requeue=False)
-                outcome = "failed"
-                error_type = "ValidationError"
-                return
-
-            # Guard against a non-UUID mbid/id — e.g. the extractor's "unknown" sentinel
-            # for a JSONL line missing its id. This would otherwise pass the emptiness
-            # check above, fail the PostgreSQL UUID cast deterministically, and churn
-            # through the quorum queue's redelivery limit before dead-lettering.
             try:
-                uuid.UUID(data_id)
-            except ValueError, AttributeError, TypeError:
-                logger.warning(
-                    "⚠️ Nacking record with non-UUID mbid/id",
-                    data_type=data_type,
-                    data_id=data_id,
-                )
-                await message.nack(requeue=False)
-                outcome = "failed"
-                error_type = "ValidationError"
-                return
+                data: dict[str, Any] = loads(message.body)
 
-            # Extract record details for logging
-            record_name = data.get("name", "Unknown")
-            logger.debug(
-                "🔄 Processing record",
-                data_type=data_type[:-1],
-                data_id=data_id,
-                record_name=record_name,
-            )
+                # Check if this is a file completion message
+                if data.get("type") == "file_complete":
+                    total_processed = data.get("total_processed", 0)
+                    logger.info(f"✅ File processing complete for {data_type}! Total records processed: {total_processed}")
 
-        except Exception as e:
-            logger.error("❌ Failed to parse message", error=str(e))
-            await message.nack(requeue=False)
-            outcome = "failed"
-            error_type = type(e).__name__
-            return
+                    # Schedule consumer cancellation if enabled
+                    if CONSUMER_CANCEL_DELAY > 0 and data_type in queues:
+                        await schedule_consumer_cancellation(data_type, queues[data_type])
 
-        # Process record using async connection pool
-        try:
-            if connection_pool is None:
-                raise RuntimeError("Connection pool not initialized")
+                    # Mark as completed AFTER scheduling cancellation so the stuck-state
+                    # checker still fires for any in-flight messages during the delay.
+                    completed_files.add(data_type)
 
-            processor = PROCESSORS.get(data_type)
-            if processor is None:
-                logger.error("❌ No processor for data type", data_type=data_type)
-                await message.nack(requeue=False)
-                outcome = "failed"
-                error_type = "UnknownEntity"
-                return
+                    await message.ack()
+                    outcome = "skipped"
+                    return
 
-            async with connection_pool.connection() as conn:
-                await conn.set_autocommit(False)
-                async with conn.transaction():
-                    await processor(conn, data)
-
-                logger.debug(
-                    "🐘 Updated record in PostgreSQL",
-                    data_type=data_type[:-1],
-                    data_id=data_id,
-                )
-
-            await message.ack()
-
-            # PostgreSQL answered — clear the outage backoff.
-            outage_backoff.reset()
-
-            # Increment counter and update last message time only after successful ack
-            if data_type in message_counts:
-                message_counts[data_type] += 1
-                last_message_time[data_type] = time.time()
-                if message_counts[data_type] % progress_interval == 0:
+                # Check if this is an extraction completion message
+                if data.get("type") == "extraction_complete":
                     logger.info(
-                        "📊 Processed records in PostgreSQL",
-                        count=message_counts[data_type],
+                        "🏁 Received extraction_complete signal",
                         data_type=data_type,
+                        version=data.get("version"),
                     )
 
-        except (InterfaceError, OperationalError, DatabaseUnavailableError) as e:
-            logger.warning("⚠️ Database connection issue, will retry", error=str(e))
-            # Pause before requeueing. The main queues are quorum queues with
-            # x-delivery-limit=20 — a budget with no time dimension — so requeueing
-            # immediately spends all 20 redeliveries in ~3 minutes and RabbitMQ
-            # dead-letters a perfectly valid record part-way through a routine
-            # database maintenance window.
-            await outage_backoff.wait()
-            await message.nack(requeue=True)
-            outcome = "failed"
-            error_type = type(e).__name__
-        except (DataError, IntegrityError) as e:
-            # Malformed data that deterministically fails a column cast (DataError, e.g. a
-            # non-UUID mbid that slipped past validation above) or a constraint
-            # (IntegrityError, e.g. NotNullViolation when the dump line carried no
-            # name/title, which the extractor forwards as "name": null). Retrying would
-            # fail identically every time, so nack without requeue instead of churning
-            # through the quorum queue's redelivery limit — 20 futile redeliveries, each
-            # opening a pooled connection and rolling back a transaction, per bad record
-            # None of the musicbrainz tables declare a foreign key,
-            # so no IntegrityError here is order-dependent/transient.
-            logger.error(
-                "❌ Non-retryable data error, nacking without requeue",
-                data_type=data_type,
-                error=str(e),
-            )
-            try:
+                    # extraction_complete is this type's terminal signal, so it must also
+                    # (re-)mark the type complete. completed_files is otherwise written only by
+                    # file_complete and ERASED by _recover_consumers for any type whose queue
+                    # still holds messages — and when the only pending message IS this signal,
+                    # nothing ever restored the flag: the stall check then logged at ERROR
+                    # every 30s forever and check_all_consumers_idle() could never return True,
+                    # so the connection and idle consumers were held open until restart. A
+                    # plain restart between the file_complete ack and this delivery reaches the
+                    # same terminal state.
+                    completed_files.add(data_type)
+                    if CONSUMER_CANCEL_DELAY > 0 and data_type in queues:
+                        await schedule_consumer_cancellation(data_type, queues[data_type])
+
+                    await message.ack()
+                    outcome = "skipped"
+                    return
+
+                # Normal message processing - require 'id' field
+                if "id" not in data:
+                    logger.error("❌ Message missing 'id' field", data=data)
+                    await message.nack(requeue=False)
+                    outcome = "failed"
+                    error_type = "ValidationError"
+                    return
+
+                data_id: str = data["id"]
+
+                # Guard against empty mbid/id — would crash PostgreSQL UUID cast
+                if not data_id:
+                    logger.warning("⚠️ Nacking record with empty mbid/id", data_type=data_type)
+                    await message.nack(requeue=False)
+                    outcome = "failed"
+                    error_type = "ValidationError"
+                    return
+
+                # Guard against a non-UUID mbid/id — e.g. the extractor's "unknown" sentinel
+                # for a JSONL line missing its id. This would otherwise pass the emptiness
+                # check above, fail the PostgreSQL UUID cast deterministically, and churn
+                # through the quorum queue's redelivery limit before dead-lettering.
+                try:
+                    uuid.UUID(data_id)
+                except ValueError, AttributeError, TypeError:
+                    logger.warning(
+                        "⚠️ Nacking record with non-UUID mbid/id",
+                        data_type=data_type,
+                        data_id=data_id,
+                    )
+                    await message.nack(requeue=False)
+                    outcome = "failed"
+                    error_type = "ValidationError"
+                    return
+
+                # Extract record details for logging
+                record_name = data.get("name", "Unknown")
+                logger.debug(
+                    "🔄 Processing record",
+                    data_type=data_type[:-1],
+                    data_id=data_id,
+                    record_name=record_name,
+                )
+
+            except Exception as e:
+                logger.error("❌ Failed to parse message", error=str(e))
                 await message.nack(requeue=False)
-            except Exception as nack_error:
-                logger.warning("⚠️ Failed to nack message", error=str(nack_error))
-            outcome = "failed"
-            error_type = type(e).__name__
-        except Exception as e:
-            logger.error("❌ Failed to process message", data_type=data_type, error=str(e))
+                outcome = "failed"
+                error_type = type(e).__name__
+                return
+
+            # Process record using async connection pool
             try:
+                if connection_pool is None:
+                    raise RuntimeError("Connection pool not initialized")
+
+                processor = PROCESSORS.get(data_type)
+                if processor is None:
+                    logger.error("❌ No processor for data type", data_type=data_type)
+                    await message.nack(requeue=False)
+                    outcome = "failed"
+                    error_type = "UnknownEntity"
+                    return
+
+                async with connection_pool.connection() as conn:
+                    await conn.set_autocommit(False)
+                    async with conn.transaction():
+                        await processor(conn, data)
+
+                    logger.debug(
+                        "🐘 Updated record in PostgreSQL",
+                        data_type=data_type[:-1],
+                        data_id=data_id,
+                    )
+
+                await message.ack()
+
+                # PostgreSQL answered — clear the outage backoff.
+                outage_backoff.reset()
+
+                # Increment counter and update last message time only after successful ack
+                if data_type in message_counts:
+                    message_counts[data_type] += 1
+                    last_message_time[data_type] = time.time()
+                    if message_counts[data_type] % progress_interval == 0:
+                        logger.info(
+                            "📊 Processed records in PostgreSQL",
+                            count=message_counts[data_type],
+                            data_type=data_type,
+                        )
+
+            except (InterfaceError, OperationalError, DatabaseUnavailableError) as e:
+                logger.warning("⚠️ Database connection issue, will retry", error=str(e))
+                # Pause before requeueing. The main queues are quorum queues with
+                # x-delivery-limit=20 — a budget with no time dimension — so requeueing
+                # immediately spends all 20 redeliveries in ~3 minutes and RabbitMQ
+                # dead-letters a perfectly valid record part-way through a routine
+                # database maintenance window.
+                await outage_backoff.wait()
                 await message.nack(requeue=True)
-            except Exception as nack_error:
-                logger.warning("⚠️ Failed to nack message", error=str(nack_error))
-            outcome = "failed"
-            error_type = type(e).__name__
-    finally:
-        duration = time.perf_counter() - started
-        _record_pipeline_message(entity, outcome, duration)
-        _record_consumed_message(destination, duration, error_type)
+                outcome = "failed"
+                error_type = type(e).__name__
+            except (DataError, IntegrityError) as e:
+                # Malformed data that deterministically fails a column cast (DataError, e.g. a
+                # non-UUID mbid that slipped past validation above) or a constraint
+                # (IntegrityError, e.g. NotNullViolation when the dump line carried no
+                # name/title, which the extractor forwards as "name": null). Retrying would
+                # fail identically every time, so nack without requeue instead of churning
+                # through the quorum queue's redelivery limit — 20 futile redeliveries, each
+                # opening a pooled connection and rolling back a transaction, per bad record
+                # None of the musicbrainz tables declare a foreign key,
+                # so no IntegrityError here is order-dependent/transient.
+                logger.error(
+                    "❌ Non-retryable data error, nacking without requeue",
+                    data_type=data_type,
+                    error=str(e),
+                )
+                try:
+                    await message.nack(requeue=False)
+                except Exception as nack_error:
+                    logger.warning("⚠️ Failed to nack message", error=str(nack_error))
+                outcome = "failed"
+                error_type = type(e).__name__
+            except Exception as e:
+                logger.error("❌ Failed to process message", data_type=data_type, error=str(e))
+                try:
+                    await message.nack(requeue=True)
+                except Exception as nack_error:
+                    logger.warning("⚠️ Failed to nack message", error=str(nack_error))
+                outcome = "failed"
+                error_type = type(e).__name__
+        finally:
+            duration = time.perf_counter() - started
+            _record_pipeline_message(entity, outcome, duration)
+            _record_consumed_message(destination, duration, error_type)
+            _message_span_context.reset(token)
+            _set_span_outcome(span, outcome)
+            if error_type is not None:
+                _mark_span_failed(span, error_type)
 
 
 async def progress_reporter() -> None:
@@ -1311,6 +1444,10 @@ async def main() -> None:
 
     setup_logging(SERVICE_NAME, log_file=Path(f"/logs/{SERVICE_NAME}.log"))
     setup_telemetry(AMQP_CONSUMER_ID)
+    # Sample this loop's scheduling delay into groovemap.runtime.event_loop.lag. It has to be
+    # started from the running loop, which is why it lives here and not next to the process
+    # metrics setup_telemetry installs. shutdown_telemetry() cancels the sampling task.
+    start_event_loop_monitor()
     logger.info("🚀 Starting GrooveMap musicbrainz-sql-loader with connection pooling")
 
     # Add startup delay for dependent services
