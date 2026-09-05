@@ -1,19 +1,25 @@
-"""Tests for the OpenTelemetry domain metrics this service records.
+"""Tests for the OpenTelemetry domain metrics and spans this service records.
 
-Every assertion here is about the shape dashboards depend on: instrument name, unit, and the
-closed attribute set from the OTEL-metrics program conventions. An in-memory metric reader
-installed as the active provider makes these fully local — no collector, no network.
+Every assertion here is about the shape dashboards and traces depend on: instrument name,
+unit, span name, span kind, and the closed attribute set from the OTEL program conventions.
+In-memory providers for both signals, installed as the active providers, make these fully
+local — no collector, no network.
 """
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
-from common import AsyncPostgreSQLPool, runtime_metrics, telemetry
+from common import AsyncPostgreSQLPool, get_tracer, runtime_metrics, telemetry
 from opentelemetry.sdk.metrics import MeterProvider as SdkMeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+from opentelemetry.sdk.trace import TracerProvider as SdkTracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import SpanKind, StatusCode
 from psycopg.errors import IntegrityError
 
 import brainztableinator.brainztableinator as bt
@@ -29,14 +35,26 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
     from opentelemetry.sdk.metrics.export import Metric
+    from opentelemetry.sdk.trace import ReadableSpan
+
+
+# A known W3C trace context, as an extractor's publish would leave it on an AMQP message.
+UPSTREAM_TRACE_ID = 0x4BF92F3577B34DA6A3CE929D0E0E4736
+UPSTREAM_SPAN_ID = 0x00F067AA0BA902B7
+UPSTREAM_TRACEPARENT = f"00-{UPSTREAM_TRACE_ID:032x}-{UPSTREAM_SPAN_ID:016x}-01"
+
+ARTISTS_QUEUE = "groovemap-musicbrainz-brainztableinator-artists"
 
 
 class Collector:
-    """An in-memory provider plus helpers for reading what was recorded."""
+    """In-memory providers for both signals, plus helpers for reading what was recorded."""
 
     def __init__(self) -> None:
         self.reader = InMemoryMetricReader()
         self.provider = SdkMeterProvider(metric_readers=[self.reader])
+        self.span_exporter = InMemorySpanExporter()
+        self.tracer_provider = SdkTracerProvider()
+        self.tracer_provider.add_span_processor(SimpleSpanProcessor(self.span_exporter))
 
     def metrics(self) -> dict[str, Metric]:
         """Collect once and return every recorded metric by name."""
@@ -65,6 +83,17 @@ class Collector:
         assert len(matching) == 1, f"expected exactly one {name} point matching {attrs!r}, got {len(matching)}"
         return matching[0]
 
+    def spans(self, kind: SpanKind | None = None) -> list[ReadableSpan]:
+        """Return every finished span, optionally narrowed to one kind."""
+        finished = self.span_exporter.get_finished_spans()
+        return [span for span in finished if kind is None or span.kind is kind]
+
+    def span_named(self, name: str) -> ReadableSpan:
+        """Return the single finished span with this name."""
+        matching = [span for span in self.spans() if span.name == name]
+        assert len(matching) == 1, f"expected exactly one {name!r} span, got {[span.name for span in self.spans()]}"
+        return matching[0]
+
 
 @pytest.fixture
 def collector(monkeypatch: pytest.MonkeyPatch) -> Iterator[Collector]:
@@ -76,18 +105,23 @@ def collector(monkeypatch: pytest.MonkeyPatch) -> Iterator[Collector]:
     """
     active = Collector()
     monkeypatch.setattr(telemetry, "_provider", active.provider)
+    monkeypatch.setattr(telemetry, "_tracer_provider", active.tracer_provider)
     monkeypatch.setattr(telemetry, "_generation", telemetry.provider_generation() + 1)
     runtime_metrics.reset_instruments()
     bt.reset_metric_instruments()
+    assert telemetry.tracer_provider() is active.tracer_provider
     yield active
     monkeypatch.setattr(telemetry, "_provider", None)
+    monkeypatch.setattr(telemetry, "_tracer_provider", None)
     runtime_metrics.reset_instruments()
     bt.reset_metric_instruments()
 
 
-def _valid_message(body: bytes) -> AsyncMock:
+def _valid_message(body: bytes, headers: dict[str, Any] | None = None) -> AsyncMock:
     mock_message = AsyncMock()
     mock_message.body = body
+    # aio-pika hands back the delivery's header table, or None when the publisher sent none.
+    mock_message.headers = headers
     return mock_message
 
 
@@ -365,3 +399,449 @@ class TestDbClientMetricsFireViaSharedWrapper:
         )
         assert point.count == 1
         assert "error.type" not in dict(point.attributes)
+
+
+# ===========================================================================
+# process {queue} — the CONSUMER span
+# ===========================================================================
+
+
+def _cursor_connection() -> AsyncMock:
+    """A mock connection whose cursor() is an async context manager over a mock cursor."""
+    mock_conn = AsyncMock()
+    mock_cursor = AsyncMock()
+    mock_cursor_cm = AsyncMock()
+    mock_cursor_cm.__aenter__ = AsyncMock(return_value=mock_cursor)
+    mock_cursor_cm.__aexit__ = AsyncMock(return_value=None)
+    mock_conn.cursor = MagicMock(return_value=mock_cursor_cm)
+    return mock_conn
+
+
+async def _deliver_artist(message: AsyncMock, processor: Any, conn: AsyncMock | None = None) -> None:
+    """Run one artists delivery through on_data_message with a stubbed pool and processor."""
+    mock_pool = _connected_pool(conn if conn is not None else AsyncMock())
+    with (
+        patch("brainztableinator.brainztableinator.shutdown_requested", False),
+        patch("brainztableinator.brainztableinator.completed_files", set()),
+        patch("brainztableinator.brainztableinator.connection_pool", mock_pool),
+        patch(
+            "brainztableinator.brainztableinator.message_counts",
+            {"artists": 0, "labels": 0, "release-groups": 0, "releases": 0},
+        ),
+        patch(
+            "brainztableinator.brainztableinator.last_message_time",
+            {"artists": 0.0, "labels": 0.0, "release-groups": 0.0, "releases": 0.0},
+        ),
+        patch.dict("brainztableinator.brainztableinator.PROCESSORS", {"artists": processor}),
+    ):
+        await on_data_message(message, "artists")
+
+
+class TestConsumerSpan:
+    """on_data_message opens `process {queue}` and joins the publisher's trace."""
+
+    @pytest.mark.asyncio
+    async def test_span_joins_the_trace_carried_by_the_message_headers(self, collector: Collector) -> None:
+        """The whole point of the wave-2 adoption: one trace from the extractor's publish to
+        this consumer, carried by the traceparent the broker delivered."""
+        message = _valid_message(
+            b'{"id": "550e8400-e29b-41d4-a716-446655440000", "name": "Test Artist"}',
+            headers={"traceparent": UPSTREAM_TRACEPARENT},
+        )
+
+        await _deliver_artist(message, AsyncMock())
+
+        span = collector.span_named(f"process {ARTISTS_QUEUE}")
+        assert span.kind is SpanKind.CONSUMER
+        assert span.context is not None
+        assert span.context.trace_id == UPSTREAM_TRACE_ID
+        assert span.parent is not None
+        assert span.parent.span_id == UPSTREAM_SPAN_ID
+        assert dict(span.attributes or {}) == {
+            "messaging.system": "rabbitmq",
+            "messaging.destination.name": ARTISTS_QUEUE,
+            "messaging.operation.name": "process",
+            "outcome": "processed",
+        }
+        assert span.status.status_code is not StatusCode.ERROR
+
+    @pytest.mark.asyncio
+    async def test_bytes_traceparent_joins_the_same_trace(self, collector: Collector) -> None:
+        """Some AMQP clients hand header values back as bytes; the trace must survive that."""
+        message = _valid_message(
+            b'{"id": "550e8400-e29b-41d4-a716-446655440000"}',
+            headers={"traceparent": UPSTREAM_TRACEPARENT.encode()},
+        )
+
+        await _deliver_artist(message, AsyncMock())
+
+        span = collector.span_named(f"process {ARTISTS_QUEUE}")
+        assert span.context is not None
+        assert span.context.trace_id == UPSTREAM_TRACE_ID
+
+    @pytest.mark.asyncio
+    async def test_a_message_without_headers_starts_a_new_trace(self, collector: Collector) -> None:
+        message = _valid_message(b'{"id": "550e8400-e29b-41d4-a716-446655440000"}', headers=None)
+
+        await _deliver_artist(message, AsyncMock())
+
+        span = collector.span_named(f"process {ARTISTS_QUEUE}")
+        assert span.parent is None, "a delivery with no trace context must start a root span"
+        assert span.context is not None
+        assert span.context.trace_id != UPSTREAM_TRACE_ID
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_traceparent_starts_a_new_trace(self, collector: Collector) -> None:
+        """An unreadable trace context must not fail the message that delivered it."""
+        message = _valid_message(b'{"id": "550e8400-e29b-41d4-a716-446655440000"}', headers={"traceparent": "not-a-traceparent"})
+
+        await _deliver_artist(message, AsyncMock())
+
+        span = collector.span_named(f"process {ARTISTS_QUEUE}")
+        assert span.parent is None
+        assert span.context is not None
+        assert span.context.trace_id != UPSTREAM_TRACE_ID
+
+    @pytest.mark.asyncio
+    async def test_a_rejected_message_fails_the_span_with_error_type_only(self, collector: Collector) -> None:
+        message = _valid_message(b'{"name": "No id here"}', headers={"traceparent": UPSTREAM_TRACEPARENT})
+
+        with (
+            patch("brainztableinator.brainztableinator.shutdown_requested", False),
+            patch("brainztableinator.brainztableinator.connection_pool", MagicMock()),
+        ):
+            await on_data_message(message, "artists")
+
+        span = collector.span_named(f"process {ARTISTS_QUEUE}")
+        assert span.status.status_code is StatusCode.ERROR
+        assert (span.attributes or {})["error.type"] == "ValidationError"
+        assert (span.attributes or {})["outcome"] == "failed"
+        assert span.status.description is None, "a failed span carries error.type, never a message"
+        assert span.events == (), "no span event may carry a payload"
+
+    @pytest.mark.asyncio
+    async def test_shutdown_requested_opens_no_span(self, collector: Collector) -> None:
+        message = _valid_message(b'{"id": "550e8400-e29b-41d4-a716-446655440000"}')
+
+        with patch("brainztableinator.brainztableinator.shutdown_requested", True):
+            await on_data_message(message, "artists")
+
+        assert collector.spans() == []
+
+
+# ===========================================================================
+# flush postgresql {entity} — the batch flush span
+# ===========================================================================
+
+
+class TestBatchFlushSpans:
+    """Each batch flush runs inside `flush postgresql {entity}`, linked to its messages."""
+
+    @pytest.mark.asyncio
+    async def test_relationships_flush_opens_the_internal_span(self, collector: Collector) -> None:
+        rels = [{"target_mbid": "550e8400-e29b-41d4-a716-446655440001", "target_type": "label", "type": "member of band"}]
+
+        await _insert_relationships(_cursor_connection(), "550e8400-e29b-41d4-a716-446655440000", "artist", rels)
+
+        span = collector.span_named("flush postgresql artist")
+        assert span.kind is SpanKind.INTERNAL
+        assert dict(span.attributes or {}) == {
+            "db.system.name": "postgresql",
+            "groovemap.entity": "artist",
+            "outcome": "processed",
+        }
+
+    @pytest.mark.asyncio
+    async def test_external_links_flush_opens_the_internal_span(self, collector: Collector) -> None:
+        links = [{"url": "https://example.com", "service": "bandcamp"}]
+
+        await _insert_external_links(_cursor_connection(), "550e8400-e29b-41d4-a716-446655440000", "release", links)
+
+        span = collector.span_named("flush postgresql release")
+        assert span.kind is SpanKind.INTERNAL
+        assert (span.attributes or {})["outcome"] == "processed"
+
+    @pytest.mark.asyncio
+    async def test_an_empty_batch_still_reports_a_skipped_flush(self, collector: Collector) -> None:
+        """Span and metric stay in step: groovemap.pipeline.batch.flush.duration is recorded on
+        the empty path too, so an operator comparing span counts to metric counts sees one
+        number, not two."""
+        await _insert_relationships(AsyncMock(), "550e8400-e29b-41d4-a716-446655440000", "label", [])
+
+        span = collector.span_named("flush postgresql label")
+        assert (span.attributes or {})["outcome"] == "skipped"
+        assert span.status.status_code is not StatusCode.ERROR
+
+    @pytest.mark.asyncio
+    async def test_a_failed_flush_sets_error_status_and_outcome(self, collector: Collector) -> None:
+        mock_conn = _cursor_connection()
+        mock_conn.cursor.return_value.__aenter__.return_value.executemany = AsyncMock(side_effect=IntegrityError("boom"))
+        rels = [{"target_mbid": "550e8400-e29b-41d4-a716-446655440001", "target_type": "release", "type": "performer"}]
+
+        with pytest.raises(IntegrityError):
+            await _insert_relationships(mock_conn, "550e8400-e29b-41d4-a716-446655440000", "release-group", rels)
+
+        span = collector.span_named("flush postgresql release-group")
+        assert span.status.status_code is StatusCode.ERROR
+        assert (span.attributes or {})["error.type"] == "IntegrityError"
+        assert (span.attributes or {})["outcome"] == "failed"
+        assert span.events == ()
+
+    @pytest.mark.asyncio
+    async def test_the_flush_span_links_back_to_the_message_span(self, collector: Collector) -> None:
+        """A flush covers the deliveries whose rows it writes, so it links to their spans.
+        One delivery drives one flush here; common.flush_span caps the list at 64."""
+        mock_conn = _cursor_connection()
+        rels = [{"target_mbid": "550e8400-e29b-41d4-a716-446655440001", "target_type": "label", "type": "member of band"}]
+
+        async def processor(conn: Any, record: dict[str, Any]) -> None:
+            await _insert_relationships(conn, record["id"], "artist", rels)
+
+        message = _valid_message(
+            b'{"id": "550e8400-e29b-41d4-a716-446655440000"}',
+            headers={"traceparent": UPSTREAM_TRACEPARENT},
+        )
+        await _deliver_artist(message, processor, conn=mock_conn)
+
+        consume_span = collector.span_named(f"process {ARTISTS_QUEUE}")
+        flush = collector.span_named("flush postgresql artist")
+        assert consume_span.context is not None
+        assert len(flush.links) == 1
+        assert flush.links[0].context.span_id == consume_span.context.span_id
+        assert flush.links[0].context.trace_id == UPSTREAM_TRACE_ID
+        assert flush.context is not None
+        assert flush.context.trace_id == UPSTREAM_TRACE_ID, "the flush belongs to the delivery's trace"
+
+    @pytest.mark.asyncio
+    async def test_a_flush_outside_a_delivery_carries_no_links(self, collector: Collector) -> None:
+        """Nothing fabricates a link when there is no message span to point at."""
+        await _insert_relationships(AsyncMock(), "550e8400-e29b-41d4-a716-446655440000", "label", [])
+
+        assert collector.span_named("flush postgresql label").links == ()
+
+
+# ===========================================================================
+# Span nesting: one trace per record, from the delivery to the write
+# ===========================================================================
+
+
+class _FlushableConnection:
+    """A pooled-connection stand-in that also serves cursors to the flush helpers."""
+
+    def __init__(self) -> None:
+        self.closed = False
+        self.executed = 0
+
+    async def close(self) -> None:
+        self.closed = True
+
+    async def set_autocommit(self, value: bool) -> None:  # noqa: ARG002 - psycopg signature
+        return None
+
+    def transaction(self) -> Any:
+        return _null_async_context(None)
+
+    def cursor(self) -> Any:
+        return _null_async_context(self)
+
+    async def executemany(self, statement: str, params: list[Any]) -> None:  # noqa: ARG002 - psycopg signature
+        self.executed += 1
+
+
+def _null_async_context(value: Any) -> Any:
+    manager = AsyncMock()
+    manager.__aenter__ = AsyncMock(return_value=value)
+    manager.__aexit__ = AsyncMock(return_value=None)
+    return manager
+
+
+class TestSpanNesting:
+    """The delivery's span is the ancestor of every span the handler opens under it."""
+
+    @pytest.mark.asyncio
+    async def test_the_pooled_session_and_flush_spans_nest_under_the_delivery(self, collector: Collector) -> None:
+        """`AsyncPostgreSQLPool.connection()` — the real wrapper this handler uses — opens the
+        `session postgresql` CLIENT span for as long as the connection is checked out, which in
+        this service is the whole record write. The batch flush therefore runs inside that span
+        rather than around it, so the tree is delivery -> pooled session -> flush.
+        """
+        conn = _FlushableConnection()
+        rels = [{"target_mbid": "550e8400-e29b-41d4-a716-446655440001", "target_type": "label", "type": "member of band"}]
+
+        async def processor(record_conn: Any, record: dict[str, Any]) -> None:
+            await _insert_relationships(record_conn, record["id"], "artist", rels)
+
+        pool = AsyncPostgreSQLPool(
+            connection_params={"host": "localhost", "port": 5432, "dbname": "test", "user": "test", "password": "test"},
+            max_connections=2,
+            min_connections=1,
+            health_check_interval=3600,
+        )
+        message = _valid_message(
+            b'{"id": "550e8400-e29b-41d4-a716-446655440000"}',
+            headers={"traceparent": UPSTREAM_TRACEPARENT},
+        )
+
+        with (
+            patch.object(pool, "_create_connection", AsyncMock(return_value=conn)),
+            patch.object(pool, "_test_connection", AsyncMock(return_value=True)),
+        ):
+            await pool.initialize()
+            try:
+                with (
+                    patch("brainztableinator.brainztableinator.shutdown_requested", False),
+                    patch("brainztableinator.brainztableinator.completed_files", set()),
+                    patch("brainztableinator.brainztableinator.connection_pool", pool),
+                    patch(
+                        "brainztableinator.brainztableinator.message_counts",
+                        {"artists": 0, "labels": 0, "release-groups": 0, "releases": 0},
+                    ),
+                    patch(
+                        "brainztableinator.brainztableinator.last_message_time",
+                        {"artists": 0.0, "labels": 0.0, "release-groups": 0.0, "releases": 0.0},
+                    ),
+                    patch.dict("brainztableinator.brainztableinator.PROCESSORS", {"artists": processor}),
+                ):
+                    await on_data_message(message, "artists")
+            finally:
+                await pool.close()
+
+        assert conn.executed == 1
+        delivery = collector.span_named(f"process {ARTISTS_QUEUE}")
+        session = collector.span_named("session postgresql")
+        flush = collector.span_named("flush postgresql artist")
+
+        assert delivery.context is not None
+        assert session.context is not None
+        assert session.parent is not None
+        assert session.parent.span_id == delivery.context.span_id
+        assert flush.parent is not None
+        assert flush.parent.span_id == session.context.span_id
+        for span in (delivery, session, flush):
+            assert span.context is not None
+            assert span.context.trace_id == UPSTREAM_TRACE_ID
+
+
+# ===========================================================================
+# Runtime metrics: the event-loop monitor
+# ===========================================================================
+
+
+class TestEventLoopMonitor:
+    """start_event_loop_monitor() runs from the consumer's own loop, after setup_telemetry."""
+
+    @pytest.mark.asyncio
+    @patch("brainztableinator.brainztableinator.HealthServer")
+    @patch.dict("os.environ", {"STARTUP_DELAY": "0"})
+    async def test_main_starts_the_monitor_from_its_running_loop_after_setup(self, mock_health_server: Mock) -> None:
+        mock_health_server.return_value = MagicMock()
+        order: list[str] = []
+        loops: list[Any] = []
+
+        def note(name: str) -> Any:
+            def record(*_args: Any, **_kwargs: Any) -> None:
+                order.append(name)
+
+            return record
+
+        def note_monitor(*_args: Any, **_kwargs: Any) -> None:
+            order.append("start_event_loop_monitor")
+            loops.append(asyncio.get_running_loop())
+
+        with (
+            patch("brainztableinator.brainztableinator.setup_logging", side_effect=note("setup_logging")),
+            patch("brainztableinator.brainztableinator.setup_telemetry", side_effect=note("setup_telemetry")),
+            patch("brainztableinator.brainztableinator.start_event_loop_monitor", side_effect=note_monitor),
+            patch.object(bt.MusicBrainzSQLLoaderConfig, "from_env", side_effect=ValueError("stop here")),
+        ):
+            await bt.main()
+
+        assert order == ["setup_logging", "setup_telemetry", "start_event_loop_monitor"]
+        assert loops == [asyncio.get_running_loop()], "the monitor must be started from the consumer's loop"
+
+    @pytest.mark.asyncio
+    async def test_the_library_monitor_samples_into_the_lag_histogram(self, collector: Collector, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Unpatched: this is the library call the service makes, proving the process actually
+        gets groovemap.runtime.event_loop.lag rather than a mock that was called."""
+        # The monitor declines to sample unless metrics are really being exported, which it
+        # reads from the private SDK handle rather than the API-level one the fixture installs.
+        monkeypatch.setattr(telemetry, "_sdk_provider", collector.provider)
+        try:
+            monitor = telemetry.start_event_loop_monitor(interval_s=0.001)
+            assert monitor is not None
+            await asyncio.sleep(0.05)
+        finally:
+            telemetry._stop_event_loop_monitors()
+
+        points = collector.points("groovemap.runtime.event_loop.lag")
+        assert points, "the monitor recorded no event-loop lag"
+        assert points[0].count >= 1
+
+
+# ===========================================================================
+# The tracing switches: no endpoint, and traces off with metrics on
+# ===========================================================================
+
+
+class TestTracingSwitches:
+    """Tracing is env-var-only and never fails the service."""
+
+    @pytest.mark.asyncio
+    async def test_without_an_endpoint_nothing_records_and_the_handler_still_settles(self) -> None:
+        """The wave-1 regression, restated for spans: with no OTEL_EXPORTER_OTLP_ENDPOINT the
+        service installs no real provider, opens no recording span, and behaves as before."""
+        bt.setup_telemetry("brainztableinator")
+        try:
+            assert telemetry._sdk_tracer_provider is None
+            assert telemetry._sdk_provider is None
+
+            probe = get_tracer(bt.METRICS_SCOPE).start_span("probe")
+            try:
+                assert probe.is_recording() is False
+            finally:
+                probe.end()
+
+            message = _valid_message(
+                b'{"id": "550e8400-e29b-41d4-a716-446655440000"}',
+                headers={"traceparent": UPSTREAM_TRACEPARENT},
+            )
+            processor = AsyncMock()
+            await _deliver_artist(message, processor)
+            processor.assert_awaited_once()
+            message.ack.assert_awaited_once()
+        finally:
+            bt.shutdown_telemetry()
+
+    @pytest.mark.asyncio
+    async def test_traces_exporter_none_keeps_metrics_flowing_and_creates_no_spans(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A deployment that wants the process view without the trace volume sets
+        OTEL_TRACES_EXPORTER=none and still gets a real MeterProvider."""
+        # Refused instantly rather than routed, and with a one-second export budget, so the
+        # shutdown flush below never waits on a network that is not there.
+        monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
+        monkeypatch.setenv("OTEL_EXPORTER_OTLP_TIMEOUT", "1")
+        monkeypatch.setenv("OTEL_METRIC_EXPORT_INTERVAL", "600000")
+        monkeypatch.setenv("OTEL_TRACES_EXPORTER", "none")
+
+        provider = bt.setup_telemetry("brainztableinator")
+        try:
+            assert isinstance(provider, SdkMeterProvider), "metrics must still be exported"
+            assert telemetry._sdk_tracer_provider is None, "no tracer provider may be installed"
+
+            probe = get_tracer(bt.METRICS_SCOPE).start_span("probe")
+            try:
+                assert probe.is_recording() is False
+            finally:
+                probe.end()
+
+            bt.reset_metric_instruments()
+            message = _valid_message(
+                b'{"id": "550e8400-e29b-41d4-a716-446655440000"}',
+                headers={"traceparent": UPSTREAM_TRACEPARENT},
+            )
+            processor = AsyncMock()
+            await _deliver_artist(message, processor)
+            processor.assert_awaited_once()
+        finally:
+            bt.shutdown_telemetry()
+            bt.reset_metric_instruments()

@@ -6,20 +6,29 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 
-# Every standard OpenTelemetry variable that changes what the SDK records or exports. The
-# telemetry suites assert on what an in-memory provider recorded, so they must not inherit
-# ambient OTEL configuration — a CI runner or a developer's shell may set OTEL_SDK_DISABLED
-# or a real collector endpoint, which would otherwise make those assertions fail silently
-# (an empty collection, no error) or reach out to a real endpoint.
+# Every standard OpenTelemetry variable that changes what the SDK records or exports, for
+# both signals. The telemetry suites assert on what an in-memory provider recorded, so they
+# must not inherit ambient OTEL configuration — a CI runner or a developer's shell may set
+# OTEL_SDK_DISABLED or a real collector endpoint, which would otherwise make those assertions
+# fail silently (an empty collection, no error) or reach out to a real endpoint. The tracing
+# half matters just as much: an inherited OTEL_TRACES_SAMPLER_ARG=0 would drop every span a
+# test expects, and an inherited OTEL_PROPAGATORS without tracecontext would stop a consumer
+# span from ever joining the traceparent a test hands it.
 OTEL_ENVIRONMENT = (
     "OTEL_EXPORTER_OTLP_ENDPOINT",
     "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_TIMEOUT",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
     "OTEL_METRICS_EXEMPLAR_FILTER",
     "OTEL_METRICS_EXPORTER",
     "OTEL_METRIC_EXPORT_INTERVAL",
+    "OTEL_PROPAGATORS",
     "OTEL_RESOURCE_ATTRIBUTES",
     "OTEL_SDK_DISABLED",
     "OTEL_SERVICE_NAME",
+    "OTEL_TRACES_EXPORTER",
+    "OTEL_TRACES_SAMPLER",
+    "OTEL_TRACES_SAMPLER_ARG",
 )
 
 
