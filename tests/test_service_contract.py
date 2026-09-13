@@ -45,6 +45,8 @@ def test_operator_docs_use_current_identity_and_mermaid_diagrams() -> None:
     operator_docs = [ROOT / "README.md", *(ROOT / "docs").glob("*.md"), ROOT / "brainztableinator" / "README.md"]
     combined = "\n".join(path.read_text() for path in operator_docs if path.name != "extraction.md")
     assert "discogsography" not in combined.casefold()
+    assert "catalog-ingestion" not in combined
+    assert "musicbrainz-ingestion" in combined
     assert "```mermaid" in (ROOT / "README.md").read_text()
     assert "Python 3.14" in combined
     assert "Python 3.13" not in combined

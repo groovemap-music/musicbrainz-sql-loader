@@ -5,12 +5,13 @@
 ```mermaid
 stateDiagram-v2
     [*] --> Consuming
-    Consuming --> GracePeriod: file_complete
-    GracePeriod --> ConsumerCanceled: grace period expires
-    Consuming --> Complete: extraction_complete
-    GracePeriod --> Complete: extraction_complete
-    Complete --> Idle: every stream complete
-    Idle --> Consuming: durable queue contains new work
+    Consuming --> MarkedComplete: file_complete or extraction_complete
+    MarkedComplete --> GracePeriod: cancellation delay is positive
+    MarkedComplete --> CompleteSubscribed: cancellation disabled
+    GracePeriod --> GracePeriod: another completion marker
+    GracePeriod --> ConsumerCanceled: timer expires
+    ConsumerCanceled --> BrokerClosed: all four streams marked and canceled
+    BrokerClosed --> Consuming: durable queue work triggers recovery
 ```
 
 ## `file_complete`
@@ -22,10 +23,11 @@ deliveries already in flight to finish.
 
 ## `extraction_complete`
 
-This is the terminal event for a stream. It reasserts completion even when the process
-restarted after acknowledging `file_complete`, preventing a false stuck state. Once all
-four streams are complete and their queues are empty, the loader can close the active
-broker connection and enter periodic queue-check mode.
+The producer publishes this version-level terminal event to every stream. Each delivery
+reasserts completion for its receiving stream even when the process restarted after
+acknowledging `file_complete`, preventing a false stuck state. Once all four streams are
+marked complete and their consumers have canceled, the loader closes the active broker
+connection and enters periodic queue-check mode.
 
 Unlike SQL loaders that own stale-row purging, this service does not infer deletion from
 a timestamp. It stores the current MusicBrainz records supplied by the producer. Schema
@@ -43,3 +45,7 @@ of pending work, and PostgreSQL upserts are idempotent. The health response expo
 
 The test suite covers duplicate completion events, restart recovery, cancellation timing,
 and shutdown delivery churn without connecting to RabbitMQ or PostgreSQL.
+
+This page describes only consumer state. The producer's durable download/processing state
+and rules for emitting both markers are owned by
+[`musicbrainz-ingestion`](https://github.com/groovemap-music/musicbrainz-ingestion/blob/main/docs/state-marker-system.md).
