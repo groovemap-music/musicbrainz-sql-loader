@@ -32,9 +32,15 @@ rejected without retry and arrive in the dead-letter queue.
 ## RabbitMQ and restart
 
 The broker connection uses heartbeat monitoring and bounded reconnect attempts. Exchanges,
-quorum queues, dead-letter exchanges, and dead-letter queues are durable. Graceful process
-shutdown cancels subscriptions before closing the connection so unsettled records are
-redelivered once rather than churned.
+quorum live queues, dead-letter exchanges, and classic dead-letter queues are durable, matching
+every sibling catalog service. Live-queue bounding comes from `x-delivery-limit` plus the
+fleet's quorum-queue policy; DLQ bounding is a broker policy tracked separately
+(`gm-deployment-8mb`), not a queue-type change here — RabbitMQ cannot change an existing
+queue's type in place. Graceful process shutdown cancels subscriptions before closing the
+connection so unsettled records are redelivered once rather than churned. See
+[Release-group starvation incident](musicbrainz-sync.md#release-group-starvation-incident)
+for the consumer-loss diagnosis and the operator bead tracking the DLQ policy and the
+parked-message decision.
 
 ## Health
 

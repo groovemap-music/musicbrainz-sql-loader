@@ -1582,6 +1582,30 @@ class TestCloseRabbitMQConnection:
         assert bt.active_connection is None
 
     @pytest.mark.asyncio
+    async def test_logs_registered_and_active_consumer_tags_before_close(self) -> None:
+        """Teardown evidence distinguishes registrations from active consumers."""
+        import brainztableinator.brainztableinator as bt
+
+        bt.active_channel = AsyncMock()
+        bt.active_connection = AsyncMock()
+        bt.connection_consumer_tags = {
+            "artists": "tag-artists",
+            "release-groups": "tag-release-groups",
+        }
+        bt.consumer_tags = {"release-groups": "tag-release-groups"}
+
+        with patch("brainztableinator.brainztableinator.logger") as mock_logger:
+            await close_rabbitmq_connection()
+
+        close_call = next(call for call in mock_logger.info.call_args_list if call.args[0] == "Closing RabbitMQ connection")
+        assert close_call.kwargs["registered_consumer_tags"] == {
+            "artists": "tag-artists",
+            "release-groups": "tag-release-groups",
+        }
+        assert close_call.kwargs["active_consumer_tags"] == {"release-groups": "tag-release-groups"}
+        assert bt.connection_consumer_tags == {}
+
+    @pytest.mark.asyncio
     async def test_handles_channel_close_error(self) -> None:
         """Test handling error when closing channel."""
         import brainztableinator.brainztableinator as bt
@@ -1650,9 +1674,15 @@ class TestCheckConsumersUnexpectedlyDead:
         import brainztableinator.brainztableinator as bt
         from brainztableinator.brainztableinator import check_consumers_unexpectedly_dead
 
-        bt.consumer_tags = {"artists": "tag-123"}
+        bt.consumer_tags = {
+            "artists": "tag-artists",
+            "labels": "tag-labels",
+            "release-groups": "tag-release-groups",
+            "releases": "tag-releases",
+        }
         bt.completed_files = set()
         bt.message_counts = {"artists": 100}
+        bt.consumer_watch_started_at = 0.0
         assert await check_consumers_unexpectedly_dead() is False
 
     @pytest.mark.asyncio
@@ -1664,6 +1694,7 @@ class TestCheckConsumersUnexpectedlyDead:
         bt.consumer_tags = {}
         bt.completed_files = {"artists", "labels", "release-groups", "releases"}
         bt.message_counts = {"artists": 100}
+        bt.consumer_watch_started_at = time.time() - bt.STARTUP_IDLE_TIMEOUT - 1
         assert await check_consumers_unexpectedly_dead() is False
 
     @pytest.mark.asyncio
@@ -1675,18 +1706,144 @@ class TestCheckConsumersUnexpectedlyDead:
         bt.consumer_tags = {}
         bt.completed_files = set()
         bt.message_counts = {"artists": 0, "labels": 0, "release-groups": 0, "releases": 0}
+        bt.consumer_watch_started_at = time.time()
         assert await check_consumers_unexpectedly_dead() is False
 
     @pytest.mark.asyncio
     async def test_stuck_state_detected(self) -> None:
-        """Stuck when no consumers, files not completed, has processed messages."""
+        """Stuck when no consumers remain after startup grace."""
         import brainztableinator.brainztableinator as bt
         from brainztableinator.brainztableinator import check_consumers_unexpectedly_dead
 
         bt.consumer_tags = {}
         bt.completed_files = {"labels"}  # Only 1 of 3 complete
         bt.message_counts = {"artists": 100, "labels": 50, "release-groups": 0, "releases": 0}
+        bt.consumer_watch_started_at = time.time() - bt.STARTUP_IDLE_TIMEOUT - 1
         assert await check_consumers_unexpectedly_dead() is True
+
+    @pytest.mark.asyncio
+    async def test_zero_message_stream_without_consumer_alarms_after_grace(self) -> None:
+        """A never-started stream is not hidden by its zero message count."""
+        import brainztableinator.brainztableinator as bt
+        from brainztableinator.brainztableinator import check_consumers_unexpectedly_dead
+
+        bt.consumer_tags = {
+            "artists": "tag-artists",
+            "labels": "tag-labels",
+            "releases": "tag-releases",
+        }
+        bt.completed_files = set()
+        bt.message_counts = {"artists": 0, "labels": 0, "release-groups": 0, "releases": 0}
+        bt.last_message_time = {"artists": 0.0, "labels": 0.0, "release-groups": 0.0, "releases": 0.0}
+        bt.consumer_watch_started_at = time.time() - bt.STARTUP_IDLE_TIMEOUT - 1
+
+        assert await check_consumers_unexpectedly_dead() is True
+        health = get_health_data()
+        assert health["consumer_alarm_types"] == ["release-groups"]
+
+    @pytest.mark.asyncio
+    async def test_registered_zero_message_stream_alarms_when_siblings_completed(self) -> None:
+        """A stale local tag cannot hide the only stream that never delivered."""
+        import brainztableinator.brainztableinator as bt
+        from brainztableinator.brainztableinator import check_consumers_unexpectedly_dead
+
+        bt.consumer_tags = {
+            "artists": "tag-artists",
+            "labels": "tag-labels",
+            "release-groups": "stale-tag-release-groups",
+            "releases": "tag-releases",
+        }
+        bt.completed_files = {"artists", "labels", "releases"}
+        bt.message_counts = {"artists": 100, "labels": 50, "release-groups": 0, "releases": 75}
+        bt.last_message_time = {
+            "artists": time.time(),
+            "labels": time.time(),
+            "release-groups": 0.0,
+            "releases": time.time(),
+        }
+        bt.consumer_watch_started_at = time.time() - bt.STARTUP_IDLE_TIMEOUT - 1
+
+        assert await check_consumers_unexpectedly_dead() is True
+        assert get_health_data()["consumer_alarm_types"] == ["release-groups"]
+
+
+class TestConsumerRegistrationEvidence:
+    """Consumer lifecycle logs retain the evidence needed for diagnosis."""
+
+    def test_registration_logs_data_type_queue_and_tag(self) -> None:
+        import brainztableinator.brainztableinator as bt
+
+        bt.consumer_tags = {}
+        bt.connection_consumer_tags = {}
+        with (
+            patch("brainztableinator.brainztableinator._record_consumer_delta"),
+            patch("brainztableinator.brainztableinator.logger") as mock_logger,
+        ):
+            bt._register_consumer("release-groups", "ctag-rg", recovered=False)
+
+        call = mock_logger.info.call_args
+        assert call.args[0] == "Registered RabbitMQ consumer"
+        assert call.kwargs == {
+            "data_type": "release-groups",
+            "queue_name": "groovemap-musicbrainz-brainztableinator-release-groups",
+            "consumer_tag": "ctag-rg",
+            "recovered": False,
+        }
+        assert bt.connection_consumer_tags == {"release-groups": "ctag-rg"}
+
+    @pytest.mark.asyncio
+    async def test_dlqs_stay_classic_queues(self) -> None:
+        """DLQs remain x-queue-type classic, matching every sibling catalog service.
+
+        RabbitMQ cannot change an existing queue's type in place, so redeclaring an
+        existing classic DLQ as quorum fails PRECONDITION_FAILED at startup on every
+        broker that already has one. Bounding the DLQs is a broker policy
+        (gm-deployment-8mb), not a queue-type change here.
+        """
+        import brainztableinator.brainztableinator as bt
+
+        expected = {"artists", "labels", "release-groups", "releases"}
+        bt.active_connection = None
+        bt.active_channel = None
+        bt.consumer_tags = {}
+        bt.completed_files = set()
+        bt.queues = {}
+        bt.last_message_time = dict.fromkeys(expected, 0.0)
+
+        dlq_calls: list[dict[str, Any]] = []
+
+        def declare_queue(**kwargs: Any) -> Any:
+            name = kwargs.get("name", "")
+            if kwargs.get("passive"):
+                q = MagicMock()
+                q.declaration_result.message_count = 100 if name.endswith("-artists") else 0
+                return q
+            if name.endswith(".dlq"):
+                dlq_calls.append(kwargs)
+            q = AsyncMock()
+            q.consume = AsyncMock(return_value=f"tag-{name}")
+            q.bind = AsyncMock()
+            return q
+
+        mock_channel = AsyncMock()
+        mock_channel.declare_queue = AsyncMock(side_effect=declare_queue)
+        mock_channel.declare_exchange = AsyncMock(return_value=AsyncMock())
+        mock_channel.set_qos = AsyncMock()
+        mock_connection = AsyncMock()
+        mock_connection.channel = AsyncMock(return_value=mock_channel)
+        mock_rmq = AsyncMock()
+        mock_rmq.connect = AsyncMock(return_value=mock_connection)
+
+        with patch.object(bt, "rabbitmq_manager", mock_rmq), patch.object(bt, "logger"):
+            await bt._recover_consumers()
+
+        assert len(dlq_calls) == len(expected)
+        assert all(call["arguments"] == {"x-queue-type": "classic"} for call in dlq_calls)
+
+        bt.consumer_tags = {}
+        bt.active_connection = None
+        bt.active_channel = None
+        bt.queues = {}
 
 
 # ===========================================================================
@@ -1749,8 +1906,15 @@ class TestPeriodicQueueChecker:
 
         bt.rabbitmq_manager = mock_rabbitmq_manager
         bt.active_connection = None
-        bt.consumer_tags = {"artists": "tag-123"}  # Active consumer
+        bt.consumer_tags = {
+            "artists": "tag-artists",
+            "labels": "tag-labels",
+            "release-groups": "tag-release-groups",
+            "releases": "tag-releases",
+        }
         bt.completed_files = set()
+        bt.message_counts = {"artists": 0, "labels": 0, "release-groups": 0, "releases": 0}
+        bt.consumer_watch_started_at = time.time()
         bt.shutdown_requested = False
 
         from brainztableinator.brainztableinator import periodic_queue_checker
@@ -2048,7 +2212,12 @@ class TestGetHealthDataExtended:
             "labels": current_time - 8,
             "releases": 0.0,
         }
-        bt.consumer_tags = {"artists": "consumer-1", "labels": "consumer-2"}
+        bt.consumer_tags = {
+            "artists": "consumer-1",
+            "labels": "consumer-2",
+            "release-groups": "consumer-3",
+            "releases": "consumer-4",
+        }
         bt.connection_pool = MagicMock()
         bt.completed_files = set()
 
@@ -2092,7 +2261,12 @@ class TestGetHealthDataExtended:
             "labels": current_time - 120,
             "releases": 0.0,
         }
-        bt.consumer_tags = {"artists": "consumer-1", "labels": "consumer-2"}
+        bt.consumer_tags = {
+            "artists": "consumer-1",
+            "labels": "consumer-2",
+            "release-groups": "consumer-3",
+            "releases": "consumer-4",
+        }
         bt.completed_files = set()
 
         result = get_health_data()
@@ -2954,10 +3128,11 @@ class TestProgressReporterExtended:
         bt.last_message_time = {
             "artists": current_time - 150,  # stalled (>120s)
             "labels": current_time,
+            "release-groups": 0.0,  # never received a delivery
             "releases": current_time,
         }
         bt.completed_files = set()
-        bt.consumer_tags = {"artists": "tag1", "labels": "tag2"}
+        bt.consumer_tags = {"artists": "tag1", "labels": "tag2", "releases": "tag3"}
 
         _real_sleep = asyncio.sleep
         call_count = 0
@@ -2970,6 +3145,7 @@ class TestProgressReporterExtended:
             await _real_sleep(0)
 
         with (
+            patch("brainztableinator.brainztableinator.STARTUP_IDLE_TIMEOUT", 0),
             patch("brainztableinator.brainztableinator.logger") as mock_logger,
             patch("brainztableinator.brainztableinator.asyncio.sleep", side_effect=fast_sleep),
         ):
@@ -2978,6 +3154,7 @@ class TestProgressReporterExtended:
         # Should have logged stalled consumers
         error_calls = [str(c) for c in mock_logger.error.call_args_list]
         assert any("Stalled" in c or "stalled" in c.lower() for c in error_calls)
+        assert any("release-groups" in call for call in error_calls)
 
     @pytest.mark.asyncio
     async def test_progress_reporter_logs_waiting_for_messages(self) -> None:
