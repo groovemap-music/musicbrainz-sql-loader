@@ -2,7 +2,10 @@
 
 `musicbrainz-sql-loader` uses the pinned `groovemap-runtime` PostgreSQL and RabbitMQ
 adapters. The service is designed to pause safely during a transient database outage and
-resume from durable broker state.
+resume from durable broker state. The shared connection, retry, circuit-breaker, and
+telemetry mechanics are defined by the
+[`groovemap-runtime` boundary](https://github.com/groovemap-music/python-libraries/blob/main/docs/runtime.md);
+this page records only how this loader applies them.
 
 ```mermaid
 flowchart LR
@@ -41,3 +44,5 @@ consistent. Connection strings and credentials are never returned or logged.
 
 For capacity rationale and the prior pool-exhaustion diagnosis, see
 [PostgreSQL connection-budget analysis](postgres-pool-exhaustion-analysis.md).
+Current fleet connection budgets and deployment-time overrides are owned by the
+[`deployment` configuration](https://github.com/groovemap-music/deployment/blob/main/docs/configuration.md#database-connections).

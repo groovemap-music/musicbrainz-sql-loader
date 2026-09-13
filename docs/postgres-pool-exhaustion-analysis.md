@@ -1,5 +1,9 @@
 # PostgreSQL connection-budget analysis
 
+This is a historical diagnosis for the MusicBrainz SQL consumer. Current fleet-wide
+connection budgets and environment promotion belong to the
+[`deployment` configuration](https://github.com/groovemap-music/deployment/blob/main/docs/configuration.md#database-connections).
+
 ## Incident
 
 During a MusicBrainz bulk import, the SQL loader repeatedly exhausted its client pool
@@ -37,18 +41,9 @@ flowchart LR
 - Transient acquisition failures retain bounded retry and outage backoff; deterministic
   data errors are not retried.
 
-With the reviewed fleet defaults, the expected maxima are:
-
-| Service | Default maximum PostgreSQL connections |
-| --- | ---: |
-| `catalog-api` | 8 |
-| `discogs-sql-loader` | 12 |
-| `musicbrainz-sql-loader` | 12 |
-| analytics service | 4 |
-| single-connection console path | approximately 1 |
-
-The combined default remains below 45 and leaves room for health-check transients.
-Deployment-specific values remain the deployment repository's responsibility.
+This repository fixes only its own default maximum at 12. The total fleet budget, current
+peer-service defaults, and health-check headroom can change independently and are therefore
+documented by `deployment`, not copied here.
 
 ## Operational rule
 

@@ -22,10 +22,10 @@ Credentials have no defaults.
 
 | Variable | Default | Description |
 | --- | ---: | --- |
-| `MUSICBRAINZ_EXCHANGE_PREFIX` | `groovemap-musicbrainz` | Fanout exchange prefix |
+| `MUSICBRAINZ_EXCHANGE_PREFIX` | `groovemap-musicbrainz` | Fanout exchange prefix from the promoted producer contract |
 | `POSTGRES_POOL_MIN_SIZE` | `2` | Minimum PostgreSQL pool size |
 | `POSTGRES_POOL_MAX_SIZE` | `12` | Maximum pool size and channel-global AMQP prefetch |
-| `CONSUMER_CANCEL_DELAY` | `300` | Seconds between `file_complete` and consumer cancellation; `0` disables cancellation |
+| `CONSUMER_CANCEL_DELAY` | `300` | Seconds between a completion marker and consumer cancellation; `0` disables cancellation |
 | `QUEUE_CHECK_INTERVAL` | `3600` | Seconds between durable-queue checks while idle |
 | `STUCK_CHECK_INTERVAL` | `30` | Seconds between missing-consumer recovery checks |
 | `STARTUP_IDLE_TIMEOUT` | `30` | Seconds without messages before idle mode |
@@ -34,6 +34,11 @@ Credentials have no defaults.
 
 Pool sizes are clamped so `1 <= min <= max`. RabbitMQ prefetch is tied to the maximum
 pool size because every in-flight delivery can hold one PostgreSQL connection.
+
+The promoted [catalog-event contract](../contracts/catalog-events/v1/contract.json) is the
+authority for entity vocabulary, exchange names, queue templates, and producer provenance.
+Deployment-specific values and secret mounting belong to the
+[`deployment` configuration](https://github.com/groovemap-music/deployment/blob/main/docs/configuration.md).
 
 ## Runtime endpoints
 

@@ -7,7 +7,7 @@ or migrate the database schema.
 
 ```mermaid
 flowchart LR
-    Dumps[MusicBrainz JSONL dumps] --> Ingestion[catalog-ingestion]
+    Dumps[MusicBrainz JSONL dumps] --> Ingestion[musicbrainz-ingestion]
     Ingestion -->|four fanout exchanges| RabbitMQ[(RabbitMQ)]
     RabbitMQ --> Loader[musicbrainz-sql-loader]
     Loader -->|idempotent upserts| PostgreSQL[(PostgreSQL musicbrainz schema)]
@@ -17,17 +17,25 @@ flowchart LR
 ## Behavior
 
 The loader subscribes to the `artists`, `labels`, `release-groups`, and `releases`
-streams under the `groovemap-musicbrainz` exchange prefix. Each record is written in a
-single transaction with idempotent `ON CONFLICT` behavior. The separately versioned
+streams produced by
+[`musicbrainz-ingestion`](https://github.com/groovemap-music/musicbrainz-ingestion). The
+promoted contract names exchanges `groovemap-musicbrainz-{entity}`. This loader's durable
+queues are `groovemap-musicbrainz-brainztableinator-{entity}` with `.dlx` and `.dlq`
+dead-letter suffixes; the `brainztableinator` segment is a compatibility identifier.
+
+Each record is written in a single transaction with idempotent `ON CONFLICT` behavior to
+`musicbrainz.artists`, `musicbrainz.labels`, `musicbrainz.release_groups`,
+`musicbrainz.releases`, `musicbrainz.relationships`, and
+`musicbrainz.external_links`. The separately versioned
 [`database-schema`](https://github.com/groovemap-music/database-schema) repository owns
 the `musicbrainz` schema definition and initialization image.
 
-`file_complete` messages mark an individual stream complete and schedule its consumer
-for cancellation after a configurable grace period. `extraction_complete` is the
-terminal signal for the import. A graceful shutdown cancels consumers before closing the
-connection, leaving in-flight deliveries unacknowledged so RabbitMQ can redeliver them
-once after restart. Completion state is intentionally in memory; after restart the
-loader checks durable queues and resumes any remaining work.
+Both `file_complete` and `extraction_complete` mark the receiving stream complete and
+schedule its consumer for cancellation after a configurable grace period. The producer
+publishes the version-level `extraction_complete` signal to all four exchanges. A graceful
+shutdown cancels subscriptions before closing the connection; a delivery that reaches the
+shutdown guard is left unsettled so RabbitMQ can redeliver it once after restart. Completion
+state is intentionally in memory, while records and queues remain durable.
 
 See [Import and restart behavior](docs/musicbrainz-sync.md),
 [consumer draining](docs/consumer-cancellation.md), and
@@ -84,30 +92,13 @@ the singular canonical entity type (`artist`, `label`, `release-group`, `release
 | `groovemap.pipeline.reconnects` | counter | `system` |
 | `groovemap.pipeline.circuit_breaker.state` | observable gauge | `system` |
 
-The last three come from the `groovemap-runtime` resilience wrappers the loader already
-uses; nothing in this repository records them.
-
-Runtime instruments are installed by `setup_telemetry` from the `otel` extra and are
-observable, so the SDK reads them on the exporter's own thread and nothing on the message
-path pays for them. `process.open_file_descriptor.count` is absent on Windows and the
-`cpython.gc.*` instruments are absent on PyPy — the series is missing rather than a
-misleading zero.
-
-| Instrument | Kind | Attributes |
-| --- | --- | --- |
-| `process.cpu.time` | observable counter (`s`) | `type` (`user`, `system`) |
-| `process.cpu.utilization` | observable gauge (ratio) | — |
-| `process.memory.usage` | observable up-down counter (`By`) | — |
-| `process.memory.virtual` | observable up-down counter (`By`) | — |
-| `process.thread.count` | observable up-down counter | — |
-| `process.open_file_descriptor.count` | observable up-down counter | — |
-| `process.context_switches` | observable counter | `type` (`involuntary`, `voluntary`) |
-| `cpython.gc.collections` | observable counter | `generation`, `cpython.gc.generation` |
-| `groovemap.runtime.event_loop.lag` | histogram (`s`) | — |
-
-`groovemap.runtime.event_loop.lag` is sampled once a second by a background task the loader
-starts from its own running event loop right after `setup_telemetry`; `shutdown_telemetry`
-cancels it.
+`db.client.operation.duration`, `groovemap.pipeline.reconnects`, and
+`groovemap.pipeline.circuit_breaker.state` come from the `groovemap-runtime` adapters rather
+than this repository. The shared package also owns the `process.*`, `cpython.gc.*`, and
+`groovemap.runtime.event_loop.lag` definitions and their platform availability; see its
+[telemetry boundary](https://github.com/groovemap-music/python-libraries/blob/main/docs/runtime.md#telemetry-boundary)
+for the authoritative inventory. This loader starts the event-loop monitor after telemetry
+setup and stops it through `shutdown_telemetry`.
 
 Spans use low-cardinality names built only from the closed sets the metric attributes already
 use. No mbid, statement, file name, or free text reaches a span name or attribute, and a
@@ -120,12 +111,12 @@ span event carrying a payload.
 | `session postgresql` | client | `db.system.name`, `db.operation.name`, `error.type` on failure |
 | `flush postgresql {entity}` | internal | `db.system.name`, `groovemap.entity`, `outcome`, `error.type` on failure |
 
-`process {queue}` is opened from the `traceparent` header the extractor's publish left on the
-message, so a record's whole path — dump file, publish, this loader, PostgreSQL — is one
-trace. A delivery whose headers carry no readable trace context starts a new trace rather
-than failing. The loader acks and nacks its own aio-pika deliveries instead of going through
-`common.process_message_with_retry`, so it opens this span itself from the shared helpers,
-with the identical name, kind, and attributes the wrapper would have used.
+`process {queue}` is opened from the `traceparent` header that `musicbrainz-ingestion` left
+on the published message, so a record's whole path — dump file, publish, this loader,
+PostgreSQL — is one trace. A delivery whose headers carry no readable trace context starts a
+new trace rather than failing. The loader acks and nacks its own aio-pika deliveries instead
+of going through `common.process_message_with_retry`, so it opens this span itself from the
+shared helpers, with the identical name, kind, and attributes the wrapper would have used.
 
 `flush postgresql {entity}` covers one `executemany` of relationship or external-link rows
 and carries a span link to each delivery whose rows it writes; `common.flush_span` caps that
@@ -148,11 +139,31 @@ just setup
 just check
 ```
 
-`just check` is credential-free: PostgreSQL and RabbitMQ boundaries are mocked. It runs
-formatting, linting, contract verification, secret scans, typing, unit and regression
-tests, wheel build/install checks, license checks, and a version-bump preview. In
-particular, it preserves shutdown-delivery, drain, completion, and transient-failure
-regressions.
+`just check` is credential-free: PostgreSQL and RabbitMQ boundaries are mocked. The
+operator-facing recipe surface is:
+
+| Recipe | Contract |
+| --- | --- |
+| `just setup` | Install the frozen development environment. |
+| `just format-check` / `just lint` / `just contract-check` | Run the three source checks independently. |
+| `just source-check` | Run format, lint, and promoted-contract checks together. |
+| `just format` | Apply Ruff formatting and safe lint fixes to the worktree. |
+| `just typecheck` | Type-check the Python source and tests. |
+| `just test` / `just coverage` | Run the same unit and regression suite with coverage; CI uses `coverage`. |
+| `just secret-scan` | Scan Git history and the working tree with Gitleaks. |
+| `just build` | Build the wheel and source distribution. |
+| `just install-check` | Build, then verify the wheel in an isolated environment. |
+| `just license-check` | Verify package metadata and dependency licenses. |
+| `just bump-preview` | Verify the Commitizen version-bump preview. |
+| `just check` | Run every preceding validation capability. |
+| `just audit` | Run the separate network-backed vulnerability audit. |
+| `just prepare-runtime-wheel` | Stage the pinned `groovemap-runtime` wheel for an image build. |
+| `just image` | Stage the pinned runtime wheel and build the local container image. |
+| `just bump` | Update local version files, changelog, and lock data without committing, tagging, or publishing. |
+| `just release-dry-run` | Run `check`, then assemble local release evidence without publishing. |
+
+The regression suite preserves shutdown-delivery, drain, completion, and transient-failure
+behavior.
 
 Build the repository-named local image separately when Docker is available:
 
@@ -180,8 +191,15 @@ the compatibility identifiers are implementation details.
 
 ## Contracts, release, and license
 
-- Catalog-event contract v1 is promoted byte-for-byte from `catalog-ingestion`.
-- Persistence compatibility v1 is promoted from `database-schema`.
+- [Catalog-event contract v1](contracts/catalog-events/v1/contract.json) is promoted
+  byte-for-byte from
+  [`musicbrainz-ingestion`](https://github.com/groovemap-music/musicbrainz-ingestion), with
+  the producer revision and digests recorded in its
+  [source file](contracts/catalog-events/v1/source.json).
+- [Persistence compatibility v1](contracts/persistence/v1/compatibility.json) is promoted
+  from [`database-schema`](https://github.com/groovemap-music/database-schema), with its
+  provenance recorded separately in
+  [`source.json`](contracts/persistence/v1/source.json).
 - `just source-check` verifies promoted files and the generated binding by SHA-256.
 - `just release-dry-run` validates release artifacts without tagging, pushing,
   publishing, or releasing.
