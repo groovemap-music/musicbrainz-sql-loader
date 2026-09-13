@@ -7,6 +7,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+PERSISTENCE_PRODUCER_COMMIT = "91cbf6e3712a2fa403693b5c81fde729f29cb4ce"
 
 
 def digest(path: Path) -> str:
@@ -23,6 +24,7 @@ with (ROOT / "pyproject.toml").open("rb") as source:
 assert digest(ROOT / "contracts/catalog-events/v1/contract.json") == catalog_source["contract_sha256"]
 assert digest(ROOT / "brainztableinator/catalog_contract.py") == catalog_source["binding_sha256"]
 assert digest(ROOT / "contracts/persistence/v1/compatibility.json") == persistence_source["contract_sha256"]
+assert persistence_source["producer_commit"] == PERSISTENCE_PRODUCER_COMMIT
 assert compatibility["contract"] == "groovemap.persistence"
 assert compatibility["version"] == 1
 assert compatibility["application_runtime"]["tested_version"] == "0.1.0"
