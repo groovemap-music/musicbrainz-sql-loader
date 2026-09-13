@@ -35,8 +35,9 @@ from common import (
 from opentelemetry.trace import SpanKind, Status, StatusCode
 from orjson import loads
 from psycopg.errors import DataError, IntegrityError, InterfaceError, OperationalError
-from psycopg.types.json import Jsonb
 
+from brainztableinator._persistence import PostgreSQLMusicBrainzWriter
+from brainztableinator._record_processing import MusicBrainzRecordProcessor
 from brainztableinator.config import MusicBrainzSQLLoaderConfig
 from brainztableinator.queue_names import (
     AMQP_EXCHANGE_TYPE,
@@ -70,15 +71,12 @@ STARTUP_BANNER = r"""
 +--------------------------------+
 """.strip("\n")
 
-# === OpenTelemetry domain metrics ===
-#
 # One meter for this service, resolved lazily (see ``_instrument``) so the first real call
 # always lands after ``main`` has called ``setup_telemetry`` — before that, a message cannot
 # reach ``on_data_message`` and a batch cannot reach ``_insert_relationships`` /
 # ``_insert_external_links``, because no consumer is registered until after telemetry setup.
 METRICS_SCOPE = "groovemap.brainztableinator"
 
-# The closed source label for every pipeline instrument this service emits.
 PIPELINE_SOURCE = CONSUMER_SOURCES[AMQP_CONSUMER_ID]["source"]
 
 PIPELINE_MESSAGES = "groovemap.pipeline.messages"
@@ -97,10 +95,7 @@ MESSAGING_SYSTEM = "rabbitmq"
 
 STORE = "postgresql"
 
-# MUSICBRAINZ_DATA_TYPES is plural ("release-groups"); every metric attribute uses the
-# singular canonical entity vocabulary already used at the _insert_relationships /
-# _insert_external_links call sites ("release-group"), so one closed vocabulary covers every
-# domain instrument.
+# Metrics use singular entity names even though queue data types are plural.
 _ENTITY_LABELS = {
     "artists": "artist",
     "labels": "label",
@@ -210,8 +205,6 @@ def _record_consumer_delta(delta: int) -> None:
         logger.debug("Could not record consumer count metric", exc_info=True)
 
 
-# === OpenTelemetry spans ===
-#
 # Spans report under the same instrumentation scope as the metrics above, so an operator
 # reads one scope name for both signals. The tracer is resolved per span rather than cached
 # at import time: ``main`` installs the TracerProvider inside ``setup_telemetry``, and a
@@ -222,10 +215,8 @@ def _record_consumer_delta(delta: int) -> None:
 # conventions: no message, no stack trace, no span event carrying a payload. The shared
 # helpers in ``common.tracing`` already do the same, so nesting reads consistently.
 
-# The CONSUMER span context of the delivery currently being processed, so a batch flush can
-# link back to the message spans it covers. A ContextVar rather than a parameter because the
-# flush helpers sit four frames below the handler behind the per-entity processors, and the
-# link is telemetry, not an argument any of them should have to carry.
+# The current delivery context lets private batch processing link its flush span without
+# coupling record mapping or persistence to OpenTelemetry.
 _message_span_context: ContextVar[Any | None] = ContextVar("brainztableinator_message_span", default=None)
 
 
@@ -312,7 +303,26 @@ def _flush_links() -> list[Any]:
     return [] if context is None else [context]
 
 
-# Config will be initialized in main
+class _RuntimeBatchObserver:
+    """Bridge record-batch events into the service's telemetry lifecycle."""
+
+    def flush(self, entity: str) -> Any:
+        return flush_span(STORE, entity, links=_flush_links())
+
+    def record(self, entity: str, size: int, duration_s: float, outcome: str) -> None:
+        _record_batch_flush(entity, size, duration_s, outcome)
+
+    def set_outcome(self, span: Any, outcome: str) -> None:
+        _set_span_outcome(span, outcome)
+
+
+_record_processor = MusicBrainzRecordProcessor(
+    PostgreSQLMusicBrainzWriter(),
+    _RuntimeBatchObserver(),
+    map_musicbrainz_release,
+)
+
+
 config: MusicBrainzSQLLoaderConfig | None = None
 
 # Fallback prefetch when config is not yet loaded (matches MusicBrainzSQLLoaderConfig default).
@@ -331,50 +341,37 @@ def _channel_prefetch() -> int:
     return config.postgres_pool_max_size if config is not None else _DEFAULT_POOL_MAX
 
 
-# Progress tracking
 message_counts = {"artists": 0, "labels": 0, "release-groups": 0, "releases": 0}
-progress_interval = 100  # Log progress every 100 messages
+progress_interval = 100
 last_message_time = {
     "artists": 0.0,
     "labels": 0.0,
     "release-groups": 0.0,
     "releases": 0.0,
 }
-completed_files: set[str] = set()  # Track which files have completed processing
+completed_files: set[str] = set()
 
-# Throttles requeues while PostgreSQL is unavailable, so an outage cannot burn
-# the quorum queue's x-delivery-limit budget and dead-letter valid records
-# This prevents a database outage from exhausting the quorum queue's delivery budget.
+# Throttle requeues so an outage cannot exhaust the quorum queue's delivery budget.
 outage_backoff = OutageBackoff(SERVICE_NAME)
 current_task = None
 current_progress = 0.0
 
-# Consumer management
-consumer_tags: dict[str, str] = {}  # {"artists": "consumer-tag-123", ...}
-consumer_cancel_tasks: dict[str, asyncio.Task[None]] = {}  # {"artists": asyncio.Task, ...}
-queues: dict[str, Any] = {}  # {"artists": queue_object, ...}
-CONSUMER_CANCEL_DELAY = int(os.environ.get("CONSUMER_CANCEL_DELAY", "300"))  # Default 5 minutes
+consumer_tags: dict[str, str] = {}
+consumer_cancel_tasks: dict[str, asyncio.Task[None]] = {}
+queues: dict[str, Any] = {}
+CONSUMER_CANCEL_DELAY = int(os.environ.get("CONSUMER_CANCEL_DELAY", "300"))
 
-# Periodic queue checking settings
-QUEUE_CHECK_INTERVAL = int(
-    os.environ.get("QUEUE_CHECK_INTERVAL", "3600")
-)  # Default 1 hour - how often to check for new messages when connection is closed
+QUEUE_CHECK_INTERVAL = int(os.environ.get("QUEUE_CHECK_INTERVAL", "3600"))
 
-# Interval for checking stuck state (consumers died unexpectedly)
-STUCK_CHECK_INTERVAL = int(os.environ.get("STUCK_CHECK_INTERVAL", "30"))  # Default 30 seconds - how often to check for stuck state
+STUCK_CHECK_INTERVAL = int(os.environ.get("STUCK_CHECK_INTERVAL", "30"))
 
-# Idle mode settings - reduce log noise when no messages arrive after startup
-STARTUP_IDLE_TIMEOUT = int(os.environ.get("STARTUP_IDLE_TIMEOUT", "30"))  # Seconds after startup with no messages before entering idle mode
-IDLE_LOG_INTERVAL = int(os.environ.get("IDLE_LOG_INTERVAL", "300"))  # 5 min between idle status logs
+STARTUP_IDLE_TIMEOUT = int(os.environ.get("STARTUP_IDLE_TIMEOUT", "30"))
+IDLE_LOG_INTERVAL = int(os.environ.get("IDLE_LOG_INTERVAL", "300"))
 
-# Idle mode state
 idle_mode = False
 
-# Connection parameters will be initialized in main
 connection_params: dict[str, Any] = {}
 
-# Connection state tracking
-# Create async connection pool for concurrent access
 connection_pool: AsyncPostgreSQLPool | None = None
 
 rabbitmq_manager: Any = None  # Will hold AsyncResilientRabbitMQ instance
@@ -385,21 +382,17 @@ connection_check_task: asyncio.Task[None] | None = None  # Background task for p
 
 def get_health_data() -> dict[str, Any]:
     """Get current health data for monitoring."""
-    # Determine current task based on active consumers and recent activity
     active_task = None
     current_time = time.time()
 
-    # Check for recent message activity (within last 10 seconds)
     for data_type, last_time in last_message_time.items():
         if last_time > 0 and (current_time - last_time) < 10:
             active_task = f"Processing {data_type}"
             break
 
-    # If no recent activity but consumers exist, show as idle
     if active_task is None and len(consumer_tags) > 0:
         active_task = "Idle - waiting for messages"
 
-    # Check for stuck state: no consumers but work remains (files not completed)
     no_active_consumers = len(consumer_tags) == 0
     files_incomplete = len(completed_files) < len(MUSICBRAINZ_DATA_TYPES)
     has_processed_messages = any(count > 0 for count in message_counts.values())
@@ -432,7 +425,6 @@ def get_health_data() -> dict[str, Any]:
     }
 
 
-# Global shutdown flag
 shutdown_requested = False
 
 
@@ -466,10 +458,8 @@ async def schedule_consumer_cancellation(data_type: str, queue: Any) -> None:
                     CONSUMER_CANCEL_DELAY=CONSUMER_CANCEL_DELAY,
                 )
 
-                # Cancel the consumer with nowait to avoid hanging
                 await queue.cancel(consumer_tag, nowait=True)
 
-                # Remove from tracking
                 del consumer_tags[data_type]
                 _record_consumer_delta(-1)
 
@@ -478,21 +468,17 @@ async def schedule_consumer_cancellation(data_type: str, queue: Any) -> None:
                     data_type=data_type,
                 )
 
-                # Check if all consumers are now idle
                 if await check_all_consumers_idle():
                     logger.info("🔧 All consumers idle, closing RabbitMQ connection")
                     await close_rabbitmq_connection()
         except Exception as e:
             logger.error("❌ Failed to cancel consumer", data_type=data_type, error=str(e))
         finally:
-            # Clean up the task reference
             consumer_cancel_tasks.pop(data_type, None)
 
-    # Cancel any existing scheduled cancellation
     if data_type in consumer_cancel_tasks:
         consumer_cancel_tasks[data_type].cancel()
 
-    # Schedule new cancellation
     consumer_cancel_tasks[data_type] = asyncio.create_task(cancel_after_delay())
 
 
@@ -587,7 +573,6 @@ async def periodic_queue_checker() -> None:
 
             current_time = time.time()
 
-            # Check for stuck state (consumers died but work remains)
             if await check_consumers_unexpectedly_dead():
                 logger.warning(
                     "⚠️ Detected stuck state: consumers died but files not completed. Attempting recovery...",
@@ -598,12 +583,10 @@ async def periodic_queue_checker() -> None:
                 await _recover_consumers()
                 continue
 
-            # Normal idle check: only run at QUEUE_CHECK_INTERVAL
             time_since_last_check = current_time - last_full_check
             if time_since_last_check < QUEUE_CHECK_INTERVAL:
                 continue
 
-            # Only do full queue check if no active consumers and connection is closed
             if active_connection or len(consumer_tags) > 0:
                 continue
 
@@ -622,7 +605,6 @@ async def _recover_consumers() -> None:
     """Recover consumers by reconnecting to RabbitMQ and restarting consumption."""
     global active_connection, active_channel, queues, idle_mode
 
-    # Close any existing broken connection first
     if active_connection:
         try:
             await active_connection.close()
@@ -631,7 +613,6 @@ async def _recover_consumers() -> None:
         active_connection = None
         active_channel = None
 
-    # Temporarily connect to check queue depths
     try:
         temp_connection = await rabbitmq_manager.connect()
         temp_channel = await temp_connection.channel()
@@ -640,7 +621,6 @@ async def _recover_consumers() -> None:
         return
 
     try:
-        # Check each queue for pending messages
         queues_with_messages = []
         for data_type in MUSICBRAINZ_DATA_TYPES:
             queue_name = catalog_queue_name(AMQP_CONSUMER_ID, data_type)
@@ -661,10 +641,8 @@ async def _recover_consumers() -> None:
             active_connection = temp_connection
             active_channel = temp_channel
 
-            # Channel-global QoS bounds total in-flight handlers to the pool capacity.
             await active_channel.set_qos(prefetch_count=_channel_prefetch(), global_=True)
 
-            # Declare per-data-type fanout exchanges and consumer-owned queues
             queues = {}
             for data_type in MUSICBRAINZ_DATA_TYPES:
                 exchange_name = catalog_exchange_name(data_type)
@@ -763,344 +741,36 @@ async def _recover_consumers() -> None:
         consumer_tags.clear()
 
 
-# MusicBrainz's ws/2 JSON serializer spells multi-word entity types with an
-# underscore ("release_group") while this project — queue names, PROCESSORS keys,
-# and the hardcoded literals at every _insert_relationships call site — uses the
-# hyphenated form. The extractor now canonicalizes on the way out
-# (extractor/src/jsonl_parser.rs::canonical_entity_type), but messages published by
-# an older extractor may still be in flight or parked in a DLQ, so normalize
-# defensively at the write boundary too. Without this, the forward row written from
-# endpoint A and the swapped backward row written from endpoint B carry different
-# target_entity_type spellings, so the natural-key ON CONFLICT never fires and the
-# same logical relationship is stored twice under two vocabularies.
-_ENTITY_TYPE_ALIASES = {"release_group": "release-group"}
-
-
-def _get_or(record: dict[str, Any], key: str, default: Any) -> Any:
-    """``dict.get`` that treats a present-but-null value as absent.
-
-    The extractor's ``json!`` macro always emits every key it knows about — a source
-    field the MusicBrainz dump omits arrives as an explicit JSON ``null``, not as a
-    missing key. ``dict.get(key, default)`` therefore returns ``None`` and the default
-    is dead code, so ``ended`` landed as SQL NULL (a column DEFAULT does not apply to an
-    explicitly supplied NULL, and ``WHERE NOT ended`` silently drops those rows) and
-    ``attributes`` landed as the jsonb scalar ``null`` (on which ``jsonb_array_length``
-    errors outright). ON CONFLICT DO UPDATE then overwrote previously-correct values
-    with those nulls on reprocessing.
-    """
-    value = record.get(key)
-    return default if value is None else value
-
-
-def _life_span(record: dict[str, Any]) -> dict[str, Any]:
-    """Return the record's ``life_span`` object, tolerating a null/absent one."""
-    life_span = record.get("life_span")
-    return life_span if isinstance(life_span, dict) else {}
-
-
-def _canonical_entity_type(entity_type: str) -> str:
-    """Map a MusicBrainz entity-type spelling onto the project's canonical vocabulary."""
-    return _ENTITY_TYPE_ALIASES.get(entity_type, entity_type)
-
-
 async def _insert_relationships(conn: Any, source_mbid: str, source_type: str, rels: list[dict[str, Any]]) -> None:
-    """Batch-insert relationship records for one entity into musicbrainz.relationships.
-
-    All of an entity's relationships are written with a single ``executemany`` so the
-    set is pipelined in one round-trip instead of one statement (and one network
-    round-trip) per relationship. This keeps the per-message transaction short, which
-    minimizes how long the connection sits ``idle in transaction`` holding a backend —
-    the dominant pressure on the shared PgBouncer budget during a bulk import.
-
-    MusicBrainz relations are directional and materialized on both endpoints;
-    ``direction`` == "backward" means the entity being processed is the
-    relation's TARGET, not its source (mirrors the fix in
-    the MusicBrainz graph enricher). Swap source/target in that
-    case so the stored row always reflects the relationship's canonical
-    orientation (e.g. member->band for "member of band"), regardless of
-    which endpoint's record we happened to be processing.
-    """
-    canonical_source_type = _canonical_entity_type(source_type)
-    params = []
-    for rel in rels:
-        # Skip relations missing a target MBID (would fail UUID cast), target entity
-        # type, or relationship type — these would violate NOT NULL / cast constraints.
-        if not (rel.get("target_mbid") and rel.get("target_type") and rel.get("type")):
-            continue
-
-        rel_target_type = _canonical_entity_type(rel["target_type"])
-
-        if rel.get("direction") == "backward":
-            row_source_mbid, row_source_type = rel["target_mbid"], rel_target_type
-            row_target_mbid, row_target_type = source_mbid, canonical_source_type
-        else:
-            row_source_mbid, row_source_type = source_mbid, canonical_source_type
-            row_target_mbid, row_target_type = rel["target_mbid"], rel_target_type
-
-        params.append(
-            (
-                row_source_mbid,
-                row_source_type,
-                row_target_mbid,
-                row_target_type,
-                rel.get("type", ""),
-                Jsonb(_get_or(rel, "attributes", [])),
-                rel.get("begin_date"),
-                rel.get("end_date"),
-                _get_or(rel, "ended", False),
-            )
-        )
-    with flush_span(STORE, canonical_source_type, links=_flush_links()) as span:
-        if not params:
-            _record_batch_flush(canonical_source_type, 0, 0.0, "skipped")
-            _set_span_outcome(span, "skipped")
-            return
-        started = time.perf_counter()
-        try:
-            async with conn.cursor() as cursor:
-                await cursor.executemany(
-                    "INSERT INTO musicbrainz.relationships "
-                    "(source_mbid, source_entity_type, target_mbid, target_entity_type, relationship_type, attributes, begin_date, end_date, ended) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
-                    # The conflict target must match relationships_natural_key in the
-                    # database-schema repository's src/groovemap_schema/postgres.py,
-                    # which includes begin_date/end_date/attributes so that two distinct relationship
-                    # instances (e.g. a re-joined band membership with different date ranges, or a
-                    # multi-instrument performer credit) coexist as separate rows instead of one
-                    # silently overwriting the other. begin_date/end_date/
-                    # attributes are now part of the conflict key so a genuine re-ingest conflict only
-                    # occurs when they already match; only `ended` (a mutable flag, not part of the
-                    # relationship's identity) needs refreshing on conflict.
-                    "ON CONFLICT (source_mbid, target_mbid, source_entity_type, target_entity_type, relationship_type, begin_date, end_date, attributes) "
-                    "DO UPDATE SET ended = EXCLUDED.ended",
-                    params,
-                )
-        except Exception:
-            _record_batch_flush(canonical_source_type, len(params), time.perf_counter() - started, "failed")
-            _set_span_outcome(span, "failed")
-            # The re-raise leaves the flush span through common.flush_span, which sets the
-            # ERROR status and error.type itself; setting them again here would be duplicate.
-            raise
-        _record_batch_flush(canonical_source_type, len(params), time.perf_counter() - started, "processed")
-        _set_span_outcome(span, "processed")
+    """Preserve the established relationship-batch entry point."""
+    await _record_processor.insert_relationships(conn, source_mbid, source_type, rels)
 
 
 async def _insert_external_links(conn: Any, mbid: str, entity_type: str, links: list[dict[str, Any]]) -> None:
-    """Batch-insert external link records for one entity into musicbrainz.external_links.
-
-    Uses a single ``executemany`` for the same round-trip / transaction-window reasons
-    described in :func:`_insert_relationships`.
-    """
-    canonical_entity_type = _canonical_entity_type(entity_type)
-    params = [
-        (
-            mbid,
-            entity_type,
-            link.get("url", ""),
-            link.get("service", ""),
-        )
-        for link in links
-        if link.get("url") and link.get("service")  # Skip links missing URL or service name
-    ]
-    with flush_span(STORE, canonical_entity_type, links=_flush_links()) as span:
-        if not params:
-            _record_batch_flush(canonical_entity_type, 0, 0.0, "skipped")
-            _set_span_outcome(span, "skipped")
-            return
-        started = time.perf_counter()
-        try:
-            async with conn.cursor() as cursor:
-                await cursor.executemany(
-                    "INSERT INTO musicbrainz.external_links "
-                    "(mbid, entity_type, url, service_name) "
-                    "VALUES (%s, %s, %s, %s) "
-                    "ON CONFLICT (mbid, entity_type, service_name, url) DO UPDATE SET url = EXCLUDED.url",
-                    params,
-                )
-        except Exception:
-            _record_batch_flush(canonical_entity_type, len(params), time.perf_counter() - started, "failed")
-            _set_span_outcome(span, "failed")
-            # The re-raise leaves the flush span through common.flush_span, which sets the
-            # ERROR status and error.type itself; setting them again here would be duplicate.
-            raise
-        _record_batch_flush(canonical_entity_type, len(params), time.perf_counter() - started, "processed")
-        _set_span_outcome(span, "processed")
+    """Preserve the established external-link batch entry point."""
+    await _record_processor.insert_external_links(conn, mbid, entity_type, links)
 
 
 async def process_artist(conn: Any, record: dict[str, Any]) -> None:
     """Insert or update a MusicBrainz artist record in PostgreSQL."""
-    mbid = record.get("mbid", record.get("id", ""))
-    async with conn.cursor() as cursor:
-        await cursor.execute(
-            "INSERT INTO musicbrainz.artists "
-            "(mbid, name, sort_name, type, gender, begin_date, end_date, ended, "
-            "area, begin_area, end_area, disambiguation, discogs_artist_id, "
-            "aliases, tags, data) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
-            "ON CONFLICT (mbid) DO UPDATE SET "
-            "name = EXCLUDED.name, sort_name = EXCLUDED.sort_name, "
-            "type = EXCLUDED.type, gender = EXCLUDED.gender, "
-            "begin_date = EXCLUDED.begin_date, end_date = EXCLUDED.end_date, "
-            "ended = EXCLUDED.ended, area = EXCLUDED.area, "
-            "begin_area = EXCLUDED.begin_area, end_area = EXCLUDED.end_area, "
-            "disambiguation = EXCLUDED.disambiguation, "
-            "discogs_artist_id = EXCLUDED.discogs_artist_id, "
-            "aliases = EXCLUDED.aliases, tags = EXCLUDED.tags, "
-            "data = EXCLUDED.data, updated_at = NOW()",
-            (
-                mbid,
-                record.get("name", ""),
-                record.get("sort_name", ""),
-                record.get("mb_type", ""),
-                record.get("gender", ""),
-                _get_or(record, "begin_date", _life_span(record).get("begin")),
-                _get_or(record, "end_date", _life_span(record).get("end")),
-                _get_or(record, "ended", _get_or(_life_span(record), "ended", False)),
-                record.get("area", ""),
-                record.get("begin_area", ""),
-                record.get("end_area", ""),
-                record.get("disambiguation", ""),
-                record.get("discogs_artist_id"),
-                Jsonb(_get_or(record, "aliases", [])),
-                Jsonb(_get_or(record, "tags", [])),
-                Jsonb(record),
-            ),
-        )
-
-    # Insert relationships and external links (batched into one round-trip each)
-    await _insert_relationships(conn, mbid, "artist", record.get("relations", []))
-    await _insert_external_links(conn, mbid, "artist", record.get("external_links", []))
+    await _record_processor.process_artist(conn, record)
 
 
 async def process_label(conn: Any, record: dict[str, Any]) -> None:
     """Insert or update a MusicBrainz label record in PostgreSQL."""
-    mbid = record.get("mbid", record.get("id", ""))
-    async with conn.cursor() as cursor:
-        await cursor.execute(
-            "INSERT INTO musicbrainz.labels "
-            "(mbid, name, type, label_code, begin_date, end_date, ended, "
-            "area, disambiguation, discogs_label_id, data) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
-            "ON CONFLICT (mbid) DO UPDATE SET "
-            "name = EXCLUDED.name, type = EXCLUDED.type, "
-            "label_code = EXCLUDED.label_code, "
-            "begin_date = EXCLUDED.begin_date, end_date = EXCLUDED.end_date, "
-            "ended = EXCLUDED.ended, area = EXCLUDED.area, "
-            "disambiguation = EXCLUDED.disambiguation, "
-            "discogs_label_id = EXCLUDED.discogs_label_id, "
-            "data = EXCLUDED.data, updated_at = NOW()",
-            (
-                mbid,
-                record.get("name", ""),
-                record.get("mb_type", ""),
-                record.get("label_code"),
-                _get_or(record, "begin_date", _life_span(record).get("begin")),
-                _get_or(record, "end_date", _life_span(record).get("end")),
-                _get_or(record, "ended", _get_or(_life_span(record), "ended", False)),
-                record.get("area", ""),
-                record.get("disambiguation", ""),
-                record.get("discogs_label_id"),
-                Jsonb(record),
-            ),
-        )
-
-    # Insert relationships and external links (batched into one round-trip each)
-    await _insert_relationships(conn, mbid, "label", record.get("relations", []))
-    await _insert_external_links(conn, mbid, "label", record.get("external_links", []))
-
-
-def _release_media_block(record: dict[str, Any]) -> dict[str, Any]:
-    """Return the release's canonical media block (ADR 0007).
-
-    A producer at or after the media rollout attaches the precomputed canonical
-    ``media`` block directly, so that block is used as-is. An event from a producer
-    that predates the field carries only the raw ``media_raw`` medium list (or
-    neither field at all); in both of those cases a best-effort block is derived
-    through the shared Python mapper, so the persisted column is never left NULL
-    for a row this loader writes. ``status``/``packaging``/``release_group`` ride
-    along on the derivation so a predates-media event still yields an edition/
-    packaging/release_kind-aware block, not just its medium items.
-    """
-    media = record.get("media")
-    if isinstance(media, dict):
-        return media
-
-    return map_musicbrainz_release(
-        {
-            "media": record.get("media_raw") or [],
-            "status": record.get("status"),
-            "packaging": record.get("packaging"),
-            "release_group": record.get("release_group"),
-        }
-    )
+    await _record_processor.process_label(conn, record)
 
 
 async def process_release(conn: Any, record: dict[str, Any]) -> None:
     """Insert or update a MusicBrainz release record in PostgreSQL."""
-    mbid = record.get("mbid", record.get("id", ""))
-    async with conn.cursor() as cursor:
-        await cursor.execute(
-            "INSERT INTO musicbrainz.releases "
-            "(mbid, name, barcode, status, release_group_mbid, discogs_release_id, media, data) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
-            "ON CONFLICT (mbid) DO UPDATE SET "
-            "name = EXCLUDED.name, barcode = EXCLUDED.barcode, "
-            "status = EXCLUDED.status, "
-            "release_group_mbid = EXCLUDED.release_group_mbid, "
-            "discogs_release_id = EXCLUDED.discogs_release_id, "
-            "media = EXCLUDED.media, "
-            "data = EXCLUDED.data, updated_at = NOW()",
-            (
-                mbid,
-                record.get("name", ""),
-                record.get("barcode"),
-                record.get("status", ""),
-                record.get("release_group_mbid"),
-                record.get("discogs_release_id"),
-                Jsonb(_release_media_block(record)),
-                Jsonb(record),
-            ),
-        )
-
-    # Insert relationships and external links (batched into one round-trip each)
-    await _insert_relationships(conn, mbid, "release", record.get("relations", []))
-    await _insert_external_links(conn, mbid, "release", record.get("external_links", []))
+    await _record_processor.process_release(conn, record)
 
 
 async def process_release_group(conn: Any, record: dict[str, Any]) -> None:
     """Insert or update a MusicBrainz release-group record in PostgreSQL."""
-    mbid = record.get("mbid", record.get("id", ""))
-    async with conn.cursor() as cursor:
-        await cursor.execute(
-            "INSERT INTO musicbrainz.release_groups "
-            "(mbid, name, type, secondary_types, first_release_date, "
-            "disambiguation, discogs_master_id, data) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
-            "ON CONFLICT (mbid) DO UPDATE SET "
-            "name = EXCLUDED.name, type = EXCLUDED.type, "
-            "secondary_types = EXCLUDED.secondary_types, "
-            "first_release_date = EXCLUDED.first_release_date, "
-            "disambiguation = EXCLUDED.disambiguation, "
-            "discogs_master_id = EXCLUDED.discogs_master_id, "
-            "data = EXCLUDED.data, updated_at = NOW()",
-            (
-                mbid,
-                record.get("name", ""),
-                record.get("mb_type", ""),
-                Jsonb(_get_or(record, "secondary_types", [])),
-                record.get("first_release_date"),
-                record.get("disambiguation", ""),
-                record.get("discogs_master_id"),
-                Jsonb(record),
-            ),
-        )
-
-    # Insert relationships and external links (batched into one round-trip each)
-    await _insert_relationships(conn, mbid, "release-group", record.get("relations", []))
-    await _insert_external_links(conn, mbid, "release-group", record.get("external_links", []))
+    await _record_processor.process_release_group(conn, record)
 
 
-# Map data types to their processing functions
 PROCESSORS: dict[str, Any] = {
     "artists": process_artist,
     "labels": process_label,
@@ -1153,7 +823,6 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
     # open across the whole handler, so the pool's db spans and the batch flush spans below
     # nest under it and one trace shows a record's path from the dump file into PostgreSQL.
     with _consume_span(destination, message.headers) as span:
-        # Published for the batch flushes further down the call stack to link back to.
         token = _message_span_context.set(_span_context_of(span))
         outcome = "processed"
         error_type: str | None = None
@@ -1162,12 +831,10 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
             try:
                 data: dict[str, Any] = loads(message.body)
 
-                # Check if this is a file completion message
                 if data.get("type") == "file_complete":
                     total_processed = data.get("total_processed", 0)
                     logger.info(f"✅ File processing complete for {data_type}! Total records processed: {total_processed}")
 
-                    # Schedule consumer cancellation if enabled
                     if CONSUMER_CANCEL_DELAY > 0 and data_type in queues:
                         await schedule_consumer_cancellation(data_type, queues[data_type])
 
@@ -1179,7 +846,6 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
                     outcome = "skipped"
                     return
 
-                # Check if this is an extraction completion message
                 if data.get("type") == "extraction_complete":
                     logger.info(
                         "🏁 Received extraction_complete signal",
@@ -1187,15 +853,7 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
                         version=data.get("version"),
                     )
 
-                    # extraction_complete is this type's terminal signal, so it must also
-                    # (re-)mark the type complete. completed_files is otherwise written only by
-                    # file_complete and ERASED by _recover_consumers for any type whose queue
-                    # still holds messages — and when the only pending message IS this signal,
-                    # nothing ever restored the flag: the stall check then logged at ERROR
-                    # every 30s forever and check_all_consumers_idle() could never return True,
-                    # so the connection and idle consumers were held open until restart. A
-                    # plain restart between the file_complete ack and this delivery reaches the
-                    # same terminal state.
+                    # Recovery may clear completion before redelivering this terminal signal.
                     completed_files.add(data_type)
                     if CONSUMER_CANCEL_DELAY > 0 and data_type in queues:
                         await schedule_consumer_cancellation(data_type, queues[data_type])
@@ -1204,7 +862,6 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
                     outcome = "skipped"
                     return
 
-                # Normal message processing - require 'id' field
                 if "id" not in data:
                     logger.error("❌ Message missing 'id' field", data=data)
                     await message.nack(requeue=False)
@@ -1239,7 +896,6 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
                     error_type = "ValidationError"
                     return
 
-                # Extract record details for logging
                 record_name = data.get("name", "Unknown")
                 logger.debug(
                     "🔄 Processing record",
@@ -1255,7 +911,6 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
                 error_type = type(e).__name__
                 return
 
-            # Process record using async connection pool
             try:
                 if connection_pool is None:
                     raise RuntimeError("Connection pool not initialized")
@@ -1281,10 +936,8 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> N
 
                 await message.ack()
 
-                # PostgreSQL answered — clear the outage backoff.
                 outage_backoff.reset()
 
-                # Increment counter and update last message time only after successful ack
                 if data_type in message_counts:
                     message_counts[data_type] += 1
                     last_message_time[data_type] = time.time()
@@ -1360,14 +1013,12 @@ async def progress_reporter() -> None:
             await asyncio.sleep(30)
         report_count += 1
 
-        # Skip all logging if all files are complete
         if len(completed_files) == len(MUSICBRAINZ_DATA_TYPES):
             continue
 
         total = sum(message_counts.values())
         current_time = time.time()
 
-        # Idle mode detection
         if not idle_mode and total == 0 and (current_time - startup_time) >= STARTUP_IDLE_TIMEOUT:
             idle_mode = True
             last_idle_log = current_time
@@ -1377,7 +1028,6 @@ async def progress_reporter() -> None:
             )
             continue
 
-        # While in idle mode, only log briefly every IDLE_LOG_INTERVAL
         if idle_mode:
             if total > 0:
                 idle_mode = False
@@ -1389,7 +1039,6 @@ async def progress_reporter() -> None:
                 )
             continue
 
-        # Check for stalled consumers (skip completed files)
         stalled_consumers = []
         for data_type, last_time in last_message_time.items():
             if data_type not in completed_files and last_time > 0 and (current_time - last_time) > 120:
@@ -1398,7 +1047,6 @@ async def progress_reporter() -> None:
         if stalled_consumers:
             logger.error(f"⚠️ Stalled consumers detected: {stalled_consumers}. No messages processed for >2 minutes.")
 
-        # Build progress string with completion emojis
         progress_parts = []
         for data_type in ["artists", "labels", "release-groups", "releases"]:
             emoji = "✅ " if data_type in completed_files else ""
@@ -1406,7 +1054,6 @@ async def progress_reporter() -> None:
 
         logger.info(f"📊 MusicBrainz PostgreSQL Progress: {total} total messages processed ({', '.join(progress_parts)})")
 
-        # Log current processing state
         if total == 0:
             logger.info("⏳ Waiting for messages to process...")
         elif all(current_time - last_time < 5 for last_time in last_message_time.values() if last_time > 0):
@@ -1418,7 +1065,6 @@ async def progress_reporter() -> None:
                 slow_consumers=slow_consumers,
             )
 
-        # Log consumer status
         active_consumers = list(consumer_tags.keys())
         canceled_consumers = [dt for dt in MUSICBRAINZ_DATA_TYPES if dt not in consumer_tags and dt in completed_files]
 
@@ -1438,7 +1084,6 @@ async def main() -> None:
     """Main entry point for the MusicBrainz SQL loader service."""
     global connection_pool, config, connection_params, queues, rabbitmq_manager, active_connection, active_channel, connection_check_task
 
-    # Set up signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
@@ -1450,7 +1095,6 @@ async def main() -> None:
     start_event_loop_monitor()
     logger.info("🚀 Starting GrooveMap musicbrainz-sql-loader with connection pooling")
 
-    # Add startup delay for dependent services
     startup_delay = int(os.environ.get("STARTUP_DELAY", "5"))
     if startup_delay > 0:
         logger.info(
@@ -1459,22 +1103,18 @@ async def main() -> None:
         )
         await asyncio.sleep(startup_delay)
 
-    # Start health server
     health_server = HealthServer(8010, get_health_data)
     health_server.start_background()
     logger.info("🏥 Health server started on port 8010")
 
-    # Initialize configuration
     try:
         config = MusicBrainzSQLLoaderConfig.from_env()
     except ValueError as e:
         logger.error("❌ Configuration error", error=str(e))
         return
 
-    # Parse host and port from address (POSTGRES_HOST may embed a port, e.g. a pooler)
     host, port = parse_postgres_host_port(config.postgres_host)
 
-    # Set connection parameters
     connection_params = {
         "host": str(host),
         "port": int(port),
@@ -1483,7 +1123,6 @@ async def main() -> None:
         "password": str(config.postgres_password),
     }
 
-    # Initialize async resilient connection pool
     try:
         connection_pool = AsyncPostgreSQLPool(
             connection_params=connection_params,
@@ -1505,7 +1144,6 @@ async def main() -> None:
 
     print(STARTUP_BANNER)
 
-    # Initialize resilient RabbitMQ connection manager
     rabbitmq_manager = AsyncResilientRabbitMQ(
         connection_url=config.amqp_connection,
         max_retries=10,
@@ -1514,7 +1152,6 @@ async def main() -> None:
         retry_delay=5.0,
     )
 
-    # Try to connect with additional retry logic for startup
     max_startup_retries = 5
     startup_retry = 0
     amqp_connection = None
@@ -1564,7 +1201,6 @@ async def main() -> None:
             prefetch_count=prefetch,
         )
 
-        # Declare per-data-type fanout exchanges and consumer-owned queues
         queues = {}
         for data_type in MUSICBRAINZ_DATA_TYPES:
             exchange_name = catalog_exchange_name(data_type)
@@ -1572,13 +1208,10 @@ async def main() -> None:
             dlx_name = catalog_dead_letter_exchange_name(AMQP_CONSUMER_ID, data_type)
             dlq_name = catalog_dead_letter_queue_name(AMQP_CONSUMER_ID, data_type)
 
-            # Declare fanout exchange (must match extractor)
             exchange = await channel.declare_exchange(exchange_name, AMQP_EXCHANGE_TYPE, durable=True, auto_delete=False)
 
-            # Declare consumer-owned dead-letter exchange
             dlx_exchange = await channel.declare_exchange(dlx_name, AMQP_EXCHANGE_TYPE, durable=True, auto_delete=False)
 
-            # Declare DLQ (classic queue for dead letters)
             dlq = await channel.declare_queue(
                 auto_delete=False,
                 durable=True,
@@ -1587,7 +1220,6 @@ async def main() -> None:
             )
             await dlq.bind(dlx_exchange)
 
-            # Declare main quorum queue with consumer-owned DLX
             queue_args = {
                 "x-queue-type": "quorum",
                 "x-dead-letter-exchange": dlx_name,
@@ -1602,7 +1234,6 @@ async def main() -> None:
             await queue.bind(exchange)
             queues[data_type] = queue
 
-        # Start consumers for all data types
         for data_type in MUSICBRAINZ_DATA_TYPES:
             handler = make_data_handler(data_type)
             consumer_tags[data_type] = await queues[data_type].consume(handler)
@@ -1616,7 +1247,6 @@ async def main() -> None:
 
         progress_task = asyncio.create_task(progress_reporter())
 
-        # Start periodic queue checker task
         connection_check_task = asyncio.create_task(periodic_queue_checker())
         logger.info(
             f"🔄 Started periodic queue checker (interval: {QUEUE_CHECK_INTERVAL}s)",
@@ -1641,26 +1271,21 @@ async def main() -> None:
             # can only leave unacked.
             await cancel_all_consumers()
 
-            # Cancel progress reporting
             progress_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await progress_task
 
-            # Cancel connection check task
             if connection_check_task:
                 connection_check_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await connection_check_task
                 logger.info("✅ Queue checker task stopped")
 
-            # Cancel any pending consumer cancellation tasks
             for task in list(consumer_cancel_tasks.values()):
                 task.cancel()
 
-            # Close RabbitMQ connection if still active
             await close_rabbitmq_connection()
 
-            # Close async connection pool
             try:
                 if connection_pool:
                     await connection_pool.close()
@@ -1668,10 +1293,8 @@ async def main() -> None:
             except Exception as e:
                 logger.warning("⚠️ Error closing connection pool", error=str(e))
 
-        # Stop health server
         health_server.stop()
 
-        # Force-flush and shut down telemetry so the last export lands.
         shutdown_telemetry()
 
 
