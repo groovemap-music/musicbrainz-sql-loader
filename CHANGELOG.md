@@ -3,6 +3,12 @@
 All notable changes to this repository will be recorded here by Commitizen from
 Conventional Commits.
 
+## Unreleased
+
+### Feat
+
+- **loader**: attach or mint native catalog ids per message and write gm_item_id
+
 ## v0.2.0 (2026-09-04)
 
 ### Feat

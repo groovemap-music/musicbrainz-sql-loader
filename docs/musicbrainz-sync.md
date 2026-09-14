@@ -53,6 +53,43 @@ embed a competing schema definition.
 The authoritative table and index inventory remains in the
 [`database-schema` architecture](https://github.com/groovemap-music/database-schema/blob/main/docs/architecture.md#postgresql-media-schema).
 
+## Native catalog identity
+
+Every row this loader writes carries `gm_item_id`, the native catalog identifier from
+[ADR 0009](https://github.com/groovemap-music/design/blob/main/docs/adr/0009-native-catalog-identity.md).
+A provider's own identifier is evidence, not identity: `provider_aliases` maps a
+`(provider, entity_kind, external_id)` triple onto one GrooveMap-minted UUID, and the four
+upserts write the id that mapping yields.
+
+The entity kind is the vocabulary's, not the provider's spelling. An artist is `artist`, a
+label is `label`, a release is `release`, and a **release group is `master`** — both names
+describe the abstract work a release is an edition of.
+
+Each `process_*` method resolves the id on the message's own connection, inside the message's
+transaction, before it calls the writer:
+
+- **Attach.** When the record carries the matching Discogs identifier
+  (`discogs_artist_id`, `discogs_label_id`, `discogs_release_id`, or `discogs_master_id`) and
+  a Discogs alias already resolves, the MusicBrainz alias is attached to *that* item's native
+  id. The row shares the identifier the Discogs loader already minted instead of opening a
+  parallel item for the same record. The existing alias always wins, so an attach that races
+  another writer returns the id the winning alias names and nothing is ever overwritten.
+- **Mint.** A record with no Discogs identifier, or one whose Discogs identifier no alias has
+  claimed yet, resolves its own MusicBrainz alias, which mints a catalog item on a miss.
+
+Resolution costs one to three short queries per message on the connection the upsert already
+holds, so a failure rolls the alias back with the row it was minted for.
+
+Ordering is not guaranteed between the two loaders. A MusicBrainz record that names a Discogs
+release the Discogs loader has not yet ingested mints its own item, and the pair is then two
+items for one record. Repairing those pairs is a **follow-on reconciliation job** that walks
+the `discogs_*` columns after both catalogs have loaded and merges the duplicates; it is
+deliberately not this loader's work, because blocking a message on a counterpart that may
+never arrive would stall the import.
+
+A row whose alias could not be resolved is still written, with `gm_item_id` left NULL for that
+same job to fill. Identity is additive here: it never dead-letters a record.
+
 ## Canonical media block
 
 `musicbrainz.releases.media` holds the canonical media block from
