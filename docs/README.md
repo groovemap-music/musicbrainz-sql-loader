@@ -6,6 +6,7 @@
 - [File and extraction completion](file-completion-tracking.md)
 - [Database resilience](database-resilience.md)
 - [PostgreSQL connection-budget analysis](postgres-pool-exhaustion-analysis.md)
+- [Test assertion audit](test-assertion-audit.md)
 - [Source-history provenance](extraction.md)
 - [Release compliance](release-compliance.md)
 
