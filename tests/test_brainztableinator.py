@@ -922,29 +922,20 @@ class TestOnDataMessage:
             assert completed == {"artists"}
 
     @pytest.mark.asyncio
-    async def test_valid_data_message_calls_processor(self):
+    async def test_valid_data_message_calls_processor(
+        self,
+        mock_async_pool: MagicMock,
+        mock_connection: MagicMock,
+    ):
         """A valid data message with 'id' should call the appropriate processor."""
         mock_message = AsyncMock()
         mock_message.body = b'{"id": "550e8400-e29b-41d4-a716-446655440000", "name": "Test Artist"}'
-
-        mock_pool = MagicMock()
-        mock_conn = AsyncMock()
-        # Support conn.transaction() as an async context manager
-        mock_tx_cm = AsyncMock()
-        mock_tx_cm.__aenter__ = AsyncMock(return_value=None)
-        mock_tx_cm.__aexit__ = AsyncMock(return_value=None)
-        mock_conn.transaction = MagicMock(return_value=mock_tx_cm)
-        mock_conn_cm = AsyncMock()
-        mock_conn_cm.__aenter__ = AsyncMock(return_value=mock_conn)
-        mock_conn_cm.__aexit__ = AsyncMock(return_value=None)
-        mock_pool.connection = MagicMock(return_value=mock_conn_cm)
-
         mock_processor = AsyncMock()
 
         with (
             patch("brainztableinator.brainztableinator.shutdown_requested", False),
             patch("brainztableinator.brainztableinator.completed_files", set()),
-            patch("brainztableinator.brainztableinator.connection_pool", mock_pool),
+            patch("brainztableinator.brainztableinator.connection_pool", mock_async_pool),
             patch(
                 "brainztableinator.brainztableinator.message_counts",
                 {"artists": 0, "labels": 0, "release-groups": 0, "releases": 0},
@@ -960,7 +951,7 @@ class TestOnDataMessage:
         ):
             await on_data_message(mock_message, "artists")
 
-            mock_processor.assert_called_once_with(mock_conn, {"id": "550e8400-e29b-41d4-a716-446655440000", "name": "Test Artist"})
+            mock_processor.assert_called_once_with(mock_connection, {"id": "550e8400-e29b-41d4-a716-446655440000", "name": "Test Artist"})
             mock_message.ack.assert_called_once()
 
     @pytest.mark.asyncio
