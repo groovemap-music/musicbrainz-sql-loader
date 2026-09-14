@@ -25,13 +25,13 @@ class PostgreSQLMusicBrainzWriter:
     """Execute the MusicBrainz schema's entity-specific write statements."""
 
     async def upsert_artist(self, conn: Any, values: tuple[Any, ...]) -> None:
-        params = (*values[:13], Jsonb(values[13]), Jsonb(values[14]), Jsonb(values[15]))
+        params = (*values[:13], Jsonb(values[13]), Jsonb(values[14]), Jsonb(values[15]), values[16])
         async with conn.cursor() as cursor:
             await cursor.execute(
                 "INSERT INTO musicbrainz.artists "
                 "(mbid, name, sort_name, type, gender, begin_date, end_date, ended, "
-                "area, begin_area, end_area, disambiguation, discogs_artist_id, aliases, tags, data) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                "area, begin_area, end_area, disambiguation, discogs_artist_id, aliases, tags, data, gm_item_id) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
                 "ON CONFLICT (mbid) DO UPDATE SET "
                 "name = EXCLUDED.name, sort_name = EXCLUDED.sort_name, "
                 "type = EXCLUDED.type, gender = EXCLUDED.gender, "
@@ -41,17 +41,18 @@ class PostgreSQLMusicBrainzWriter:
                 "disambiguation = EXCLUDED.disambiguation, "
                 "discogs_artist_id = EXCLUDED.discogs_artist_id, "
                 "aliases = EXCLUDED.aliases, tags = EXCLUDED.tags, "
+                "gm_item_id = EXCLUDED.gm_item_id, "
                 "data = EXCLUDED.data, updated_at = NOW()",
                 params,
             )
 
     async def upsert_label(self, conn: Any, values: tuple[Any, ...]) -> None:
-        params = (*values[:10], Jsonb(values[10]))
+        params = (*values[:10], Jsonb(values[10]), values[11])
         async with conn.cursor() as cursor:
             await cursor.execute(
                 "INSERT INTO musicbrainz.labels "
-                "(mbid, name, type, label_code, begin_date, end_date, ended, area, disambiguation, discogs_label_id, data) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                "(mbid, name, type, label_code, begin_date, end_date, ended, area, disambiguation, discogs_label_id, data, gm_item_id) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
                 "ON CONFLICT (mbid) DO UPDATE SET "
                 "name = EXCLUDED.name, type = EXCLUDED.type, "
                 "label_code = EXCLUDED.label_code, "
@@ -59,40 +60,43 @@ class PostgreSQLMusicBrainzWriter:
                 "ended = EXCLUDED.ended, area = EXCLUDED.area, "
                 "disambiguation = EXCLUDED.disambiguation, "
                 "discogs_label_id = EXCLUDED.discogs_label_id, "
+                "gm_item_id = EXCLUDED.gm_item_id, "
                 "data = EXCLUDED.data, updated_at = NOW()",
                 params,
             )
 
     async def upsert_release(self, conn: Any, values: tuple[Any, ...]) -> None:
-        params = (*values[:6], Jsonb(values[6]), Jsonb(values[7]))
+        params = (*values[:6], Jsonb(values[6]), Jsonb(values[7]), values[8])
         async with conn.cursor() as cursor:
             await cursor.execute(
                 "INSERT INTO musicbrainz.releases "
-                "(mbid, name, barcode, status, release_group_mbid, discogs_release_id, media, data) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                "(mbid, name, barcode, status, release_group_mbid, discogs_release_id, media, data, gm_item_id) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
                 "ON CONFLICT (mbid) DO UPDATE SET "
                 "name = EXCLUDED.name, barcode = EXCLUDED.barcode, "
                 "status = EXCLUDED.status, "
                 "release_group_mbid = EXCLUDED.release_group_mbid, "
                 "discogs_release_id = EXCLUDED.discogs_release_id, "
                 "media = EXCLUDED.media, "
+                "gm_item_id = EXCLUDED.gm_item_id, "
                 "data = EXCLUDED.data, updated_at = NOW()",
                 params,
             )
 
     async def upsert_release_group(self, conn: Any, values: tuple[Any, ...]) -> None:
-        params = (*values[:3], Jsonb(values[3]), *values[4:7], Jsonb(values[7]))
+        params = (*values[:3], Jsonb(values[3]), *values[4:7], Jsonb(values[7]), values[8])
         async with conn.cursor() as cursor:
             await cursor.execute(
                 "INSERT INTO musicbrainz.release_groups "
-                "(mbid, name, type, secondary_types, first_release_date, disambiguation, discogs_master_id, data) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                "(mbid, name, type, secondary_types, first_release_date, disambiguation, discogs_master_id, data, gm_item_id) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
                 "ON CONFLICT (mbid) DO UPDATE SET "
                 "name = EXCLUDED.name, type = EXCLUDED.type, "
                 "secondary_types = EXCLUDED.secondary_types, "
                 "first_release_date = EXCLUDED.first_release_date, "
                 "disambiguation = EXCLUDED.disambiguation, "
                 "discogs_master_id = EXCLUDED.discogs_master_id, "
+                "gm_item_id = EXCLUDED.gm_item_id, "
                 "data = EXCLUDED.data, updated_at = NOW()",
                 params,
             )
