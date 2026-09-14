@@ -1,10 +1,20 @@
 """Test fixtures for brainztableinator tests."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, create_autospec
+from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 from common import AsyncPostgreSQLPool
 from psycopg import AsyncConnection, AsyncCursor, AsyncTransaction
+
+
+if TYPE_CHECKING:
+    from uuid import UUID
+
+    from common.identity import AliasRef
 
 
 # Every standard OpenTelemetry variable that changes what the SDK records or exports, for
@@ -93,3 +103,32 @@ def mock_async_pool(mock_connection: MagicMock) -> MagicMock:
     pool = create_autospec(AsyncPostgreSQLPool, instance=True, spec_set=True)
     pool.connection.return_value = mock_connection
     return pool
+
+
+def stub_native_id(ref: AliasRef) -> UUID:
+    """Return the native id the identity stub resolves ``ref`` to, deterministically."""
+    return uuid5(NAMESPACE_URL, f"{ref.provider}/{ref.entity_kind}/{ref.external_id}")
+
+
+@pytest.fixture(autouse=True)
+def stubbed_identity_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Resolve native ids without a database, so the default suite stays offline.
+
+    ``resolve_aliases`` and ``attach_aliases`` run real statements on whatever connection they
+    are handed, and every ``process_*`` test hands them a mock cursor that answers nothing. The
+    stubs keep those tests asserting on the writes they are actually about while still giving
+    each record a stable ``gm_item_id``, so a params tuple that lost the column still fails.
+
+    The identity tests in ``tests/test_record_processing.py`` patch the same two names from the
+    test body, which runs after this fixture and therefore wins; they are where the real
+    resolve-then-attach ordering is asserted.
+    """
+
+    async def resolve(_conn: Any, refs: Any, **_kwargs: Any) -> dict[AliasRef, UUID]:
+        return {ref: stub_native_id(ref) for ref in refs}
+
+    async def attach(_conn: Any, mapping: Any, **_kwargs: Any) -> dict[AliasRef, UUID]:
+        return dict(mapping)
+
+    monkeypatch.setattr("brainztableinator._record_processing.resolve_aliases", resolve)
+    monkeypatch.setattr("brainztableinator._record_processing.attach_aliases", attach)

@@ -30,6 +30,11 @@ Each record is written in a single transaction with idempotent `ON CONFLICT` beh
 [`database-schema`](https://github.com/groovemap-music/database-schema) repository owns
 the `musicbrainz` schema definition and initialization image.
 
+Each of the four entity upserts also writes `gm_item_id`, the native catalog identifier. A
+record naming its Discogs counterpart attaches to that item's existing id rather than minting
+a parallel one; everything else mints its own. See
+[Native catalog identity](docs/musicbrainz-sync.md#native-catalog-identity).
+
 Both `file_complete` and `extraction_complete` mark the receiving stream complete and
 schedule its consumer for cancellation after a configurable grace period. The producer
 publishes the version-level `extraction_complete` signal to all four exchanges. A graceful

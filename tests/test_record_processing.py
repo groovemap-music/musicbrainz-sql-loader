@@ -4,8 +4,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
+from uuid import UUID, uuid4
 
 import pytest
+from common.identity import AliasRef
 
 from brainztableinator._record_processing import MusicBrainzRecordProcessor
 
@@ -76,3 +78,105 @@ def test_runtime_module_contains_no_entity_sql() -> None:
     assert "INSERT INTO musicbrainz" not in runtime
     for table in ("artists", "labels", "releases", "release_groups", "relationships", "external_links"):
         assert f"INSERT INTO musicbrainz.{table}" in persistence
+
+
+def _identity(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    resolved: dict[AliasRef, UUID] | None = None,
+    attached: dict[AliasRef, UUID] | None = None,
+) -> tuple[AsyncMock, AsyncMock]:
+    """Replace the two identity calls with recorders that answer from fixed tables.
+
+    A ref absent from ``resolved`` is an alias no provider has claimed, which is what an
+    unresolvable Discogs id looks like from the loader's side.
+    """
+    resolve = AsyncMock(side_effect=lambda _conn, refs: {ref: (resolved or {})[ref] for ref in refs if ref in (resolved or {})})
+    attach = AsyncMock(side_effect=lambda _conn, mapping: {ref: (attached or mapping)[ref] for ref in mapping})
+    monkeypatch.setattr("brainztableinator._record_processing.resolve_aliases", resolve)
+    monkeypatch.setattr("brainztableinator._record_processing.attach_aliases", attach)
+    return resolve, attach
+
+
+@pytest.mark.asyncio
+async def test_a_release_naming_a_discogs_id_attaches_to_that_item_instead_of_minting(monkeypatch: pytest.MonkeyPatch) -> None:
+    discogs_ref = AliasRef("discogs", "release", "4242")
+    musicbrainz_ref = AliasRef("musicbrainz", "release", "release-mbid")
+    native_id = uuid4()
+    resolve, attach = _identity(monkeypatch, resolved={discogs_ref: native_id})
+    writer = _writer()
+    processor = MusicBrainzRecordProcessor(writer, _Observer(), MagicMock())
+    conn = MagicMock()
+
+    await processor.process_release(conn, {"mbid": "release-mbid", "discogs_release_id": 4242, "media": {}})
+
+    # The Discogs alias is read first and the MusicBrainz alias is attached to what it named,
+    # so no second catalog item is minted for a record the Discogs loader already owns.
+    resolve.assert_awaited_once_with(conn, [discogs_ref])
+    attach.assert_awaited_once_with(conn, {musicbrainz_ref: native_id})
+    assert writer.upsert_release.await_args.args[1][8] == native_id
+
+
+@pytest.mark.asyncio
+async def test_an_attach_losing_to_an_existing_alias_writes_the_id_that_alias_already_names(monkeypatch: pytest.MonkeyPatch) -> None:
+    discogs_ref = AliasRef("discogs", "artist", "77")
+    musicbrainz_ref = AliasRef("musicbrainz", "artist", "artist-mbid")
+    discogs_native_id, incumbent_id = uuid4(), uuid4()
+    _identity(monkeypatch, resolved={discogs_ref: discogs_native_id}, attached={musicbrainz_ref: incumbent_id})
+    writer = _writer()
+    processor = MusicBrainzRecordProcessor(writer, _Observer(), MagicMock())
+
+    await processor.process_artist(MagicMock(), {"mbid": "artist-mbid", "discogs_artist_id": 77})
+
+    # attach_aliases never overwrites: the row keeps whatever the existing alias resolves to.
+    assert writer.upsert_artist.await_args.args[1][16] == incumbent_id
+
+
+@pytest.mark.asyncio
+async def test_a_label_without_a_discogs_id_mints_through_its_own_musicbrainz_alias(monkeypatch: pytest.MonkeyPatch) -> None:
+    musicbrainz_ref = AliasRef("musicbrainz", "label", "label-mbid")
+    native_id = uuid4()
+    resolve, attach = _identity(monkeypatch, resolved={musicbrainz_ref: native_id})
+    writer = _writer()
+    processor = MusicBrainzRecordProcessor(writer, _Observer(), MagicMock())
+    conn = MagicMock()
+
+    await processor.process_label(conn, {"mbid": "label-mbid"})
+
+    resolve.assert_awaited_once_with(conn, [musicbrainz_ref])
+    attach.assert_not_awaited()
+    assert writer.upsert_label.await_args.args[1][11] == native_id
+
+
+@pytest.mark.asyncio
+async def test_a_discogs_id_no_alias_claims_falls_back_to_minting_through_musicbrainz(monkeypatch: pytest.MonkeyPatch) -> None:
+    discogs_ref = AliasRef("discogs", "master", "999")
+    musicbrainz_ref = AliasRef("musicbrainz", "master", "release-group-mbid")
+    native_id = uuid4()
+    resolve, attach = _identity(monkeypatch, resolved={musicbrainz_ref: native_id})
+    writer = _writer()
+    processor = MusicBrainzRecordProcessor(writer, _Observer(), MagicMock())
+    conn = MagicMock()
+
+    await processor.process_release_group(conn, {"mbid": "release-group-mbid", "discogs_master_id": 999})
+
+    # A release group resolves as the master kind, and a Discogs id no alias claims yet mints
+    # rather than blocking the row; reconciling the pair later is the reconciliation job's work.
+    assert [call.args for call in resolve.await_args_list] == [(conn, [discogs_ref]), (conn, [musicbrainz_ref])]
+    attach.assert_not_awaited()
+    assert writer.upsert_release_group.await_args.args[1][8] == native_id
+
+
+@pytest.mark.asyncio
+async def test_a_record_without_an_mbid_writes_no_native_id_rather_than_building_an_empty_ref(monkeypatch: pytest.MonkeyPatch) -> None:
+    resolve, attach = _identity(monkeypatch)
+    writer = _writer()
+    processor = MusicBrainzRecordProcessor(writer, _Observer(), MagicMock())
+
+    await processor.process_artist(MagicMock(), {"name": "Nameless"})
+
+    # AliasRef rejects an empty external id, so a record the producer emitted without one must
+    # not reach the identity calls at all.
+    resolve.assert_not_awaited()
+    attach.assert_not_awaited()
+    assert writer.upsert_artist.await_args.args[1][16] is None

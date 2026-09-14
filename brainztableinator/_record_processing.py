@@ -5,9 +5,12 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING, Any, Protocol
 
+from common.identity import AliasRef, attach_aliases, resolve_aliases
+
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from uuid import UUID
 
     from brainztableinator._persistence import MusicBrainzWriter
 
@@ -23,6 +26,11 @@ class BatchObserver(Protocol):
 
 
 _ENTITY_TYPE_ALIASES = {"release_group": "release-group"}
+
+# The identity vocabulary's kind for a MusicBrainz release group is `master`: both name the
+# abstract work a release is an edition of, and ADR 0009 keeps one kind per concept rather than
+# one per provider's spelling of it.
+RELEASE_GROUP_ENTITY_KIND = "master"
 
 
 def _get_or(record: dict[str, Any], key: str, default: Any) -> Any:
@@ -128,9 +136,37 @@ class MusicBrainzRecordProcessor:
             self._observer.record(canonical_entity_type, len(rows), time.perf_counter() - started, "processed")
             self._observer.set_outcome(span, "processed")
 
+    async def _native_id(self, conn: Any, entity_kind: str, mbid: str, discogs_id: Any) -> UUID | None:
+        """Return the native catalog id this record belongs to, attaching to a Discogs item when it names one.
+
+        A MusicBrainz row that carries its Discogs counterpart's identifier must share that
+        item's native id rather than mint a parallel one, so the Discogs alias is resolved first
+        and the MusicBrainz alias is attached to whatever it already resolves to. The existing
+        alias always wins, so the attach returns the id to use even when another writer got
+        there first. A record with no Discogs identifier, or one no Discogs row has claimed yet,
+        mints through its own MusicBrainz alias instead; reconciling those two items once the
+        Discogs side arrives is the reconciliation job's work, not this loader's.
+
+        Both calls run on the message's own connection inside the message's transaction, so a
+        failed write rolls the alias back with the row it was minted for.
+        """
+        if not mbid:
+            return None
+
+        musicbrainz_ref = AliasRef("musicbrainz", entity_kind, mbid)
+        if discogs_id:
+            discogs_ref = AliasRef("discogs", entity_kind, str(discogs_id))
+            native_id = (await resolve_aliases(conn, [discogs_ref])).get(discogs_ref)
+            if native_id is not None:
+                attached = await attach_aliases(conn, {musicbrainz_ref: native_id})
+                return attached.get(musicbrainz_ref, native_id)
+
+        return (await resolve_aliases(conn, [musicbrainz_ref])).get(musicbrainz_ref)
+
     async def process_artist(self, conn: Any, record: dict[str, Any]) -> None:
         mbid = record.get("mbid", record.get("id", ""))
         life_span = _life_span(record)
+        gm_item_id = await self._native_id(conn, "artist", mbid, record.get("discogs_artist_id"))
         await self._writer.upsert_artist(
             conn,
             (
@@ -150,6 +186,7 @@ class MusicBrainzRecordProcessor:
                 _get_or(record, "aliases", []),
                 _get_or(record, "tags", []),
                 record,
+                gm_item_id,
             ),
         )
         await self.insert_relationships(conn, mbid, "artist", record.get("relations", []))
@@ -158,6 +195,7 @@ class MusicBrainzRecordProcessor:
     async def process_label(self, conn: Any, record: dict[str, Any]) -> None:
         mbid = record.get("mbid", record.get("id", ""))
         life_span = _life_span(record)
+        gm_item_id = await self._native_id(conn, "label", mbid, record.get("discogs_label_id"))
         await self._writer.upsert_label(
             conn,
             (
@@ -172,6 +210,7 @@ class MusicBrainzRecordProcessor:
                 record.get("disambiguation", ""),
                 record.get("discogs_label_id"),
                 record,
+                gm_item_id,
             ),
         )
         await self.insert_relationships(conn, mbid, "label", record.get("relations", []))
@@ -193,6 +232,7 @@ class MusicBrainzRecordProcessor:
 
     async def process_release(self, conn: Any, record: dict[str, Any]) -> None:
         mbid = record.get("mbid", record.get("id", ""))
+        gm_item_id = await self._native_id(conn, "release", mbid, record.get("discogs_release_id"))
         await self._writer.upsert_release(
             conn,
             (
@@ -204,6 +244,7 @@ class MusicBrainzRecordProcessor:
                 record.get("discogs_release_id"),
                 self.release_media_block(record),
                 record,
+                gm_item_id,
             ),
         )
         await self.insert_relationships(conn, mbid, "release", record.get("relations", []))
@@ -211,6 +252,7 @@ class MusicBrainzRecordProcessor:
 
     async def process_release_group(self, conn: Any, record: dict[str, Any]) -> None:
         mbid = record.get("mbid", record.get("id", ""))
+        gm_item_id = await self._native_id(conn, RELEASE_GROUP_ENTITY_KIND, mbid, record.get("discogs_master_id"))
         await self._writer.upsert_release_group(
             conn,
             (
@@ -222,6 +264,7 @@ class MusicBrainzRecordProcessor:
                 record.get("disambiguation", ""),
                 record.get("discogs_master_id"),
                 record,
+                gm_item_id,
             ),
         )
         await self.insert_relationships(conn, mbid, "release-group", record.get("relations", []))
