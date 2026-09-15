@@ -1,7 +1,7 @@
 {
   "binding_sha256": "5ec6d7e0317e39396b9b40effb4804e70242768b95499b922b161c6f300c1273",
-  "contract_sha256": "85ebbe7b94669f2abd38ca9c5c83b4019aa71b8aa3aa4b9d9fb7f78ba35095ef",
-  "migration_transform": "Repointed the producer pin from the retired combined catalog-ingestion contract to the musicbrainz-only musicbrainz-ingestion contract; the discogs consumers, sources, and fixtures are gone and MusicBrainz release fixtures now carry the media and media_raw fields.",
-  "producer_commit": "f0dae1037c809c6855863aebc35d0a7d21366482",
+  "contract_sha256": "53073d4b4aac07655abe18688a4eb9c4902481f50dbd02b5b61c083c4b83be2f",
+  "migration_transform": "Promoted the catalog-identifiers producer revision (ADR 0011, wave 1): MusicBrainz release fixtures now carry country, release_events, and catalog_numbers alongside the existing barcode. All three are additive within contract v1 and the generated Python binding is unchanged, so a consumer built against the previous revision keeps working.",
+  "producer_commit": "ada3fead007a4f83eaef55b82265443da3845b31",
   "producer_repository": "https://github.com/groovemap-music/musicbrainz-ingestion"
 }

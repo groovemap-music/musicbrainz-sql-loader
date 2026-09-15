@@ -7,6 +7,7 @@ Conventional Commits.
 
 ### Feat
 
+- **loader**: attach barcode and catalogue-number aliases per release message
 - **loader**: attach or mint native catalog ids per message and write gm_item_id
 
 ## v0.2.0 (2026-09-04)
