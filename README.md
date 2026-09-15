@@ -35,6 +35,11 @@ record naming its Discogs counterpart attaches to that item's existing id rather
 a parallel one; everything else mints its own. See
 [Native catalog identity](docs/musicbrainz-sync.md#native-catalog-identity).
 
+A release additionally attaches its barcode and every catalogue number it carries as aliases of
+that native id, normalized through the shared runtime so the same value learned from Discogs
+resolves to the same item. See
+[Catalogue identifier aliases](docs/musicbrainz-sync.md#catalogue-identifier-aliases).
+
 Both `file_complete` and `extraction_complete` mark the receiving stream complete and
 schedule its consumer for cancellation after a configurable grace period. The producer
 publishes the version-level `extraction_complete` signal to all four exchanges. A graceful

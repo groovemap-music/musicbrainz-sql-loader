@@ -31,6 +31,14 @@
         "name": "Contract Release Group"
       },
       "releases": {
+        "catalog_numbers": [
+          {
+            "catalog_number": "PCS 7088",
+            "label_mbid": "c029628b-6633-439e-bcee-ed02e8a793c8",
+            "label_name": "Parlophone"
+          }
+        ],
+        "country": "GB",
         "media": {
           "container": null,
           "edition": [],
@@ -78,6 +86,13 @@
           }
         ],
         "name": "Contract Release",
+        "release_events": [
+          {
+            "area_mbid": "8a754a16-0027-3a29-b6d7-2b40ea0481ed",
+            "area_name": "United Kingdom",
+            "date": "1969-09-26"
+          }
+        ],
         "status": "Official"
       }
     }
