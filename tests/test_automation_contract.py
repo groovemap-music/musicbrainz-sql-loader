@@ -6,7 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
 AUTOMATION_REVISION = "833cb464507678c38ab78bd4718ce697399463e9"
-PYTHON_LIBRARIES_REVISION = "2d7b1a5b8766ff915a39e66a3e70013d092c1bc1"
+PYTHON_LIBRARIES_REVISION = "24704f5fd48d3ef4fff29398585e9924e225b0c5"
 
 
 def test_reusable_workflows_are_immutably_pinned() -> None:
@@ -50,6 +50,7 @@ def test_dependabot_pull_requests_run_the_ordinary_required_ci_graph() -> None:
         "package-command: just build",
         "install-command: just install-check",
         "image-command: just image",
+        "integration-command: just test-integration",
         "coverage-files: coverage.xml",
         "upload-codecov: true",
         "CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}",
@@ -107,6 +108,11 @@ def test_required_regression_suites_remain_in_the_full_gate() -> None:
             "test_file_complete_message",
             "test_db_outage_waits_before_requeue",
             "test_pool_unavailable_is_transient",
+        ),
+        "tests/integration/test_delivery_postgres.py": (
+            "test_successful_delivery_commits_before_ack",
+            "test_constraint_failure_rolls_back_and_rejects",
+            "test_connection_loss_requeues_after_the_outage_wait",
         ),
     }
     for relative_path, test_names in expected_tests.items():

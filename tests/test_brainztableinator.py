@@ -9,6 +9,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
+from common import DeliveryResult, Settlement
 
 from brainztableinator.brainztableinator import (
     PROCESSORS,
@@ -955,7 +956,7 @@ class TestOnDataMessage:
             mock_message.ack.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_shutdown_requested_nacks_with_requeue(self):
+    async def test_shutdown_requested_leaves_delivery_unsettled(self):
         """When shutdown_requested is True the message is left UNSETTLED.
 
         A still-subscribed consumer would be redelivered a
@@ -1264,12 +1265,18 @@ class TestMakeDataHandler:
     async def test_handler_calls_on_data_message_with_correct_type(self):
         """The handler returned should call on_data_message with the right data_type."""
         mock_message = AsyncMock()
+        expected = DeliveryResult(Settlement.ACK, "processed")
 
-        with patch("brainztableinator.brainztableinator.on_data_message", new_callable=AsyncMock) as mock_on_data:
+        with patch(
+            "brainztableinator.brainztableinator.on_data_message",
+            new_callable=AsyncMock,
+            return_value=expected,
+        ) as mock_on_data:
             handler = make_data_handler("labels")
-            await handler(mock_message)
+            result = await handler(mock_message)
 
             mock_on_data.assert_called_once_with(mock_message, "labels")
+            assert result == expected
 
 
 # ===========================================================================
@@ -2259,8 +2266,8 @@ class TestOnDataMessageExtended:
 
     @pytest.mark.asyncio
     @patch("brainztableinator.brainztableinator.shutdown_requested", False)
-    async def test_handles_nack_failure(self) -> None:
-        """Test handling failure during nack operation."""
+    async def test_nack_failure_is_visible_and_not_retried(self) -> None:
+        """A terminal broker failure propagates without a second settlement attempt."""
         mock_message = AsyncMock()
         mock_message.body = json.dumps({"id": "550e8400-e29b-41d4-a716-446655440000", "name": "Test"}).encode()
         mock_message.nack.side_effect = Exception("Nack failed")
@@ -2278,11 +2285,13 @@ class TestOnDataMessageExtended:
                 "brainztableinator.brainztableinator.last_message_time",
                 {"artists": 0.0, "labels": 0.0, "release-groups": 0.0, "releases": 0.0},
             ),
-            patch("brainztableinator.brainztableinator.logger") as mock_logger,
+            patch("brainztableinator.brainztableinator.logger"),
+            pytest.raises(Exception, match="Nack failed"),
         ):
             await on_data_message(mock_message, "artists")
 
-        assert any("Failed to nack message" in str(call) for call in mock_logger.warning.call_args_list)
+        mock_message.nack.assert_awaited_once_with(requeue=True)
+        mock_message.ack.assert_not_awaited()
 
     @pytest.mark.asyncio
     @patch("brainztableinator.brainztableinator.shutdown_requested", False)
