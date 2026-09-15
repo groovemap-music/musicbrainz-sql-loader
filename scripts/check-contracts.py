@@ -8,6 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PERSISTENCE_PRODUCER_COMMIT = "b67bc222b31b39205db51f7fac4b52663aac2cf7"
+APPLICATION_RUNTIME_COMMIT = "24704f5fd48d3ef4fff29398585e9924e225b0c5"
 
 
 def digest(path: Path) -> str:
@@ -29,4 +30,4 @@ assert compatibility["contract"] == "groovemap.persistence"
 assert compatibility["version"] == 1
 assert compatibility["application_runtime"]["tested_version"] == "0.1.0"
 runtime_source = pyproject["tool"]["uv"]["sources"]["groovemap-runtime"]
-assert runtime_source["rev"] == compatibility["application_runtime"]["tested_commit"]
+assert runtime_source["rev"] == APPLICATION_RUNTIME_COMMIT

@@ -119,9 +119,10 @@ span event carrying a payload.
 `process {queue}` is opened from the `traceparent` header that `musicbrainz-ingestion` left
 on the published message, so a record's whole path — dump file, publish, this loader,
 PostgreSQL — is one trace. A delivery whose headers carry no readable trace context starts a
-new trace rather than failing. The loader acks and nacks its own aio-pika deliveries instead
-of going through `common.process_message_with_retry`, so it opens this span itself from the
-shared helpers, with the identical name, kind, and attributes the wrapper would have used.
+new trace rather than failing. Terminal delivery settlement and cancellation semantics come
+from `common.delivery.run_delivery`; fixes to that shared contract must be applied there for
+all consumers. This loader keeps only its MusicBrainz transaction, classification, and
+telemetry adapters local.
 
 `flush postgresql {entity}` covers one `executemany` of relationship or external-link rows
 and carries a span link to each delivery whose rows it writes; `common.flush_span` caps that
@@ -142,7 +143,12 @@ The project uses Python 3.14 and a pinned `groovemap-runtime` revision from
 mise install
 just setup
 just check
+just test-integration
 ```
+
+`just test-integration` runs the delivery/transaction boundary against a pinned disposable
+PostgreSQL container. Set `TEST_DATABASE_URL` to use an already provisioned disposable test
+database instead.
 
 `just check` is credential-free: PostgreSQL and RabbitMQ boundaries are mocked. The
 operator-facing recipe surface is:
@@ -155,6 +161,7 @@ operator-facing recipe surface is:
 | `just format` | Apply Ruff formatting and safe lint fixes to the worktree. |
 | `just typecheck` | Type-check the Python source and tests. |
 | `just test` / `just coverage` | Run the same unit and regression suite with coverage; CI uses `coverage`. |
+| `just test-integration` | Exercise delivery settlement and transactions against disposable PostgreSQL. |
 | `just secret-scan` | Scan Git history and the working tree with Gitleaks. |
 | `just build` | Build the wheel and source distribution. |
 | `just install-check` | Build, then verify the wheel in an isolated environment. |
