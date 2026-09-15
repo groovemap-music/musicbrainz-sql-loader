@@ -5,6 +5,8 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING, Any, Protocol
 
+import structlog
+from common.identifiers import alias_refs_for_release
 from common.identity import AliasRef, attach_aliases, resolve_aliases
 
 
@@ -25,12 +27,78 @@ class BatchObserver(Protocol):
     def set_outcome(self, span: Any, outcome: str) -> None: ...
 
 
+logger = structlog.get_logger(__name__)
+
+
 _ENTITY_TYPE_ALIASES = {"release_group": "release-group"}
 
 # The identity vocabulary's kind for a MusicBrainz release group is `master`: both name the
 # abstract work a release is an edition of, and ADR 0009 keeps one kind per concept rather than
 # one per provider's spelling of it.
 RELEASE_GROUP_ENTITY_KIND = "master"
+
+# The identifiers block ADR 0011 publishes is the shape `alias_refs_for_release` validates
+# before it normalizes, so the block this module builds spells version 1 exactly. Version 1
+# pins `source.provider` to `discogs` because the Discogs producer is the only one that
+# attaches a block to an event; a MusicBrainz release names the same constant to satisfy the
+# validator. Nothing built here is stored or published: the block exists solely to reach the
+# one shared normalization and is discarded with the refs it minted, so the released contract
+# is unaffected by the field's Discogs spelling.
+_IDENTIFIERS_VERSION = "1"
+_IDENTIFIER_BLOCK_PROVIDER = "discogs"
+
+# The block's `source.field` says which provider field a value was lifted from. A MusicBrainz
+# barcode is the release's own barcode, and a catalogue number is lifted from the release's
+# label entries, which are the two fields these enum members name.
+_BARCODE_SOURCE_FIELD = "identifiers"
+_CATALOG_NUMBER_SOURCE_FIELD = "labels[].catno"
+
+
+def _identifier_item(identifier_type: str, value: str, source_field: str) -> dict[str, Any]:
+    """Return one identifiers-block item, with every field version 1 requires."""
+    return {
+        "type": identifier_type,
+        "value": value,
+        "description": None,
+        "source": {"provider": _IDENTIFIER_BLOCK_PROVIDER, "type": None, "field": source_field},
+    }
+
+
+def _identifiers_block(record: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the minimal identifiers block a release's barcode and catalogue numbers make.
+
+    Only the two alias-bearing fields a MusicBrainz release carries become items: the barcode,
+    and one item per entry of ``catalog_numbers`` that names a catalogue number. An absent,
+    null, or blank value contributes nothing, and a malformed ``catalog_numbers`` entry is
+    skipped rather than rejecting the message, which is the rule ADR 0011 sets for a malformed
+    entry. A release with neither field, and a legacy event predating both, produce ``None``
+    rather than an empty block, so no alias work is attempted for them at all.
+    """
+    items: list[dict[str, Any]] = []
+
+    barcode = record.get("barcode")
+    if isinstance(barcode, str) and barcode.strip():
+        items.append(_identifier_item("barcode", barcode, _BARCODE_SOURCE_FIELD))
+
+    catalog_numbers = record.get("catalog_numbers")
+    if isinstance(catalog_numbers, list):
+        for entry in catalog_numbers:
+            if not isinstance(entry, dict):
+                continue
+            catalog_number = entry.get("catalog_number")
+            if isinstance(catalog_number, str) and catalog_number.strip():
+                items.append(_identifier_item("catalog_number", catalog_number, _CATALOG_NUMBER_SOURCE_FIELD))
+
+    if not items:
+        return None
+
+    return {
+        "identifiers_version": _IDENTIFIERS_VERSION,
+        "items": items,
+        "types": list(dict.fromkeys(item["type"] for item in items)),
+        "aliases": [],
+        "unmapped": {"types": []},
+    }
 
 
 def _get_or(record: dict[str, Any], key: str, default: Any) -> Any:
@@ -230,6 +298,39 @@ class MusicBrainzRecordProcessor:
             }
         )
 
+    async def _attach_identifier_aliases(self, conn: Any, mbid: str, record: dict[str, Any], native_id: UUID | None) -> None:
+        """Attach the release's barcode and catalogue numbers as aliases of its native id.
+
+        A barcode or catalogue number learned from MusicBrainz must resolve to the same native
+        item a Discogs-sourced value does, so the value is normalized once, by the shared
+        ``common.identifiers`` helper, rather than a second time here: a barcode compares as
+        digits alone and a catalogue number without case or internal spacing, whichever catalog
+        published it. A value that normalizes away to nothing mints no alias.
+
+        ``attach_aliases`` never overwrites. A ref another catalog already claims comes back
+        naming that catalog's item instead of this one, which is evidence the two disagree
+        about which release a printed number belongs to rather than a failure of this message:
+        the conflict is counted and logged, the release keeps the id ``_native_id`` resolved,
+        and nothing is raised. A database error still propagates, because this write runs on the
+        message's own connection inside the message's transaction, right after the row it
+        describes, and must roll back with it.
+        """
+        if native_id is None:
+            return
+
+        block = _identifiers_block(record)
+        if block is None:
+            return
+
+        refs = alias_refs_for_release(block)
+        if not refs:
+            return
+
+        attached = await attach_aliases(conn, dict.fromkeys(refs, native_id))
+        conflicts = sum(1 for resolved in attached.values() if resolved != native_id)
+        emit = logger.warning if conflicts else logger.debug
+        emit("🔗 Attached release identifier aliases", mbid=mbid, attached=len(refs), conflicts=conflicts)
+
     async def process_release(self, conn: Any, record: dict[str, Any]) -> None:
         mbid = record.get("mbid", record.get("id", ""))
         gm_item_id = await self._native_id(conn, "release", mbid, record.get("discogs_release_id"))
@@ -247,6 +348,7 @@ class MusicBrainzRecordProcessor:
                 gm_item_id,
             ),
         )
+        await self._attach_identifier_aliases(conn, mbid, record, gm_item_id)
         await self.insert_relationships(conn, mbid, "release", record.get("relations", []))
         await self.insert_external_links(conn, mbid, "release", record.get("external_links", []))
 

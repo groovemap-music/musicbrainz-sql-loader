@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID, uuid4
 
 import pytest
+import structlog
 from common.identity import AliasRef
 
 from brainztableinator._record_processing import MusicBrainzRecordProcessor
@@ -180,3 +181,102 @@ async def test_a_record_without_an_mbid_writes_no_native_id_rather_than_building
     resolve.assert_not_awaited()
     attach.assert_not_awaited()
     assert writer.upsert_artist.await_args.args[1][16] is None
+
+
+BARCODE_REF = AliasRef("barcode", "release", "077774644421")
+FIRST_CATALOG_NUMBER_REF = AliasRef("catalog_number", "release", "PCS 7088")
+SECOND_CATALOG_NUMBER_REF = AliasRef("catalog_number", "release", "1E 062-04243")
+
+
+def _release_with_identifiers() -> dict[str, Any]:
+    """A release carrying the barcode and catalogue numbers the promoted producer now sends.
+
+    The values are written the way a dump prints them -- the barcode with grouping spaces, one
+    catalogue number lower-cased and double-spaced -- so the assertions below measure the
+    shared normalization rather than a pass-through.
+    """
+    return {
+        "mbid": "release-mbid",
+        "media": {},
+        "barcode": "0 77774 64442 1",
+        "catalog_numbers": [
+            {"catalog_number": "pcs  7088", "label_mbid": "label-mbid", "label_name": "Parlophone"},
+            {"catalog_number": "1E 062-04243", "label_mbid": None, "label_name": "Odeon"},
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_release_attaches_its_barcode_and_every_catalogue_number_to_its_native_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    musicbrainz_ref = AliasRef("musicbrainz", "release", "release-mbid")
+    native_id = uuid4()
+    _resolve, attach = _identity(monkeypatch, resolved={musicbrainz_ref: native_id})
+    writer = _writer()
+    processor = MusicBrainzRecordProcessor(writer, _Observer(), MagicMock())
+    conn = MagicMock()
+
+    await processor.process_release(conn, _release_with_identifiers())
+
+    # One attach for the whole release, after the row it describes, on the message's own
+    # connection. The barcode is compared as digits and the catalogue numbers upper-cased with
+    # their whitespace collapsed, which is what makes a Discogs-sourced value resolve here.
+    attach.assert_awaited_once_with(
+        conn,
+        {BARCODE_REF: native_id, FIRST_CATALOG_NUMBER_REF: native_id, SECOND_CATALOG_NUMBER_REF: native_id},
+    )
+    assert writer.upsert_release.await_args.args[1][8] == native_id
+    assert attach.await_args.args[0] is conn
+
+
+@pytest.mark.asyncio
+async def test_a_release_with_neither_a_barcode_nor_a_catalogue_number_attaches_no_identifier_alias(monkeypatch: pytest.MonkeyPatch) -> None:
+    musicbrainz_ref = AliasRef("musicbrainz", "release", "release-mbid")
+    _resolve, attach = _identity(monkeypatch, resolved={musicbrainz_ref: uuid4()})
+    writer = _writer()
+    processor = MusicBrainzRecordProcessor(writer, _Observer(), MagicMock())
+
+    await processor.process_release(MagicMock(), {"mbid": "release-mbid", "media": {}, "barcode": None, "catalog_numbers": []})
+
+    # The fields are present and empty, so there is nothing to normalize and no statement to
+    # run; the release is still written with the native id it resolved.
+    attach.assert_not_awaited()
+    writer.upsert_release.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_an_identifier_alias_another_catalog_claims_is_counted_rather_than_raised(monkeypatch: pytest.MonkeyPatch) -> None:
+    musicbrainz_ref = AliasRef("musicbrainz", "release", "release-mbid")
+    native_id, incumbent_id = uuid4(), uuid4()
+    _resolve, attach = _identity(
+        monkeypatch,
+        resolved={musicbrainz_ref: native_id},
+        attached={BARCODE_REF: incumbent_id, FIRST_CATALOG_NUMBER_REF: native_id, SECOND_CATALOG_NUMBER_REF: native_id},
+    )
+    writer = _writer()
+    processor = MusicBrainzRecordProcessor(writer, _Observer(), MagicMock())
+
+    with structlog.testing.capture_logs() as entries:
+        await processor.process_release(MagicMock(), _release_with_identifiers())
+
+    # attach_aliases never overwrites, so the barcode comes back naming the item another catalog
+    # already claimed. That disagreement is counted and logged, not raised, and the release keeps
+    # the id its own alias resolved.
+    attach.assert_awaited_once()
+    assert writer.upsert_release.await_args.args[1][8] == native_id
+    conflict_logs = [entry for entry in entries if entry["conflicts"]]
+    assert [(entry["log_level"], entry["attached"], entry["conflicts"]) for entry in conflict_logs] == [("warning", 3, 1)]
+
+
+@pytest.mark.asyncio
+async def test_a_legacy_release_event_without_the_identifier_fields_attaches_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    musicbrainz_ref = AliasRef("musicbrainz", "release", "release-mbid")
+    _resolve, attach = _identity(monkeypatch, resolved={musicbrainz_ref: uuid4()})
+    writer = _writer()
+    processor = MusicBrainzRecordProcessor(writer, _Observer(), MagicMock())
+
+    await processor.process_release(MagicMock(), {"mbid": "release-mbid", "media_raw": [], "status": "Official"})
+
+    # An in-flight or dead-lettered event published before the producer carried either field
+    # has no identifiers at all, and must not be rejected for it.
+    attach.assert_not_awaited()
+    writer.upsert_release.assert_awaited_once()

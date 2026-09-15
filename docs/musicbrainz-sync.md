@@ -90,6 +90,40 @@ never arrive would stall the import.
 A row whose alias could not be resolved is still written, with `gm_item_id` left NULL for that
 same job to fill. Identity is additive here: it never dead-letters a record.
 
+## Catalogue identifier aliases
+
+A release also publishes identifiers that are not MusicBrainz's own: the printed `barcode`,
+and the catalogue numbers inside `catalog_numbers`, each an entry of the release's label
+information. Both are alias namespaces the
+[ADR 0009](https://github.com/groovemap-music/design/blob/main/docs/adr/0009-native-catalog-identity.md)
+provider vocabulary reserves, and
+[ADR 0011](https://github.com/groovemap-music/design/blob/main/docs/adr/0011-catalog-identifiers-and-manufacturing-credits.md)
+decides what fills them. `process_release` attaches both to the release's native id, right
+after the row itself is written and on the same connection inside the same transaction.
+
+The point is cross-catalog lookup: a barcode learned here and the same barcode learned from
+Discogs must name one item, not two. That only holds if both sides compare the value the same
+way, so the loader does not normalize anything itself. It builds the identifiers block ADR 0011
+publishes and hands it to `common.identifiers.alias_refs_for_release` in the shared runtime,
+which is the single implementation of the comparison: a barcode compares as its ASCII digits,
+so printed grouping spaces and hyphens do not change identity, and a catalogue number compares
+trimmed, whitespace-collapsed, and upper-cased, which is how one label prints the same number
+two ways. Two values that normalize alike are one alias. A value that normalizes away to
+nothing mints none.
+
+- **Absent fields attach nothing.** A release with no barcode and no catalogue numbers, and a
+  legacy event published before the producer carried either field, run no alias statement at
+  all. Neither is an error.
+- **A conflict is counted, not raised.** `attach_aliases` never overwrites, so a barcode
+  another catalog has already claimed comes back naming *that* item. The two catalogs disagree
+  about which release a printed number belongs to; the loader counts the conflict in its log
+  line, keeps the id the release's own alias resolved, and lets the message succeed. Resolving
+  the disagreement is the same reconciliation job's work as the duplicate pairs above.
+
+The release's `country` and `release_events` fields need no such handling. They are carried
+verbatim inside the `data` column the upsert already writes, and the schema adds no column for
+either.
+
 ## Canonical media block
 
 `musicbrainz.releases.media` holds the canonical media block from
