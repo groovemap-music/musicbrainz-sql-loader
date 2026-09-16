@@ -3,12 +3,24 @@
 All notable changes to this repository will be recorded here by Commitizen from
 Conventional Commits.
 
-## Unreleased
+## v0.3.0 (2026-09-15)
 
 ### Feat
 
 - **loader**: attach barcode and catalogue-number aliases per release message
 - **loader**: attach or mint native catalog ids per message and write gm_item_id
+- **telemetry**: trace deliveries and batch flushes, and sample event-loop lag
+
+### Fix
+
+- **contracts**: enforce persistence provenance
+- **ci**: accept commitizen's no-eligible-commits bump-preview state
+- **deps**: bump python to 3.14.7-slim and dockerfile frontend to 1.27 (#1)
+
+### Refactor
+
+- **delivery**: centralize MusicBrainz SQL settlement
+- **sql**: extract MusicBrainz persistence seams
 
 ## v0.2.0 (2026-09-04)
 
