@@ -110,8 +110,12 @@ class PostgreSQLMusicBrainzWriter:
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
                 # This conflict target is the relationships_natural_key contract in
                 # database-schema; dates and attributes distinguish separate relationships.
+                # `updated_at` is refreshed on every conflict, including the ones that change
+                # nothing else: it is the only evidence that this run still saw the row, and
+                # `_reconciliation.StaleChildRowPurge` deletes rows that lack it. Leaving it
+                # off a no-op conflict would make a live relationship look stale and be purged.
                 "ON CONFLICT (source_mbid, target_mbid, source_entity_type, target_entity_type, relationship_type, begin_date, end_date, attributes) "
-                "DO UPDATE SET ended = EXCLUDED.ended",
+                "DO UPDATE SET ended = EXCLUDED.ended, updated_at = NOW()",
                 params,
             )
 
@@ -121,6 +125,9 @@ class PostgreSQLMusicBrainzWriter:
                 "INSERT INTO musicbrainz.external_links "
                 "(mbid, entity_type, url, service_name) "
                 "VALUES (%s, %s, %s, %s) "
-                "ON CONFLICT (mbid, entity_type, service_name, url) DO UPDATE SET url = EXCLUDED.url",
+                # The conflict target already covers every column, so the assignment to `url`
+                # is a no-op; the clause exists to refresh `updated_at`, which is what marks
+                # the link as still present this run for the delete-reconciliation purge.
+                "ON CONFLICT (mbid, entity_type, service_name, url) DO UPDATE SET url = EXCLUDED.url, updated_at = NOW()",
                 rows,
             )
