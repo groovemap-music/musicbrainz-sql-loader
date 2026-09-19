@@ -20,6 +20,12 @@ class MusicBrainzWriter(Protocol):
 
     async def insert_external_links(self, conn: Any, rows: list[tuple[Any, ...]]) -> None: ...
 
+    async def upsert_media_families(self, conn: Any, names: list[str]) -> None: ...
+
+    async def upsert_media(self, conn: Any, rows: list[tuple[str, str, str]]) -> None: ...
+
+    async def replace_release_media_edges(self, conn: Any, release_id: str, source: str, rows: list[tuple[str, str, str, int]]) -> None: ...
+
 
 class PostgreSQLMusicBrainzWriter:
     """Execute the MusicBrainz schema's entity-specific write statements."""
@@ -124,3 +130,68 @@ class PostgreSQLMusicBrainzWriter:
                 "ON CONFLICT (mbid, entity_type, service_name, url) DO UPDATE SET url = EXCLUDED.url",
                 rows,
             )
+
+    # ── The shared graph relations ───────────────────────────────────────────
+    # Everything below writes into the `graph` schema rather than `musicbrainz`,
+    # and every statement in it is shared with `discogs-sql-loader`. The three
+    # relations are recorded in `contracts/persistence/v1/compatibility.json`
+    # with both loaders as their owner, which is what makes the conflict clauses
+    # here part of the contract rather than defensive habit.
+
+    async def upsert_media_families(self, conn: Any, names: list[str]) -> None:
+        """Add any media families this release names to the shared vocabulary.
+
+        `graph.media_family` is keyed on `name` and both SQL loaders write it, so the row
+        already there wins. That mirrors brainzgraphinator's `MERGE (f:MediaFamily {name:
+        item.family})`, which never sets a property on an existing node.
+        """
+        if not names:
+            return
+        async with conn.cursor() as cursor:
+            await cursor.executemany(
+                "INSERT INTO graph.media_family (name) VALUES (%s) ON CONFLICT DO NOTHING",
+                [(name,) for name in names],
+            )
+
+    async def upsert_media(self, conn: Any, rows: list[tuple[str, str, str]]) -> None:
+        """Add any media this release names to the shared vocabulary.
+
+        `ON CONFLICT DO NOTHING` rather than `DO UPDATE` is the point: brainzgraphinator writes
+        a medium's family and label under `MERGE (m:Medium {id: item.medium}) ON CREATE SET
+        m.family = item.family, m.label = item.label`, so the pass that creates the medium is
+        the only one that sets them and a later pass leaves the existing row alone. Writing the
+        columns on conflict would let this loader overwrite what `discogs-sql-loader` wrote.
+        """
+        if not rows:
+            return
+        async with conn.cursor() as cursor:
+            await cursor.executemany(
+                "INSERT INTO graph.medium (medium_id, family, label) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+                rows,
+            )
+
+    async def replace_release_media_edges(self, conn: Any, release_id: str, source: str, rows: list[tuple[str, str, str, int]]) -> None:
+        """Replace one release's media edges for one source, leaving every other source alone.
+
+        `source` is part of `graph.issued_on`'s primary key `(release_id, medium_id, source)`
+        precisely so this prune reaches only the rows this loader wrote: the `WHERE` clause
+        names both the release and the source, so a row `discogs-sql-loader` wrote under
+        `source = 'discogs'` is never in range of the `DELETE`. It is the relational spelling of
+        the `MATCH (r)-[stale:ISSUED_ON]->(m:Medium) WHERE stale.source = $source ... DELETE
+        stale` prune brainzgraphinator runs before it writes the edges.
+
+        The insert is a plain `INSERT`, with no conflict clause, because the prune has just
+        emptied the range it writes into and `media_edge_rows` yields one row per medium. A
+        duplicate here would be a derivation bug, and it should fail rather than quietly
+        discard the quantity the second row carried.
+        """
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "DELETE FROM graph.issued_on WHERE release_id = %s AND source = %s",
+                (release_id, source),
+            )
+            if rows:
+                await cursor.executemany(
+                    "INSERT INTO graph.issued_on (release_id, medium_id, source, qty) VALUES (%s, %s, %s, %s)",
+                    rows,
+                )
