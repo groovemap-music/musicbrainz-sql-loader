@@ -137,6 +137,15 @@ def test_a_medium_the_vendored_vocabulary_does_not_hold_falls_back_to_its_own_id
     assert media_edge_rows(_block(_item("holographic_cube", "future")))[0]["label"] == "holographic_cube"
 
 
+def test_a_release_whose_only_format_the_vocabulary_does_not_know_yields_no_row() -> None:
+    # The mapper records the name under `unmapped.formats` and produces no item, so the
+    # release is issued on nothing rather than on a medium the taxonomy cannot name.
+    media = map_musicbrainz_release({"media": [{"format": "Wax Cylinder Deluxe"}]})
+
+    assert media["unmapped"]["formats"] == ["Wax Cylinder Deluxe"]
+    assert media_edge_rows(media) == []
+
+
 def test_a_media_block_holding_nothing_yields_no_rows() -> None:
     assert media_edge_rows({}) == []
     assert media_edge_rows({"items": None}) == []
