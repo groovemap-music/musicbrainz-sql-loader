@@ -15,7 +15,7 @@ import brainztableinator.brainztableinator as service
 
 
 ROOT = Path(__file__).parent.parent
-RUNTIME_REVISION = "e372b6a7598ae31ee6578fdff39bc920bedd7136"
+RUNTIME_REVISION = "6e84fe9acfd9551bd3bba2f2e78fef0ec1ef38ef"
 VALID_BODY = b'{"id":"550e8400-e29b-41d4-a716-446655440000","name":"Artist"}'
 
 
