@@ -40,6 +40,9 @@ def _writer() -> MagicMock:
         "upsert_release_group",
         "insert_relationships",
         "insert_external_links",
+        "upsert_media_families",
+        "upsert_media",
+        "replace_release_media_edges",
     ):
         setattr(writer, operation, AsyncMock())
     return writer
@@ -263,7 +266,9 @@ async def test_an_identifier_alias_another_catalog_claims_is_counted_rather_than
     # the id its own alias resolved.
     attach.assert_awaited_once()
     assert writer.upsert_release.await_args.args[1][8] == native_id
-    conflict_logs = [entry for entry in entries if entry["conflicts"]]
+    # `process_release` also logs the media write, so the alias log is selected by its own key
+    # rather than by position.
+    conflict_logs = [entry for entry in entries if entry.get("conflicts")]
     assert [(entry["log_level"], entry["attached"], entry["conflicts"]) for entry in conflict_logs] == [("warning", 3, 1)]
 
 
