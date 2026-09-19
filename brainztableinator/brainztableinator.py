@@ -41,7 +41,7 @@ from orjson import loads
 from psycopg.errors import DataError, IntegrityError, InterfaceError, OperationalError
 
 from brainztableinator._persistence import PostgreSQLMusicBrainzWriter
-from brainztableinator._reconciliation import StaleChildRowPurge, ensure_reconciliation_columns
+from brainztableinator._reconciliation import StaleChildRowPurge, reconciliation_columns_present
 from brainztableinator._record_processing import MusicBrainzRecordProcessor
 from brainztableinator.config import MusicBrainzSQLLoaderConfig
 from brainztableinator.queue_names import (
@@ -317,8 +317,12 @@ class _RuntimeBatchObserver:
         _set_span_outcome(span, outcome)
 
 
+# Held by name so the startup probe can turn the delete-reconciliation column's
+# refresh on; the writer emits no reference to a column the schema has not declared.
+_persistence_writer = PostgreSQLMusicBrainzWriter()
+
 _record_processor = MusicBrainzRecordProcessor(
-    PostgreSQLMusicBrainzWriter(),
+    _persistence_writer,
     _RuntimeBatchObserver(),
     map_musicbrainz_release,
 )
@@ -856,29 +860,33 @@ def make_data_handler(
     return handler
 
 
-async def _reconcile_deleted_child_rows() -> bool:
+async def _reconcile_deleted_child_rows(data_type: str, data: dict[str, Any]) -> bool:
     """Reconcile the child-row tables once every entity type has signalled completion.
 
     ``musicbrainz.relationships`` and ``musicbrainz.external_links`` are written by all
     four entity kinds, so the purge cannot fire on the first ``extraction_complete`` —
-    it would delete every row the other three kinds have not sent yet. Returns ``False``
-    only when the reconciliation was attempted and failed, which is the one case the
-    signal must be requeued for.
+    it would delete every row the other three kinds have not sent yet. The boundary and
+    the per-type record counts both come from the message, never from this process, so a
+    restart cannot move them; see the ``_reconciliation`` module docstring. Returns
+    ``False`` only when the reconciliation was attempted and failed, which is the one
+    case the signal must be requeued for.
     """
     purge = stale_row_purge
     if purge is None:
         return True
 
-    if not purge.latched_for(completed_files, MUSICBRAINZ_DATA_TYPES):
+    purge.record_completion(data_type, data)
+    if not purge.is_latched():
         logger.info(
             "⏳ Deferring MusicBrainz delete-reconciliation until every entity type completes",
-            completed=sorted(completed_files),
-            pending=sorted(set(MUSICBRAINZ_DATA_TYPES) - completed_files),
+            signalled=sorted(purge.signalled),
+            pending=purge.pending_data_types(),
+            boundary=purge.boundary.isoformat() if purge.boundary else None,
         )
         return True
 
     try:
-        await purge.purge(sum(message_counts.values()))
+        await purge.purge()
     except Exception as error:
         logger.error(
             "❌ Delete-reconciliation failed, requeueing extraction_complete",
@@ -911,7 +919,7 @@ async def _handle_data_message(message: AbstractIncomingMessage, data_type: str)
             version=data.get("version"),
         )
         completed_files.add(data_type)
-        if not await _reconcile_deleted_child_rows():
+        if not await _reconcile_deleted_child_rows(data_type, data):
             # The reconciliation is this run's only chance to remove rows dropped
             # upstream, so a failure requeues the signal rather than acking past it.
             # Completion is withdrawn with it: the signal is still pending, and idle
@@ -1161,17 +1169,16 @@ async def main() -> None:
         logger.error("❌ Failed to initialize connection pool", error=str(e))
         return
 
-    # Delete-reconciliation is maintenance, not ingestion: a failure here must not stop the
-    # loader from loading. It fails closed instead — `stale_row_purge` stays None, every call
-    # site no-ops, and nothing destructive can run without a run start read from the database.
-    # Order matters within the block: the column has to exist before the run start is read, so
-    # that every row already in the table carries a timestamp predating this run.
+    # Delete-reconciliation is maintenance, not ingestion, and this loader issues no DDL:
+    # it probes for the column groovemap-database-schema owns and stays off until it is
+    # there. Both the probe answering False and the probe itself failing leave
+    # `stale_row_purge` None, so every call site no-ops, the upserts emit no reference to
+    # a column the schema has not declared, and the loader keeps loading either way.
     stale_row_purge = None
     try:
-        await ensure_reconciliation_columns(connection_pool, logger)
-        purge = StaleChildRowPurge(connection_pool, logger)
-        await purge.latch_run_start()
-        stale_row_purge = purge
+        if await reconciliation_columns_present(connection_pool, logger):
+            _persistence_writer.set_refresh_updated_at(True)
+            stale_row_purge = StaleChildRowPurge(connection_pool, logger)
     except Exception as e:
         logger.error("❌ Delete-reconciliation unavailable this run", error=str(e))
 
