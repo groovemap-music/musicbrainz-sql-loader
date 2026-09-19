@@ -1,16 +1,17 @@
 """Unit tests for the MusicBrainz child-row delete-reconciliation.
 
-The two behaviours that make the purge safe are the ones tested hardest here: the
+Four behaviours make the purge safe, and each is tested hardest here: the
 delete-fraction cap, which refuses a shrink too large to be a real upstream
-deletion, and the dead-letter veto, which refuses to run at all when a record that
-is still present upstream was rejected without being upserted. Both are copied
-from ``discogs-sql-loader``'s ``purge_stale_rows``; a regression in either deletes
-live rows.
+deletion; the dead-letter veto, which refuses to run at all when a record that is
+still present upstream was rejected without being upserted; the startup probe,
+which keeps the whole feature off until the schema owner has declared the column;
+and the boundary, which comes from the ``extraction_complete`` body so a loader
+restart cannot move it forward onto rows the run itself wrote.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -18,11 +19,14 @@ import pytest
 from common import DeliveryResult, Settlement
 
 import brainztableinator.brainztableinator as service
+from brainztableinator._persistence import PostgreSQLMusicBrainzWriter
 from brainztableinator._reconciliation import (
     DEFAULT_MAX_DELETE_FRACTION,
     RECONCILED_TABLES,
+    RECONCILIATION_COLUMN,
     StaleChildRowPurge,
-    ensure_reconciliation_columns,
+    parse_started_at,
+    reconciliation_columns_present,
 )
 
 
@@ -30,10 +34,24 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 
-RUN_STARTED_AT = datetime(2026, 9, 18, 12, 0, tzinfo=UTC)
+BOUNDARY = datetime(2026, 9, 18, 12, 0, tzinfo=UTC)
+LATER_BOUNDARY = BOUNDARY + timedelta(days=7)
+
+DATA_TYPES = ("artists", "labels", "release-groups", "releases")
 
 RELATIONSHIPS = "musicbrainz.relationships"
 EXTERNAL_LINKS = "musicbrainz.external_links"
+
+
+def _signal(started_at: datetime = BOUNDARY, counts: int = 1000) -> dict[str, Any]:
+    """Build an ``extraction_complete`` body with every field the v1 schema requires."""
+    return {
+        "type": "extraction_complete",
+        "version": "2026-09-18",
+        "timestamp": started_at.isoformat(),
+        "started_at": started_at.isoformat(),
+        "record_counts": dict.fromkeys(DATA_TYPES, counts),
+    }
 
 
 def _statements(mock_cursor: MagicMock) -> list[str]:
@@ -72,10 +90,12 @@ def _script_counts(mock_cursor: MagicMock, counts: Sequence[tuple[int, int]], ro
     mock_cursor.execute.side_effect = on_execute
 
 
-def _purge(mock_async_pool: MagicMock, **kwargs: Any) -> StaleChildRowPurge:
+def _latched(mock_async_pool: MagicMock, started_at: datetime = BOUNDARY, **kwargs: Any) -> StaleChildRowPurge:
+    """Return a purge with all four signals collected for one boundary."""
     purge = StaleChildRowPurge(mock_async_pool, MagicMock(), **kwargs)
-    # The live latch reads NOW() from a server; every other test here sets the boundary directly.
-    purge._run_started_at = RUN_STARTED_AT
+    for data_type in DATA_TYPES:
+        purge.record_completion(data_type, _signal(started_at))
+    assert purge.is_latched()
     return purge
 
 
@@ -90,9 +110,9 @@ class TestDeleteFractionCap:
     ) -> None:
         """900 stale of 1000 is exactly the 90% cap, and the cap is inclusive."""
         _script_counts(mock_cursor, [(1000, 900), (10, 1)], rowcounts=[1])
-        purge = _purge(mock_async_pool)
+        purge = _latched(mock_async_pool)
 
-        deleted = await purge.purge(processed_records=5000)
+        deleted = await purge.purge()
 
         assert deleted[RELATIONSHIPS] == 0
         assert all("relationships" not in statement for statement in _deletes(mock_cursor))
@@ -105,9 +125,9 @@ class TestDeleteFractionCap:
     ) -> None:
         """899 stale of 1000 is under the cap, so the DELETE runs and is reported."""
         _script_counts(mock_cursor, [(1000, 899), (0, 0)], rowcounts=[899])
-        purge = _purge(mock_async_pool)
+        purge = _latched(mock_async_pool)
 
-        deleted = await purge.purge(processed_records=5000)
+        deleted = await purge.purge()
 
         assert deleted[RELATIONSHIPS] == 899
         assert _deletes(mock_cursor) == ['DELETE FROM "musicbrainz"."relationships" WHERE updated_at < %s']
@@ -120,9 +140,9 @@ class TestDeleteFractionCap:
     ) -> None:
         """A relationships shrink past the cap must not stop external_links reconciling."""
         _script_counts(mock_cursor, [(100, 95), (100, 4)], rowcounts=[4])
-        purge = _purge(mock_async_pool)
+        purge = _latched(mock_async_pool)
 
-        deleted = await purge.purge(processed_records=5000)
+        deleted = await purge.purge()
 
         assert deleted == {RELATIONSHIPS: 0, EXTERNAL_LINKS: 4}
 
@@ -134,9 +154,9 @@ class TestDeleteFractionCap:
     ) -> None:
         """A tighter cap refuses a fraction the default would have allowed."""
         _script_counts(mock_cursor, [(100, 50), (0, 0)], rowcounts=[])
-        purge = _purge(mock_async_pool, max_delete_fraction=0.5)
+        purge = _latched(mock_async_pool, max_delete_fraction=0.5)
 
-        deleted = await purge.purge(processed_records=5000)
+        deleted = await purge.purge()
 
         assert deleted[RELATIONSHIPS] == 0
         assert DEFAULT_MAX_DELETE_FRACTION == 0.9
@@ -149,9 +169,9 @@ class TestDeleteFractionCap:
     ) -> None:
         """count(*) == 0 short-circuits before the division the cap needs."""
         _script_counts(mock_cursor, [(0, 0), (0, 0)], rowcounts=[])
-        purge = _purge(mock_async_pool)
+        purge = _latched(mock_async_pool)
 
-        deleted = await purge.purge(processed_records=5000)
+        deleted = await purge.purge()
 
         assert deleted == {RELATIONSHIPS: 0, EXTERNAL_LINKS: 0}
         assert _deletes(mock_cursor) == []
@@ -168,10 +188,10 @@ class TestDeadLetterVeto:
     ) -> None:
         """Not one statement is issued, on either table."""
         _script_counts(mock_cursor, [(1000, 1), (1000, 1)], rowcounts=[1, 1])
-        purge = _purge(mock_async_pool)
+        purge = _latched(mock_async_pool)
         purge.record_dead_letter("artists")
 
-        deleted = await purge.purge(processed_records=5000)
+        deleted = await purge.purge()
 
         assert deleted == {}
         mock_cursor.execute.assert_not_awaited()
@@ -185,89 +205,197 @@ class TestDeadLetterVeto:
     ) -> None:
         """A rejected label vetoes relationships sourced from artists too."""
         _script_counts(mock_cursor, [(1000, 1), (1000, 1)], rowcounts=[1, 1])
-        purge = _purge(mock_async_pool)
+        purge = _latched(mock_async_pool)
         purge.record_dead_letter("labels")
 
-        assert await purge.purge(processed_records=5000) == {}
-        assert purge.dead_lettered == frozenset({"labels"})
+        assert await purge.purge() == {}
+        mock_cursor.execute.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_a_run_that_processed_nothing_is_vetoed(
+    async def test_the_marks_are_cleared_once_the_extraction_they_belong_to_concludes(
         self,
         mock_async_pool: MagicMock,
         mock_cursor: MagicMock,
     ) -> None:
-        """Zero processed records reads as a resumed extraction, not an empty dump."""
+        """Mirrors reset_dlq_nacks: run N's poison must not veto run N+1 forever."""
+        _script_counts(mock_cursor, [(100, 10), (100, 10)], rowcounts=[10, 10])
+        purge = _latched(mock_async_pool)
+        purge.record_dead_letter("artists")
+
+        assert await purge.purge() == {}
+        assert purge.dead_lettered == frozenset()
+
+        for data_type in DATA_TYPES:
+            purge.record_completion(data_type, _signal(LATER_BOUNDARY))
+        assert await purge.purge() == {RELATIONSHIPS: 10, EXTERNAL_LINKS: 10}
+
+    @pytest.mark.asyncio
+    async def test_a_type_the_extractor_reported_no_records_for_is_vetoed(
+        self,
+        mock_async_pool: MagicMock,
+        mock_cursor: MagicMock,
+    ) -> None:
+        """Zero records for a type reads as a resumed extraction, not an empty dump."""
         _script_counts(mock_cursor, [(1000, 900), (1000, 900)], rowcounts=[])
-        purge = _purge(mock_async_pool)
+        purge = StaleChildRowPurge(mock_async_pool, MagicMock())
+        for data_type in DATA_TYPES:
+            message = _signal()
+            if data_type == "labels":
+                message["record_counts"]["labels"] = 0
+            purge.record_completion(data_type, message)
 
-        assert await purge.purge(processed_records=0) == {}
+        assert await purge.purge() == {}
         mock_cursor.execute.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_an_unlatched_run_start_is_vetoed(
+    async def test_a_missing_record_count_is_vetoed(
         self,
         mock_async_pool: MagicMock,
         mock_cursor: MagicMock,
     ) -> None:
-        """Without a run start there is no boundary, so nothing may be deleted."""
         purge = StaleChildRowPurge(mock_async_pool, MagicMock())
+        for data_type in DATA_TYPES:
+            message = _signal()
+            message["record_counts"] = {}
+            purge.record_completion(data_type, message)
 
-        assert purge.run_started_at is None
-        assert await purge.purge(processed_records=5000) == {}
+        assert await purge.purge() == {}
         mock_cursor.execute.assert_not_awaited()
 
-    def test_reset_clears_the_run_start_and_the_dead_letter_marks(self, mock_async_pool: MagicMock) -> None:
-        purge = _purge(mock_async_pool)
+    @pytest.mark.asyncio
+    async def test_an_unlatched_purge_deletes_nothing(
+        self,
+        mock_async_pool: MagicMock,
+        mock_cursor: MagicMock,
+    ) -> None:
+        """Without all four signals there is no boundary anyone agreed on."""
+        purge = StaleChildRowPurge(mock_async_pool, MagicMock())
+        purge.record_completion("artists", _signal())
+
+        assert not purge.is_latched()
+        assert await purge.purge() == {}
+        mock_cursor.execute.assert_not_awaited()
+
+    def test_reset_clears_the_boundary_the_signals_and_the_marks(self, mock_async_pool: MagicMock) -> None:
+        purge = _latched(mock_async_pool)
         purge.record_dead_letter("releases")
 
         purge.reset()
 
-        assert purge.run_started_at is None
+        assert purge.boundary is None
+        assert purge.signalled == frozenset()
         assert purge.dead_lettered == frozenset()
 
 
-class TestRunStartAndLatching:
-    """Run start comes from the database clock, and the purge waits for every type."""
+class TestBoundaryComesFromTheMessage:
+    """The boundary is the extraction's own start, so a restart cannot move it."""
+
+    def test_the_boundary_is_the_messages_started_at(self, mock_async_pool: MagicMock) -> None:
+        purge = _latched(mock_async_pool)
+
+        assert purge.boundary == BOUNDARY
+
+    def test_a_naive_started_at_is_read_as_utc(self) -> None:
+        assert parse_started_at("2026-09-18T12:00:00") == BOUNDARY
+        assert parse_started_at("2026-09-18T12:00:00+00:00") == BOUNDARY
+
+    @pytest.mark.parametrize("value", ["", "not-a-timestamp", None, 17, {}])
+    def test_an_unusable_started_at_is_rejected_rather_than_guessed_at(self, value: Any) -> None:
+        assert parse_started_at(value) is None
 
     @pytest.mark.asyncio
-    async def test_latch_run_start_reads_the_database_clock(
+    async def test_an_unusable_started_at_drops_the_latch(
         self,
         mock_async_pool: MagicMock,
         mock_cursor: MagicMock,
     ) -> None:
-        """NOW() on the server is what the upserts stamp rows with, so no host clock is used."""
-        mock_cursor.fetchone.return_value = (RUN_STARTED_AT,)
-        purge = StaleChildRowPurge(mock_async_pool, MagicMock())
+        """The value becomes a DELETE boundary, so a bad one must stop the purge."""
+        purge = _latched(mock_async_pool)
+        purge.record_completion("artists", {"type": "extraction_complete"})
 
-        started_at = await purge.latch_run_start()
-
-        assert started_at == RUN_STARTED_AT
-        assert purge.run_started_at == RUN_STARTED_AT
-        mock_cursor.execute.assert_awaited_once_with("SELECT NOW()")
-
-    def test_latched_for_waits_for_every_entity_type(self, mock_async_pool: MagicMock) -> None:
-        """Both tables are fed by all four kinds, so a subset must not trigger the purge."""
-        purge = _purge(mock_async_pool)
-        expected = ["artists", "labels", "release-groups", "releases"]
-
-        assert not purge.latched_for({"artists"}, expected)
-        assert not purge.latched_for({"artists", "labels", "releases"}, expected)
-        assert purge.latched_for(set(expected), expected)
+        assert purge.boundary is None
+        assert not purge.is_latched()
+        assert await purge.purge() == {}
+        mock_cursor.execute.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_purge_keys_every_statement_on_the_latched_run_start(
+    async def test_a_restart_mid_run_does_not_purge_the_rows_that_run_wrote(
         self,
         mock_async_pool: MagicMock,
         mock_cursor: MagicMock,
     ) -> None:
+        """The regression the earlier SELECT NOW() boundary caused.
+
+        A fresh process, standing in for the loader after a restart, must still key the
+        DELETE on the extraction's own start. Had the boundary come from process start,
+        it would sit after everything the run wrote before the restart and delete it.
+        """
         _script_counts(mock_cursor, [(100, 10), (100, 10)], rowcounts=[10, 10])
-        purge = _purge(mock_async_pool)
+        restarted = StaleChildRowPurge(mock_async_pool, MagicMock())
+        for data_type in DATA_TYPES:
+            restarted.record_completion(data_type, _signal())
 
-        await purge.purge(processed_records=5000)
+        await restarted.purge()
 
         parameterized = [call.args[1] for call in mock_cursor.execute.await_args_list if len(call.args) > 1]
-        assert parameterized == [(RUN_STARTED_AT,)] * 4
+        assert parameterized == [(BOUNDARY,)] * 4
+
+    @pytest.mark.asyncio
+    async def test_a_later_extraction_re_latches_instead_of_re_firing_the_first(
+        self,
+        mock_async_pool: MagicMock,
+        mock_cursor: MagicMock,
+    ) -> None:
+        """A long-lived loader sees more than one extraction; the second must collect afresh."""
+        _script_counts(mock_cursor, [(100, 10), (100, 10)], rowcounts=[10, 10])
+        purge = _latched(mock_async_pool)
+        await purge.purge()
+        mock_cursor.reset_mock()
+        _script_counts(mock_cursor, [(100, 5), (100, 5)], rowcounts=[5, 5])
+
+        # The next extraction's first signal must not re-fire the previous purge.
+        purge.record_completion("artists", _signal(LATER_BOUNDARY))
+        assert purge.boundary == LATER_BOUNDARY
+        assert purge.signalled == frozenset({"artists"})
+        assert not purge.is_latched()
+        assert await purge.purge() == {}
+        mock_cursor.execute.assert_not_awaited()
+
+        for data_type in DATA_TYPES[1:]:
+            purge.record_completion(data_type, _signal(LATER_BOUNDARY))
+
+        assert await purge.purge() == {RELATIONSHIPS: 5, EXTERNAL_LINKS: 5}
+        parameterized = [call.args[1] for call in mock_cursor.execute.await_args_list if len(call.args) > 1]
+        assert parameterized == [(LATER_BOUNDARY,)] * 4
+
+    def test_a_redelivered_signal_from_a_finished_extraction_is_ignored(
+        self,
+        mock_async_pool: MagicMock,
+    ) -> None:
+        """A straggler must not drag the boundary backwards onto the current run's rows."""
+        purge = StaleChildRowPurge(mock_async_pool, MagicMock())
+        for data_type in DATA_TYPES:
+            purge.record_completion(data_type, _signal(LATER_BOUNDARY))
+
+        purge.record_completion("artists", _signal(BOUNDARY))
+
+        assert purge.boundary == LATER_BOUNDARY
+        assert purge.is_latched()
+
+    @pytest.mark.asyncio
+    async def test_the_same_extraction_is_not_reconciled_twice(
+        self,
+        mock_async_pool: MagicMock,
+        mock_cursor: MagicMock,
+    ) -> None:
+        """Redelivering all four signals for a reconciled boundary issues no statement."""
+        _script_counts(mock_cursor, [(100, 10), (100, 10)], rowcounts=[10, 10])
+        purge = _latched(mock_async_pool)
+        assert await purge.purge() == {RELATIONSHIPS: 10, EXTERNAL_LINKS: 10}
+        mock_cursor.reset_mock()
+
+        assert await purge.purge() == {}
+        mock_cursor.execute.assert_not_awaited()
 
 
 class TestTransactionAndIdempotence:
@@ -281,24 +409,24 @@ class TestTransactionAndIdempotence:
         mock_cursor: MagicMock,
     ) -> None:
         _script_counts(mock_cursor, [(100, 10), (100, 10)], rowcounts=[10, 10])
-        purge = _purge(mock_async_pool)
+        purge = _latched(mock_async_pool)
 
-        await purge.purge(processed_records=5000)
+        await purge.purge()
 
         mock_connection.set_autocommit.assert_awaited_once_with(False)
         mock_connection.transaction.assert_called_once_with()
 
     @pytest.mark.asyncio
-    async def test_a_second_pass_over_reconciled_tables_deletes_nothing(
+    async def test_a_second_extraction_over_reconciled_tables_deletes_nothing(
         self,
         mock_async_pool: MagicMock,
         mock_cursor: MagicMock,
     ) -> None:
-        """Nothing older than the run start survives the first pass, so the second is a no-op."""
+        """Nothing older than the boundary survives the first pass, so the next is a no-op."""
         _script_counts(mock_cursor, [(90, 0), (90, 0)], rowcounts=[])
-        purge = _purge(mock_async_pool)
+        purge = _latched(mock_async_pool)
 
-        deleted = await purge.purge(processed_records=5000)
+        deleted = await purge.purge()
 
         assert deleted == {RELATIONSHIPS: 0, EXTERNAL_LINKS: 0}
         assert _deletes(mock_cursor) == []
@@ -310,58 +438,150 @@ class TestTransactionAndIdempotence:
         mock_cursor: MagicMock,
     ) -> None:
         mock_cursor.execute.side_effect = RuntimeError("connection reset")
-        purge = _purge(mock_async_pool)
+        purge = _latched(mock_async_pool)
 
         with pytest.raises(RuntimeError, match="connection reset"):
-            await purge.purge(processed_records=5000)
+            await purge.purge()
 
 
-class TestReconciliationColumns:
-    """The column the purge keys on is added additively and idempotently."""
+class TestStartupProbe:
+    """The loader issues no DDL; it probes for the column database-schema owns."""
 
     @pytest.mark.asyncio
-    async def test_ensure_adds_updated_at_to_both_tables_if_not_exists(
+    async def test_the_probe_reads_information_schema_for_both_tables(
         self,
         mock_async_pool: MagicMock,
-        mock_connection: MagicMock,
         mock_cursor: MagicMock,
     ) -> None:
-        await ensure_reconciliation_columns(mock_async_pool, MagicMock())
+        mock_cursor.fetchone.side_effect = [(1,), (1,)]
+
+        assert await reconciliation_columns_present(mock_async_pool, MagicMock()) is True
 
         statements = _statements(mock_cursor)
         assert len(statements) == len(RECONCILED_TABLES)
         for statement in statements:
-            assert "ADD COLUMN IF NOT EXISTS" in statement
-            assert "updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()" in statement
-        assert any('"musicbrainz"."relationships"' in statement for statement in statements)
-        assert any('"musicbrainz"."external_links"' in statement for statement in statements)
-        mock_connection.set_autocommit.assert_awaited_once_with(False)
+            assert "information_schema.columns" in statement
+        parameters = [call.args[1] for call in mock_cursor.execute.await_args_list]
+        assert parameters == [
+            ("musicbrainz", "relationships", RECONCILIATION_COLUMN),
+            ("musicbrainz", "external_links", RECONCILIATION_COLUMN),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_the_probe_issues_no_ddl(self, mock_async_pool: MagicMock, mock_cursor: MagicMock) -> None:
+        """database-schema is the only repository that issues DDL against these tables."""
+        mock_cursor.fetchone.side_effect = [(0,), (0,)]
+
+        await reconciliation_columns_present(mock_async_pool, MagicMock())
+
+        for statement in _statements(mock_cursor):
+            assert "ALTER TABLE" not in statement.upper()
+            assert "CREATE " not in statement.upper()
+
+    @pytest.mark.asyncio
+    async def test_an_absent_column_disables_the_feature_with_one_log_line(
+        self,
+        mock_async_pool: MagicMock,
+        mock_cursor: MagicMock,
+    ) -> None:
+        mock_cursor.fetchone.side_effect = [(0,), (0,)]
+        probe_logger = MagicMock()
+
+        assert await reconciliation_columns_present(mock_async_pool, probe_logger) is False
+
+        probe_logger.warning.assert_called_once()
+        assert RECONCILIATION_COLUMN in probe_logger.warning.call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_one_missing_table_is_enough_to_disable_the_feature(
+        self,
+        mock_async_pool: MagicMock,
+        mock_cursor: MagicMock,
+    ) -> None:
+        mock_cursor.fetchone.side_effect = [(1,), (0,)]
+
+        assert await reconciliation_columns_present(mock_async_pool, MagicMock()) is False
+
+
+class TestConditionalUpsertClause:
+    """The upsert names `updated_at` only once the probe has found it."""
+
+    def test_the_default_writer_names_no_column_the_schema_has_not_declared(self) -> None:
+        writer = PostgreSQLMusicBrainzWriter()
+
+        assert writer.refresh_updated_at is False
+
+    @pytest.mark.asyncio
+    async def test_the_clause_is_absent_until_the_refresh_is_enabled(
+        self,
+        mock_connection: MagicMock,
+        mock_cursor: MagicMock,
+    ) -> None:
+        writer = PostgreSQLMusicBrainzWriter()
+
+        await writer.insert_relationships(mock_connection, [("s", "artist", "t", "artist", "member of band", [], None, None, False)])
+        await writer.insert_external_links(mock_connection, [("m", "artist", "https://example.invalid", "homepage")])
+
+        for call in mock_cursor.executemany.await_args_list:
+            assert "updated_at" not in call.args[0]
+
+    @pytest.mark.asyncio
+    async def test_the_clause_is_present_once_the_refresh_is_enabled(
+        self,
+        mock_connection: MagicMock,
+        mock_cursor: MagicMock,
+    ) -> None:
+        writer = PostgreSQLMusicBrainzWriter()
+        writer.set_refresh_updated_at(True)
+
+        await writer.insert_relationships(mock_connection, [("s", "artist", "t", "artist", "member of band", [], None, None, False)])
+        await writer.insert_external_links(mock_connection, [("m", "artist", "https://example.invalid", "homepage")])
+
+        statements = [call.args[0] for call in mock_cursor.executemany.await_args_list]
+        assert all(statement.endswith("updated_at = NOW()") for statement in statements)
+        assert "DO UPDATE SET ended = EXCLUDED.ended, updated_at = NOW()" in statements[0]
+        assert "DO UPDATE SET url = EXCLUDED.url, updated_at = NOW()" in statements[1]
 
 
 class _RecordingPurge:
     """Stand-in for the purge that records how the service drove it."""
 
-    def __init__(self, error: Exception | None = None) -> None:
-        self.calls: list[int] = []
+    def __init__(self, error: Exception | None = None, latched: bool = True) -> None:
+        self.calls: int = 0
+        self.completions: list[tuple[str, Any]] = []
         self.dead_lettered_types: list[str] = []
+        self.boundary = BOUNDARY
         self._error = error
+        self._latched = latched
 
-    def latched_for(self, completed: Any, expected: Any) -> bool:
-        return set(expected) <= set(completed)
+    def record_completion(self, data_type: str, message: Any) -> None:
+        self.completions.append((data_type, message.get("started_at")))
+
+    def is_latched(self) -> bool:
+        return self._latched
+
+    def pending_data_types(self) -> list[str]:
+        return [] if self._latched else ["releases"]
+
+    @property
+    def signalled(self) -> frozenset[str]:
+        return frozenset(data_type for data_type, _ in self.completions)
 
     def record_dead_letter(self, data_type: str) -> None:
         self.dead_lettered_types.append(data_type)
 
-    async def purge(self, processed_records: int) -> dict[str, int]:
-        self.calls.append(processed_records)
+    async def purge(self) -> dict[str, int]:
+        self.calls += 1
         if self._error is not None:
             raise self._error
         return {RELATIONSHIPS: 3, EXTERNAL_LINKS: 1}
 
 
-def _extraction_complete() -> MagicMock:
+def _extraction_complete_message() -> MagicMock:
+    import orjson
+
     message = MagicMock()
-    message.body = b'{"type": "extraction_complete", "version": "2026-01-01"}'
+    message.body = orjson.dumps(_signal())
     return message
 
 
@@ -369,20 +589,20 @@ class TestServiceLatching:
     """How ``extraction_complete`` and a dead letter drive the purge."""
 
     @pytest.mark.asyncio
-    async def test_the_purge_waits_until_every_entity_type_has_completed(
+    async def test_the_signal_is_recorded_with_its_own_started_at(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Purging after one type would delete the rows the other three still owe."""
-        purge = _RecordingPurge()
+        purge = _RecordingPurge(latched=False)
         monkeypatch.setattr(service, "stale_row_purge", purge)
         monkeypatch.setattr(service, "completed_files", set())
         monkeypatch.setattr(service, "CONSUMER_CANCEL_DELAY", 0)
 
-        result = await service._handle_data_message(_extraction_complete(), "artists")
+        result = await service._handle_data_message(_extraction_complete_message(), "artists")
 
         assert result == DeliveryResult(Settlement.ACK, "skipped")
-        assert purge.calls == []
+        assert purge.completions == [("artists", BOUNDARY.isoformat())]
+        assert purge.calls == 0
 
     @pytest.mark.asyncio
     async def test_the_last_entity_types_signal_runs_the_purge(
@@ -391,14 +611,28 @@ class TestServiceLatching:
     ) -> None:
         purge = _RecordingPurge()
         monkeypatch.setattr(service, "stale_row_purge", purge)
-        monkeypatch.setattr(service, "completed_files", {"artists", "labels", "release-groups"})
-        monkeypatch.setattr(service, "message_counts", {"artists": 7, "labels": 2, "release-groups": 1, "releases": 5})
+        monkeypatch.setattr(service, "completed_files", set())
         monkeypatch.setattr(service, "CONSUMER_CANCEL_DELAY", 0)
 
-        result = await service._handle_data_message(_extraction_complete(), "releases")
+        result = await service._handle_data_message(_extraction_complete_message(), "releases")
 
         assert result == DeliveryResult(Settlement.ACK, "skipped")
-        assert purge.calls == [15]
+        assert purge.calls == 1
+
+    @pytest.mark.asyncio
+    async def test_the_purge_no_longer_reads_completed_files(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """completed_files stays full across extractions, so the latch owns its own state."""
+        purge = _RecordingPurge(latched=False)
+        monkeypatch.setattr(service, "stale_row_purge", purge)
+        monkeypatch.setattr(service, "completed_files", set(service.MUSICBRAINZ_DATA_TYPES))
+        monkeypatch.setattr(service, "CONSUMER_CANCEL_DELAY", 0)
+
+        await service._handle_data_message(_extraction_complete_message(), "artists")
+
+        assert purge.calls == 0
 
     @pytest.mark.asyncio
     async def test_a_failed_purge_requeues_the_signal_and_withdraws_completion(
@@ -410,10 +644,9 @@ class TestServiceLatching:
         completed = {"artists", "labels", "release-groups"}
         monkeypatch.setattr(service, "stale_row_purge", purge)
         monkeypatch.setattr(service, "completed_files", completed)
-        monkeypatch.setattr(service, "message_counts", dict.fromkeys(service.MUSICBRAINZ_DATA_TYPES, 1))
         monkeypatch.setattr(service, "CONSUMER_CANCEL_DELAY", 0)
 
-        result = await service._handle_data_message(_extraction_complete(), "releases")
+        result = await service._handle_data_message(_extraction_complete_message(), "releases")
 
         assert result == DeliveryResult(Settlement.REQUEUE, "failed", "ReconciliationFailed")
         assert "releases" not in completed
@@ -459,11 +692,11 @@ class TestServiceLatching:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Startup failing to wire the purge must not stop the loader from loading."""
+        """A probe that found no column must not stop the loader from loading."""
         monkeypatch.setattr(service, "stale_row_purge", None)
         monkeypatch.setattr(service, "completed_files", set(service.MUSICBRAINZ_DATA_TYPES))
         monkeypatch.setattr(service, "CONSUMER_CANCEL_DELAY", 0)
 
-        result = await service._handle_data_message(_extraction_complete(), "releases")
+        result = await service._handle_data_message(_extraction_complete_message(), "releases")
 
         assert result == DeliveryResult(Settlement.ACK, "skipped")
