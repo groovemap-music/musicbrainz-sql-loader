@@ -435,8 +435,8 @@ connection_params: dict[str, Any] = {}
 connection_pool: AsyncPostgreSQLPool | None = None
 
 rabbitmq_manager: Any = None  # Will hold AsyncResilientRabbitMQ instance
-active_connection: Any = None  # Current active connection
-active_channel: Any = None  # Current active channel
+active_connection: Any = None
+active_channel: Any = None
 connection_check_task: asyncio.Task[None] | None = None  # Background task for periodic queue checks
 
 
