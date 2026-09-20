@@ -410,6 +410,16 @@
     },
     "views": 37
   },
+  "musicbrainz_delete_reconciliation": {
+    "columns": {
+      "musicbrainz.external_links.updated_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+      "musicbrainz.relationships.updated_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()"
+    },
+    "consumer": "musicbrainz-sql-loader",
+    "introduced_in_contract_version": 1,
+    "kind": "additive",
+    "note": "musicbrainz.relationships and musicbrainz.external_links were declared with created_at only, unlike every other MusicBrainz entity table. The additive updated_at column closes the gap: the loader refreshes it on every upsert and reconciles deletes by removing rows where updated_at < run start, the same purge_stale_rows shape discogs-sql-loader already runs against the Discogs entity tables' own updated_at. DDL ownership is database-schema alone, so this column is declared here rather than carried as a startup ALTER in the loader."
+  },
   "owners": [
     "database-schema"
   ],
