@@ -24,6 +24,7 @@ from brainztableinator._reconciliation import (
     DEFAULT_MAX_DELETE_FRACTION,
     RECONCILED_TABLES,
     RECONCILIATION_COLUMN,
+    RECONCILIATION_COLUMN_TYPE,
     StaleChildRowPurge,
     parse_started_at,
     reconciliation_columns_present,
@@ -383,6 +384,114 @@ class TestBoundaryComesFromTheMessage:
         assert purge.is_latched()
 
     @pytest.mark.asyncio
+    async def test_a_repeated_signal_at_a_vetoed_boundary_issues_no_delete(
+        self,
+        mock_async_pool: MagicMock,
+        mock_cursor: MagicMock,
+    ) -> None:
+        """Delivery is at-least-once, so one duplicate must not defeat the veto.
+
+        The marks that vetoed the extraction are cleared as it settles. Were the
+        boundary not settled with them, this repeated signal would find an empty mark
+        set and purge exactly the rows the dead letter existed to protect.
+        """
+        _script_counts(mock_cursor, [(1000, 500), (1000, 500)], rowcounts=[500, 500])
+        purge = _latched(mock_async_pool)
+        purge.record_dead_letter("artists")
+
+        assert await purge.purge() == {}
+        assert purge.dead_lettered == frozenset()
+        assert purge.settled_boundary == BOUNDARY
+
+        # The broker redelivers one of the four signals at the same boundary.
+        purge.record_completion("artists", _signal())
+
+        assert purge.is_latched()
+        assert await purge.purge() == {}
+        mock_cursor.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_every_signal_repeated_at_a_vetoed_boundary_issues_no_delete(
+        self,
+        mock_async_pool: MagicMock,
+        mock_cursor: MagicMock,
+    ) -> None:
+        """The whole set redelivered is the same case, and must be refused the same way."""
+        _script_counts(mock_cursor, [(1000, 500), (1000, 500)], rowcounts=[500, 500])
+        purge = _latched(mock_async_pool)
+        purge.record_dead_letter("releases")
+        assert await purge.purge() == {}
+
+        for data_type in DATA_TYPES:
+            purge.record_completion(data_type, _signal())
+
+        assert await purge.purge() == {}
+        assert _deletes(mock_cursor) == []
+
+    @pytest.mark.asyncio
+    async def test_a_boundary_vetoed_for_record_counts_is_settled_too(
+        self,
+        mock_async_pool: MagicMock,
+        mock_cursor: MagicMock,
+    ) -> None:
+        """Every veto settles, not just the dead-letter one."""
+        _script_counts(mock_cursor, [(1000, 500), (1000, 500)], rowcounts=[500, 500])
+        purge = StaleChildRowPurge(mock_async_pool, MagicMock())
+        for data_type in DATA_TYPES:
+            message = _signal()
+            message["record_counts"]["labels"] = 0
+            purge.record_completion(data_type, message)
+
+        assert await purge.purge() == {}
+        assert purge.settled_boundary == BOUNDARY
+
+        # Even a repeat carrying healthy counts must not reopen a settled extraction.
+        for data_type in DATA_TYPES:
+            purge.record_completion(data_type, _signal())
+
+        assert await purge.purge() == {}
+        mock_cursor.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_unlatched_purge_does_not_settle_the_boundary(
+        self,
+        mock_async_pool: MagicMock,
+        mock_cursor: MagicMock,
+    ) -> None:
+        """A boundary still being collected must stay open, and its marks must be kept."""
+        _script_counts(mock_cursor, [(1000, 500), (1000, 500)], rowcounts=[500, 500])
+        purge = StaleChildRowPurge(mock_async_pool, MagicMock())
+        purge.record_completion("artists", _signal())
+        purge.record_dead_letter("artists")
+
+        assert await purge.purge() == {}
+        assert purge.settled_boundary is None
+        assert purge.dead_lettered == frozenset({"artists"})
+
+        for data_type in DATA_TYPES[1:]:
+            purge.record_completion(data_type, _signal())
+
+        assert await purge.purge() == {}
+        assert _deletes(mock_cursor) == []
+
+    @pytest.mark.asyncio
+    async def test_a_newer_extraction_still_purges_after_a_vetoed_one(
+        self,
+        mock_async_pool: MagicMock,
+        mock_cursor: MagicMock,
+    ) -> None:
+        """Settling is per boundary, so a veto must not disable the loader for good."""
+        purge = _latched(mock_async_pool)
+        purge.record_dead_letter("artists")
+        assert await purge.purge() == {}
+
+        _script_counts(mock_cursor, [(100, 10), (100, 10)], rowcounts=[10, 10])
+        for data_type in DATA_TYPES:
+            purge.record_completion(data_type, _signal(LATER_BOUNDARY))
+
+        assert await purge.purge() == {RELATIONSHIPS: 10, EXTERNAL_LINKS: 10}
+
+    @pytest.mark.asyncio
     async def test_the_same_extraction_is_not_reconciled_twice(
         self,
         mock_async_pool: MagicMock,
@@ -393,6 +502,9 @@ class TestBoundaryComesFromTheMessage:
         purge = _latched(mock_async_pool)
         assert await purge.purge() == {RELATIONSHIPS: 10, EXTERNAL_LINKS: 10}
         mock_cursor.reset_mock()
+
+        for data_type in DATA_TYPES:
+            purge.record_completion(data_type, _signal())
 
         assert await purge.purge() == {}
         mock_cursor.execute.assert_not_awaited()
@@ -453,7 +565,7 @@ class TestStartupProbe:
         mock_async_pool: MagicMock,
         mock_cursor: MagicMock,
     ) -> None:
-        mock_cursor.fetchone.side_effect = [(1,), (1,)]
+        mock_cursor.fetchone.side_effect = [(RECONCILIATION_COLUMN_TYPE,), (RECONCILIATION_COLUMN_TYPE,)]
 
         assert await reconciliation_columns_present(mock_async_pool, MagicMock()) is True
 
@@ -470,7 +582,7 @@ class TestStartupProbe:
     @pytest.mark.asyncio
     async def test_the_probe_issues_no_ddl(self, mock_async_pool: MagicMock, mock_cursor: MagicMock) -> None:
         """database-schema is the only repository that issues DDL against these tables."""
-        mock_cursor.fetchone.side_effect = [(0,), (0,)]
+        mock_cursor.fetchone.side_effect = [(None,), (None,)]
 
         await reconciliation_columns_present(mock_async_pool, MagicMock())
 
@@ -484,7 +596,7 @@ class TestStartupProbe:
         mock_async_pool: MagicMock,
         mock_cursor: MagicMock,
     ) -> None:
-        mock_cursor.fetchone.side_effect = [(0,), (0,)]
+        mock_cursor.fetchone.side_effect = [(None,), (None,)]
         probe_logger = MagicMock()
 
         assert await reconciliation_columns_present(mock_async_pool, probe_logger) is False
@@ -498,9 +610,57 @@ class TestStartupProbe:
         mock_async_pool: MagicMock,
         mock_cursor: MagicMock,
     ) -> None:
-        mock_cursor.fetchone.side_effect = [(1,), (0,)]
+        mock_cursor.fetchone.side_effect = [(RECONCILIATION_COLUMN_TYPE,), (None,)]
 
         assert await reconciliation_columns_present(mock_async_pool, MagicMock()) is False
+
+    @pytest.mark.parametrize("declared", ["date", "timestamp without time zone", "text"])
+    @pytest.mark.asyncio
+    async def test_a_column_of_the_wrong_type_disables_the_feature(
+        self,
+        mock_async_pool: MagicMock,
+        mock_cursor: MagicMock,
+        declared: str,
+    ) -> None:
+        """A name-only probe would pass a `date` column, whose truncation deletes live rows.
+
+        `updated_at = NOW()` into a `date` stores day granularity through an assignment
+        cast, so a row refreshed hours ago reads as older than a boundary from earlier
+        the same day and is purged while still live.
+        """
+        mock_cursor.fetchone.side_effect = [(declared,), (declared,)]
+        probe_logger = MagicMock()
+
+        assert await reconciliation_columns_present(mock_async_pool, probe_logger) is False
+
+        probe_logger.error.assert_called_once()
+        message = probe_logger.error.call_args[0][0]
+        assert declared in message
+        assert RECONCILIATION_COLUMN_TYPE in message
+        probe_logger.warning.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_one_table_of_the_wrong_type_is_enough_to_disable_the_feature(
+        self,
+        mock_async_pool: MagicMock,
+        mock_cursor: MagicMock,
+    ) -> None:
+        mock_cursor.fetchone.side_effect = [(RECONCILIATION_COLUMN_TYPE,), ("date",)]
+
+        assert await reconciliation_columns_present(mock_async_pool, MagicMock()) is False
+
+    @pytest.mark.asyncio
+    async def test_the_probe_reads_the_declared_type_not_a_name_match(
+        self,
+        mock_async_pool: MagicMock,
+        mock_cursor: MagicMock,
+    ) -> None:
+        mock_cursor.fetchone.side_effect = [(RECONCILIATION_COLUMN_TYPE,), (RECONCILIATION_COLUMN_TYPE,)]
+
+        await reconciliation_columns_present(mock_async_pool, MagicMock())
+
+        for statement in _statements(mock_cursor):
+            assert "SELECT data_type" in statement
 
 
 class TestConditionalUpsertClause:

@@ -66,6 +66,15 @@ A long-lived loader sees more than one extraction. Each signal carrying a newer
 ``started_at`` re-latches: the accumulated signals are dropped and collection
 starts again for the new boundary, so a later extraction's first signal cannot
 re-fire the previous extraction's purge.
+
+Every signal is potentially a duplicate
+---------------------------------------
+Delivery is at-least-once, so the same ``extraction_complete`` can arrive twice at
+the same boundary, and the purge must be decided by something a duplicate cannot
+reset. That something is the boundary itself: an extraction is *settled* once it
+has been decided, whether it purged or was vetoed, and a settled boundary is
+refused outright. The dead-letter marks are cleared only as part of settling, so
+a repeated signal cannot find them empty and purge the rows the veto protected.
 """
 
 from __future__ import annotations
@@ -101,8 +110,16 @@ RECONCILIATION_COLUMN = "updated_at"
 # upstream deletion, and the cheap failure is leaving stale rows for one run.
 DEFAULT_MAX_DELETE_FRACTION = 0.9
 
-_COLUMN_PRESENT = """
-    SELECT count(*)
+# The type the boundary comparison requires. A `date` or a `timestamp without time
+# zone` column would satisfy a name-only probe, and then the refresh clause's
+# assignment cast would silently truncate `NOW()` -- to day granularity for a `date` --
+# so a row refreshed hours ago would read as older than a boundary from earlier the
+# same day and be deleted while still live. The probe therefore reads `data_type` and
+# requires the aware type, because the failure it prevents is silent data loss.
+RECONCILIATION_COLUMN_TYPE = "timestamp with time zone"
+
+_COLUMN_TYPE = """
+    SELECT data_type
     FROM information_schema.columns
     WHERE table_schema = %s AND table_name = %s AND column_name = %s
 """
@@ -150,12 +167,15 @@ async def reconciliation_columns_present(
     stays off, which is why it is a probe and not a migration.
     """
     missing: list[str] = []
+    wrong_type: dict[str, str] = {}
     async with connection_pool.connection() as conn, conn.cursor() as cursor:
         for schema, table in tables:
-            await cursor.execute(_COLUMN_PRESENT, (schema, table, RECONCILIATION_COLUMN))
+            await cursor.execute(_COLUMN_TYPE, (schema, table, RECONCILIATION_COLUMN))
             row = await cursor.fetchone()
             if not row or not row[0]:
                 missing.append(_qualified(schema, table))
+            elif row[0] != RECONCILIATION_COLUMN_TYPE:
+                wrong_type[_qualified(schema, table)] = str(row[0])
 
     if missing:
         logger.warning(
@@ -166,10 +186,23 @@ async def reconciliation_columns_present(
         )
         return False
 
+    if wrong_type:
+        logger.error(
+            f"🛑 Delete-reconciliation disabled — {RECONCILIATION_COLUMN} is declared "
+            f"{', '.join(f'{table} as {declared}' for table, declared in sorted(wrong_type.items()))}, "
+            f"not {RECONCILIATION_COLUMN_TYPE}; a narrower type truncates the refresh and would "
+            f"delete live rows, so loading continues with the purge off",
+            wrong_type=wrong_type,
+            column=RECONCILIATION_COLUMN,
+            required_type=RECONCILIATION_COLUMN_TYPE,
+        )
+        return False
+
     logger.info(
         "🧭 Delete-reconciliation enabled",
         tables=[_qualified(schema, table) for schema, table in tables],
         column=RECONCILIATION_COLUMN,
+        column_type=RECONCILIATION_COLUMN_TYPE,
     )
     return True
 
@@ -193,7 +226,7 @@ class StaleChildRowPurge:
         self._boundary: datetime | None = None
         self._signals: dict[str, int | None] = {}
         self._dead_lettered: set[str] = set()
-        self._reconciled_boundary: datetime | None = None
+        self._settled_boundary: datetime | None = None
 
     @property
     def boundary(self) -> datetime | None:
@@ -282,12 +315,31 @@ class StaleChildRowPurge:
         """The entity types whose ``extraction_complete`` is still outstanding."""
         return sorted(self._expected_data_types - self._signals.keys())
 
+    @property
+    def settled_boundary(self) -> datetime | None:
+        """The extraction this purge has already finished with, purged or vetoed."""
+        return self._settled_boundary
+
+    def _settle(self, boundary: datetime | None) -> None:
+        """Record that this extraction is finished with, whether it purged or was vetoed.
+
+        Settling a *vetoed* boundary is what makes the veto hold under at-least-once
+        delivery. The marks that vetoed it belong to the extraction that has just
+        concluded, so they are cleared here -- and were they cleared without the
+        boundary being recorded, a single redelivered ``extraction_complete`` at the
+        same boundary would find an empty mark set, re-latch, and purge exactly the
+        rows the veto existed to protect. Duplicate signals are ordinary, not
+        exceptional, so the guard is the boundary and not the marks.
+        """
+        self._settled_boundary = boundary
+        self._dead_lettered.clear()
+
     def _veto_reason(self) -> str | None:
         """Return why the purge must not run, or ``None`` when it may."""
         if not self.is_latched():
             return f"not every entity type has signalled: still waiting on {self.pending_data_types()}"
-        if self._reconciled_boundary is not None and self._reconciled_boundary == self._boundary:
-            return "this extraction has already been reconciled"
+        if self._settled_boundary is not None and self._settled_boundary == self._boundary:
+            return "this extraction has already been settled"
         if self._dead_lettered:
             return f"deliveries were dead-lettered this run: {sorted(self._dead_lettered)}"
         empty = sorted(data_type for data_type, count in self._signals.items() if not count)
@@ -305,10 +357,11 @@ class StaleChildRowPurge:
         veto = self._veto_reason()
         if veto is not None:
             self._logger.warning(f"⚠️ Skipping MusicBrainz delete-reconciliation — {veto}", reason=veto)
-            # Mirrors discogs-sql-loader's reset_dlq_nacks: the marks belong to the
-            # extraction that has just concluded, so they must not veto the next one.
+            # A latched extraction that is vetoed is finished with, so it settles here
+            # and no later signal at that boundary can purge it. An unlatched one is
+            # still being collected and must not settle. See `_settle`.
             if self.is_latched():
-                self._dead_lettered.clear()
+                self._settle(self._boundary)
             return {}
 
         boundary = self._boundary
@@ -326,8 +379,7 @@ class StaleChildRowPurge:
             )
             raise
 
-        self._reconciled_boundary = boundary
-        self._dead_lettered.clear()
+        self._settle(boundary)
         self._logger.info(
             "🧹 MusicBrainz delete-reconciliation complete",
             boundary=boundary.isoformat() if boundary else None,

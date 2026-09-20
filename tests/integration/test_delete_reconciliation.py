@@ -514,3 +514,93 @@ async def test_a_writer_without_the_refresh_leaves_rows_looking_stale(
         row = await cursor.fetchone()
     assert row is not None
     assert row[0] == 2, "without the refresh clause the re-sent relationship still reads as stale"
+
+
+async def test_the_probe_rejects_a_column_declared_with_a_narrower_type(
+    reconciliation_pool: AsyncPostgreSQLPool,
+) -> None:
+    """A `date` column passes a name-only probe and then deletes live rows.
+
+    `updated_at = NOW()` into a `date` truncates to day granularity through the
+    assignment cast, so a row refreshed hours ago compares as older than a boundary
+    taken earlier the same day. This asserts against a real server that the probe
+    refuses the column rather than enabling a purge that would silently delete it.
+    """
+    async with reconciliation_pool.connection() as conn:
+        await conn.set_autocommit(True)
+        for table in (RELATIONSHIPS, EXTERNAL_LINKS):
+            await conn.execute(f"ALTER TABLE {table} ALTER COLUMN updated_at TYPE DATE")
+
+    try:
+        assert await reconciliation_columns_present(reconciliation_pool, logger) is False
+    finally:
+        async with reconciliation_pool.connection() as conn:
+            await conn.set_autocommit(True)
+            for table in (RELATIONSHIPS, EXTERNAL_LINKS):
+                await conn.execute(f"ALTER TABLE {table} ALTER COLUMN updated_at TYPE TIMESTAMPTZ")
+
+
+async def test_a_truncating_column_would_have_deleted_a_live_row(
+    reconciliation_pool: AsyncPostgreSQLPool,
+) -> None:
+    """Shows the loss the probe prevents, so the type check is not merely cosmetic."""
+    processor = _processor()
+    async with reconciliation_pool.connection() as conn:
+        await conn.set_autocommit(True)
+        for table in (RELATIONSHIPS, EXTERNAL_LINKS):
+            await conn.execute(f"ALTER TABLE {table} ALTER COLUMN updated_at TYPE DATE")
+
+    try:
+        async with reconciliation_pool.connection() as conn:
+            await conn.set_autocommit(True)
+            await processor.insert_relationships(conn, ARTIST, "artist", [_relationship(KEPT_TARGET, "member of band")])
+            # A boundary later in the same day than the truncated refresh.
+            cursor = await conn.execute("SELECT date_trunc('day', NOW()) + INTERVAL '1 hour'")
+            row = await cursor.fetchone()
+            assert row is not None
+            boundary = row[0]
+
+            await processor.insert_relationships(conn, ARTIST, "artist", [_relationship(KEPT_TARGET, "member of band")])
+            cursor = await conn.execute("SELECT count(*) FROM musicbrainz.relationships WHERE updated_at < %s", (boundary,))
+            stale = await cursor.fetchone()
+
+        assert stale is not None
+        assert stale[0] == 1, "a truncated updated_at reads as stale, which is what the probe refuses to enable"
+    finally:
+        async with reconciliation_pool.connection() as conn:
+            await conn.set_autocommit(True)
+            for table in (RELATIONSHIPS, EXTERNAL_LINKS):
+                await conn.execute(f"ALTER TABLE {table} ALTER COLUMN updated_at TYPE TIMESTAMPTZ")
+
+
+async def test_a_repeated_signal_at_a_vetoed_boundary_leaves_every_row_in_place(
+    reconciliation_pool: AsyncPostgreSQLPool,
+) -> None:
+    """At-least-once delivery must not defeat the dead-letter veto on a real table."""
+    processor = _processor()
+    async with reconciliation_pool.connection() as conn:
+        await conn.set_autocommit(True)
+        await processor.insert_relationships(
+            conn,
+            ARTIST,
+            "artist",
+            [_relationship(KEPT_TARGET, "member of band"), _relationship(REMOVED_TARGET, "collaboration")],
+        )
+
+    await _age_every_row(reconciliation_pool)
+    started_at = await _now(reconciliation_pool)
+
+    async with reconciliation_pool.connection() as conn:
+        await conn.set_autocommit(True)
+        await processor.insert_relationships(conn, ARTIST, "artist", [_relationship(KEPT_TARGET, "member of band")])
+
+    purge = _latched(reconciliation_pool, started_at)
+    purge.record_dead_letter("artists")
+    assert await purge.purge() == {}
+
+    # The broker redelivers every signal at the same boundary.
+    for data_type in DATA_TYPES:
+        purge.record_completion(data_type, _signal(started_at))
+
+    assert await purge.purge() == {}
+    assert await _relationship_targets(reconciliation_pool) == {KEPT_TARGET, REMOVED_TARGET}
