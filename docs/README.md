@@ -2,6 +2,7 @@
 
 - [Configuration reference](configuration.md)
 - [MusicBrainz import and restart behavior](musicbrainz-sync.md)
+- [Graph media: the MusicBrainz half of `graph.issued_on`](graph-media.md)
 - [Consumer cancellation and draining](consumer-cancellation.md)
 - [File and extraction completion](file-completion-tracking.md)
 - [Database resilience](database-resilience.md)
