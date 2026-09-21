@@ -103,22 +103,30 @@ after the row itself is written and on the same connection inside the same trans
 
 The point is cross-catalog lookup: a barcode learned here and the same barcode learned from
 Discogs must name one item, not two. That only holds if both sides compare the value the same
-way, so the loader does not normalize anything itself. It builds the identifiers block ADR 0011
-publishes and hands it to `common.identifiers.alias_refs_for_release` in the shared runtime,
+way, so the loader does not normalize anything itself. New events supply the producer-owned
+`record.identifiers` block, including `source.provider: musicbrainz`. The loader passes that
+block unchanged to `common.identifiers.alias_refs_for_release` in the shared runtime,
 which is the single implementation of the comparison: a barcode compares as its ASCII digits,
 so printed grouping spaces and hyphens do not change identity, and a catalogue number compares
 trimmed, whitespace-collapsed, and upper-cased, which is how one label prints the same number
 two ways. Two values that normalize alike are one alias. A value that normalizes away to
 nothing mints none.
 
-- **Absent fields attach nothing.** A release with no barcode and no catalogue numbers, and a
-  legacy event published before the producer carried either field, run no alias statement at
-  all. Neither is an error.
+- **Legacy events are explicit.** Only when the `identifiers` key is absent does the loader
+  build a compatibility block from `barcode` and `catalog_numbers`, using MusicBrainz source
+  fields and provenance. A legacy event with neither value attaches nothing. A present but
+  malformed block is rejected by the shared validator; it is never silently rebuilt from raw
+  fields. The message follows the loader's existing failure/rollback path.
 - **A conflict is counted, not raised.** `attach_aliases` never overwrites, so a barcode
   another catalog has already claimed comes back naming *that* item. The two catalogs disagree
   about which release a printed number belongs to; the loader counts the conflict in its log
   line, keeps the id the release's own alias resolved, and lets the message succeed. Resolving
   the disagreement is the same reconciliation job's work as the duplicate pairs above.
+
+The loader's active runtime pin is recorded in `contracts/runtime/compatibility.json` and
+checked against the lockfile. The older `contracts/persistence/v1/compatibility.json` remains
+byte-for-byte pinned to the database-schema producer: its `tested_commit` is historical
+schema-owner provenance, not this loader's active runtime pin.
 
 The release's `country` and `release_events` fields need no such handling. They are carried
 verbatim inside the `data` column the upsert already writes, and the schema adds no column for

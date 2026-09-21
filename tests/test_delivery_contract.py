@@ -15,7 +15,7 @@ import brainztableinator.brainztableinator as service
 
 
 ROOT = Path(__file__).parent.parent
-RUNTIME_REVISION = "6e84fe9acfd9551bd3bba2f2e78fef0ec1ef38ef"
+RUNTIME_REVISION = "7abcb3ba9f467d9bdcd5b3df0b1a342a2efda73b"
 VALID_BODY = b'{"id":"550e8400-e29b-41d4-a716-446655440000","name":"Artist"}'
 
 
@@ -201,8 +201,8 @@ def test_runtime_pin_and_private_batch_boundary_are_static() -> None:
     source = (ROOT / "brainztableinator" / "brainztableinator.py").read_text()
     processor = (ROOT / "brainztableinator" / "_record_processing.py").read_text()
 
-    assert pyproject.count(RUNTIME_REVISION) == 1
-    assert lockfile.count(RUNTIME_REVISION) == 3
+    assert pyproject.count(RUNTIME_REVISION) == 2  # active source and schema-dev override
+    assert lockfile.count(RUNTIME_REVISION) == 4  # override, requirement, resolved URL and fragment
     assert "common.batch" not in source
     assert "AsyncBatchEngine" not in source
     assert "class BatchObserver" in processor

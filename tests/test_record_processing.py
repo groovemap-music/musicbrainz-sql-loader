@@ -8,9 +8,10 @@ from uuid import UUID, uuid4
 
 import pytest
 import structlog
+from common.identifiers import IdentifierValidationError
 from common.identity import AliasRef
 
-from brainztableinator._record_processing import MusicBrainzRecordProcessor
+from brainztableinator._record_processing import MusicBrainzRecordProcessor, _legacy_identifiers_block
 
 
 ROOT = Path(__file__).parent.parent
@@ -198,7 +199,7 @@ def _release_with_identifiers() -> dict[str, Any]:
     catalogue number lower-cased and double-spaced -- so the assertions below measure the
     shared normalization rather than a pass-through.
     """
-    return {
+    record = {
         "mbid": "release-mbid",
         "media": {},
         "barcode": "0 77774 64442 1",
@@ -207,6 +208,30 @@ def _release_with_identifiers() -> dict[str, Any]:
             {"catalog_number": "1E 062-04243", "label_mbid": None, "label_name": "Odeon"},
         ],
     }
+    record["identifiers"] = {
+        "identifiers_version": "1",
+        "items": [
+            {
+                "type": "barcode",
+                "value": record["barcode"],
+                "description": None,
+                "source": {"provider": "musicbrainz", "type": None, "field": "barcode"},
+            },
+            *[
+                {
+                    "type": "catalog_number",
+                    "value": entry["catalog_number"],
+                    "description": None,
+                    "source": {"provider": "musicbrainz", "type": None, "field": "label-info[].catalog-number"},
+                }
+                for entry in record["catalog_numbers"]
+            ],
+        ],
+        "types": ["barcode", "catalog_number"],
+        "aliases": [],
+        "unmapped": {"types": []},
+    }
+    return record
 
 
 @pytest.mark.asyncio
@@ -244,6 +269,72 @@ async def test_a_release_with_neither_a_barcode_nor_a_catalogue_number_attaches_
     # run; the release is still written with the native id it resolved.
     attach.assert_not_awaited()
     writer.upsert_release.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_new_event_uses_producer_block_instead_of_raw_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    record = _release_with_identifiers()
+    record["barcode"] = "999999"
+    record["catalog_numbers"] = []
+    native_id = uuid4()
+    _identity(monkeypatch, resolved={AliasRef("musicbrainz", "release", "release-mbid"): native_id})
+    writer = _writer()
+    processor = MusicBrainzRecordProcessor(writer, _Observer(), MagicMock())
+
+    await processor.process_release(MagicMock(), record)
+
+    assert writer.upsert_release.await_args.args[1][8] == native_id
+    # The producer's values, not conflicting legacy fields, are authoritative.
+    from brainztableinator._record_processing import attach_aliases
+
+    assert set(attach_aliases.await_args.args[1]) == {BARCODE_REF, FIRST_CATALOG_NUMBER_REF, SECOND_CATALOG_NUMBER_REF}
+
+
+@pytest.mark.asyncio
+async def test_legacy_event_uses_musicbrainz_provenance(monkeypatch: pytest.MonkeyPatch) -> None:
+    record = _release_with_identifiers()
+    del record["identifiers"]
+    legacy_block = _legacy_identifiers_block(record)
+    assert legacy_block is not None
+    assert {item["source"]["provider"] for item in legacy_block["items"]} == {"musicbrainz"}
+    native_id = uuid4()
+    _resolve, attach = _identity(monkeypatch, resolved={AliasRef("musicbrainz", "release", "release-mbid"): native_id})
+    processor = MusicBrainzRecordProcessor(_writer(), _Observer(), MagicMock())
+
+    await processor.process_release(MagicMock(), record)
+
+    assert set(attach.await_args.args[1]) == {BARCODE_REF, FIRST_CATALOG_NUMBER_REF, SECOND_CATALOG_NUMBER_REF}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_block", [None, {}, {"identifiers_version": "2"}])
+async def test_malformed_present_block_is_rejected_without_legacy_fallback(monkeypatch: pytest.MonkeyPatch, bad_block: Any) -> None:
+    record = _release_with_identifiers()
+    record["identifiers"] = bad_block
+    _resolve, attach = _identity(monkeypatch, resolved={AliasRef("musicbrainz", "release", "release-mbid"): uuid4()})
+    processor = MusicBrainzRecordProcessor(_writer(), _Observer(), MagicMock())
+
+    with pytest.raises((IdentifierValidationError, TypeError)):
+        await processor.process_release(MagicMock(), record)
+    attach.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reprocessing_release_reattaches_same_aliases_to_same_native_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    native_id = uuid4()
+    _resolve, attach = _identity(monkeypatch, resolved={AliasRef("musicbrainz", "release", "release-mbid"): native_id})
+    writer = _writer()
+    processor = MusicBrainzRecordProcessor(writer, _Observer(), MagicMock())
+    record = _release_with_identifiers()
+    conn = MagicMock()
+
+    await processor.process_release(conn, record)
+    await processor.process_release(conn, record)
+
+    assert attach.await_count == 2
+    assert attach.await_args_list[0].args[1] == attach.await_args_list[1].args[1]
+    assert set(attach.await_args.args[1].values()) == {native_id}
+    assert all(call.args[1][8] == native_id for call in writer.upsert_release.await_args_list)
 
 
 @pytest.mark.asyncio

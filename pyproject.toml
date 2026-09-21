@@ -57,9 +57,12 @@ packages = ["brainztableinator"]
 
 [tool.uv]
 exclude-newer = "2 days"
+# The schema producer's historical runtime URL is immutable; its dev dependency must resolve
+# against this loader's active tested runtime rather than force two revisions into one env.
+override-dependencies = ["groovemap-runtime[neo4j,otel,postgres,rabbitmq] @ git+https://github.com/groovemap-music/python-libraries.git@7abcb3ba9f467d9bdcd5b3df0b1a342a2efda73b"]
 
 [tool.uv.sources]
-groovemap-runtime = { git = "https://github.com/groovemap-music/python-libraries.git", rev = "6e84fe9acfd9551bd3bba2f2e78fef0ec1ef38ef" }
+groovemap-runtime = { git = "https://github.com/groovemap-music/python-libraries.git", rev = "7abcb3ba9f467d9bdcd5b3df0b1a342a2efda73b" }
 groovemap-database-schema = { git = "https://github.com/groovemap-music/database-schema.git", rev = "06629c6a7681127f74995bbae638ba048e2abd6d" }
 
 [tool.ruff]

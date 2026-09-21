@@ -1,7 +1,7 @@
 {
   "binding_sha256": "5ec6d7e0317e39396b9b40effb4804e70242768b95499b922b161c6f300c1273",
-  "contract_sha256": "53073d4b4aac07655abe18688a4eb9c4902481f50dbd02b5b61c083c4b83be2f",
-  "migration_transform": "Promoted the catalog-identifiers producer revision (ADR 0011, wave 1): MusicBrainz release fixtures now carry country, release_events, and catalog_numbers alongside the existing barcode. All three are additive within contract v1 and the generated Python binding is unchanged, so a consumer built against the previous revision keeps working.",
-  "producer_commit": "ada3fead007a4f83eaef55b82265443da3845b31",
+  "contract_sha256": "f0c62ec3212ff7594d1e39a2dd73cb5519b944e0984558978791992c47313a2d",
+  "migration_transform": "Promoted the reviewed MusicBrainz producer's additive identifiers block in catalog-events v1. The release fixture now carries MusicBrainz provenance and normalized barcode/catalog-number aliases; the generated Python binding is unchanged. Legacy events without the block remain consumable.",
+  "producer_commit": "ae01d967e72e18c82cac2e844daa1dfeb81a32a6",
   "producer_repository": "https://github.com/groovemap-music/musicbrainz-ingestion"
 }
