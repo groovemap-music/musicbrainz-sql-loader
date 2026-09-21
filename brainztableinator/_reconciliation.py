@@ -67,6 +67,50 @@ A long-lived loader sees more than one extraction. Each signal carrying a newer
 starts again for the new boundary, so a later extraction's first signal cannot
 re-fire the previous extraction's purge.
 
+What this purge assumes, and what it does not check
+---------------------------------------------------
+The whole mechanism rests on one premise: an ``extraction_complete`` at boundary
+B means the producer re-sent the *entire* dump for that entity kind, so a row not
+refreshed since B is a row upstream no longer has. Nothing here asserts that
+premise, and nothing can from inside this process -- a record carries no statement
+about which extraction produced it or how complete that extraction was. An
+incremental extraction announcing itself with the same message would look exactly
+like a full one in which almost everything was deleted.
+
+Two guards approximate it from the other side. The per-type ``record_counts``
+veto refuses a boundary whose extractor reported no records for some kind, which
+is the shape a resumed extraction takes; and :data:`DEFAULT_MAX_DELETE_FRACTION`
+refuses any single table shrink at or past 90%, which is the shape a partial one
+takes. Both are empirical: they catch the cases seen so far, not the premise. If
+the producer ever gains an incremental mode, this module needs a field on the
+signal saying so, not a tighter cap.
+
+The dead-letter veto is not scoped to an extraction
+---------------------------------------------------
+:meth:`StaleChildRowPurge.record_dead_letter` records a data type, not a data type
+and a boundary, and :meth:`StaleChildRowPurge._settle` clears every mark. Where
+two extractions interleave -- the next dump's records already arriving while the
+previous dump's fourth signal is still outstanding -- a mark belonging to the
+*newer* extraction is cleared when the older one settles, and the newer boundary
+starts with an empty mark set.
+
+Scoping the marks would require attributing a delivery to an extraction, and a
+record message carries nothing that does: only the completion signal names a
+``started_at``. So the behaviour is recorded rather than fixed. It fails in the
+permissive direction -- a purge that should have been vetoed may run -- which is
+why the delete-fraction cap and the record-count veto are load-bearing and not
+merely defensive, and why a producer that interleaves dumps would be a change this
+module has to be told about.
+
+``reset()`` deliberately leaves the settled boundary alone
+----------------------------------------------------------
+:meth:`StaleChildRowPurge.reset` clears the boundary, the collected signals, and
+the marks, but not ``_settled_boundary``. That is not an omission. Settling is the
+guard that makes a duplicate ``extraction_complete`` harmless; a reset that
+forgot it would let a redelivered signal re-latch a settled extraction and fire
+exactly the purge the veto refused. Forgetting a settlement is the one thing a
+reset must not do.
+
 Every signal is potentially a duplicate
 ---------------------------------------
 Delivery is at-least-once, so the same ``extraction_complete`` can arrive twice at
@@ -244,7 +288,11 @@ class StaleChildRowPurge:
         return frozenset(self._dead_lettered)
 
     def reset(self) -> None:
-        """Forget the boundary, the collected signals, and the dead-letter marks."""
+        """Forget the boundary, the collected signals, and the dead-letter marks.
+
+        The settled boundary survives, deliberately: see the module docstring. A reset
+        that forgot it would let a redelivered signal re-fire a settled purge.
+        """
         self._boundary = None
         self._signals.clear()
         self._dead_lettered.clear()
@@ -256,6 +304,12 @@ class StaleChildRowPurge:
         record is still present upstream, so its ``updated_at`` was never refreshed
         and it would read as stale. Vetoing the purge is what stops a poison message
         from deleting a still-current record beyond the dead-letter queue.
+
+        The mark names a data type and not the extraction it belongs to, which is a
+        known limitation under interleaved extractions; the module docstring records
+        why it cannot be scoped from here. ``brainztableinator._reject`` calls this
+        before the broker is told, so a rejection cannot race a concurrent signal
+        through the gap between settlement and the mark.
         """
         self._dead_lettered.add(data_type)
 

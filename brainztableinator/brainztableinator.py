@@ -896,13 +896,33 @@ async def _reconcile_deleted_child_rows(data_type: str, data: dict[str, Any]) ->
     return True
 
 
+def _reject(data_type: str, error_type: str) -> DeliveryResult:
+    """Reject a delivery to the dead-letter queue, vetoing the reconciliation first.
+
+    The veto is recorded here rather than only after ``run_delivery`` returns because
+    settlement and the mark are otherwise two steps with a gap between them: with a
+    prefetch above one, an ``extraction_complete`` delivery running concurrently can
+    latch and purge in that gap, after this record was nacked and before the mark that
+    protects it exists. Marking before the broker is told closes the window for every
+    rejection this function names. ``on_data_message`` still marks afterwards, because
+    the shared classifier can turn a raised failure into a rejection this function never
+    sees; the mark is a set membership, so recording it twice costs nothing.
+
+    A mark can only ever *skip* a purge, never widen one, so recording one early is the
+    safe direction to be wrong in.
+    """
+    if stale_row_purge is not None:
+        stale_row_purge.record_dead_letter(data_type)
+    return DeliveryResult(Settlement.REJECT, "failed", error_type)
+
+
 async def _handle_data_message(message: AbstractIncomingMessage, data_type: str) -> DeliveryResult:
     """Run one local transaction and return settlement intent without touching the broker."""
     try:
         data: dict[str, Any] = loads(message.body)
     except Exception as error:
         logger.error("❌ Failed to parse message", error=str(error))
-        return DeliveryResult(Settlement.REJECT, "failed", type(error).__name__)
+        return _reject(data_type, type(error).__name__)
 
     if data.get("type") == "file_complete":
         total_processed = data.get("total_processed", 0)
@@ -932,12 +952,12 @@ async def _handle_data_message(message: AbstractIncomingMessage, data_type: str)
 
     if "id" not in data:
         logger.error("❌ Message missing 'id' field", data=data)
-        return DeliveryResult(Settlement.REJECT, "failed", "ValidationError")
+        return _reject(data_type, "ValidationError")
 
     data_id: str = data["id"]
     if not data_id:
         logger.warning("⚠️ Nacking record with empty mbid/id", data_type=data_type)
-        return DeliveryResult(Settlement.REJECT, "failed", "ValidationError")
+        return _reject(data_type, "ValidationError")
 
     try:
         uuid.UUID(data_id)
@@ -947,12 +967,12 @@ async def _handle_data_message(message: AbstractIncomingMessage, data_type: str)
             data_type=data_type,
             data_id=data_id,
         )
-        return DeliveryResult(Settlement.REJECT, "failed", "ValidationError")
+        return _reject(data_type, "ValidationError")
 
     processor = PROCESSORS.get(data_type)
     if processor is None:
         logger.error("❌ No processor for data type", data_type=data_type)
-        return DeliveryResult(Settlement.REJECT, "failed", "UnknownEntity")
+        return _reject(data_type, "UnknownEntity")
 
     record_name = data.get("name", "Unknown")
     logger.debug(

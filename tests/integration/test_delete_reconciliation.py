@@ -1,12 +1,20 @@
 """Real-PostgreSQL regressions for the MusicBrainz child-row delete-reconciliation.
 
-These run against the pinned producer schema, applied by
-``groovemap-database-schema``'s own initializer. That revision does not yet declare
-``updated_at`` on the two child-row tables -- ``gm-database-schema-uvs`` is adding
-it -- so the fixture below adds the column as *test setup*, standing in for the
-promoted pin. The loader itself issues no DDL: it probes, and
-``test_the_probe_reports_the_column_absent_before_the_pin_is_promoted`` asserts
-what it sees against the unmodified schema.
+These run against the *promoted* producer schema, applied by
+``groovemap-database-schema``'s own initializer at the revision
+``contracts/persistence/v1/source.json`` records. That revision declares
+``updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`` on both child-row tables, so no
+test here issues the DDL the feature depends on: the column arrives with the pin,
+the loader's startup probe finds it, and
+``test_the_promoted_schema_enables_the_purge_and_a_removed_relationship_disappears``
+is the end-to-end proof that a full import over the promoted schema removes the
+relationship the second extraction stopped sending.
+
+The degraded path is still covered, because it is still the guard. Two tests take
+the promoted column away -- one dropping it, one narrowing it to ``DATE`` -- and
+assert that the probe refuses to enable the purge rather than running one that
+would delete live rows. Those are the only tests that issue DDL, and each restores
+what it changed.
 
 Everything the purge depends on is exercised end to end against a real server: that
 an upsert of a still-present relationship refreshes ``updated_at`` even when it
@@ -27,6 +35,7 @@ import pytest
 import pytest_asyncio
 import structlog
 from common import AsyncPostgreSQLPool
+from common.media import map_musicbrainz_release
 from groovemap_schema.postgres import create_postgres_schema
 from psycopg.conninfo import conninfo_to_dict
 
@@ -54,10 +63,9 @@ DATA_TYPES = ("artists", "labels", "release-groups", "releases")
 RELATIONSHIPS = "musicbrainz.relationships"
 EXTERNAL_LINKS = "musicbrainz.external_links"
 
-# Test setup only. The loader never issues DDL; `gm-database-schema-uvs` adds these
-# columns in the repository that owns the schema, and promoting this repository's pin
-# is what turns the feature on in production. Spelled here exactly as the owner will
-# declare it, so the fixture and the promoted schema converge.
+# Restore-only DDL. The promoted schema declares this column; the two degraded-mode
+# tests take it away to prove the probe refuses, and put it back exactly as the
+# schema owner declares it so the next test sees the promoted shape again.
 _ADD_UPDATED_AT = "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"
 
 
@@ -111,23 +119,9 @@ def _latched(pool: AsyncPostgreSQLPool, started_at: datetime) -> StaleChildRowPu
 
 
 @pytest_asyncio.fixture
-async def schema_only_pool() -> AsyncIterator[AsyncPostgreSQLPool]:
-    """The pinned producer schema exactly as it is, with no test setup applied."""
+async def promoted_schema_pool() -> AsyncIterator[AsyncPostgreSQLPool]:
+    """The promoted producer schema, emptied of the relations these tests write."""
     pool = await _applied_schema_pool()
-    try:
-        yield pool
-    finally:
-        await pool.close()
-
-
-@pytest_asyncio.fixture
-async def reconciliation_pool() -> AsyncIterator[AsyncPostgreSQLPool]:
-    """The pinned schema plus the column gm-database-schema-uvs is adding."""
-    pool = await _applied_schema_pool()
-    async with pool.connection() as conn:
-        await conn.set_autocommit(True)
-        for table in (RELATIONSHIPS, EXTERNAL_LINKS):
-            await conn.execute(_ADD_UPDATED_AT.format(table=table))
     try:
         await _truncate(pool)
         yield pool
@@ -153,6 +147,8 @@ async def _truncate(pool: AsyncPostgreSQLPool) -> None:
     async with pool.connection() as conn:
         await conn.set_autocommit(True)
         await conn.execute("TRUNCATE musicbrainz.relationships, musicbrainz.external_links")
+        await conn.execute("TRUNCATE musicbrainz.artists, musicbrainz.labels, musicbrainz.releases, musicbrainz.release_groups")
+        await conn.execute("TRUNCATE graph.issued_on, graph.medium, graph.media_family")
 
 
 def _processor() -> MusicBrainzRecordProcessor:
@@ -186,38 +182,40 @@ async def _age_every_row(pool: AsyncPostgreSQLPool) -> None:
         await conn.execute("UPDATE musicbrainz.external_links SET updated_at = NOW() - INTERVAL '1 day'")
 
 
-async def test_the_probe_reports_the_column_absent_before_the_pin_is_promoted(
-    schema_only_pool: AsyncPostgreSQLPool,
+async def test_the_probe_reports_the_column_absent_against_an_unpromoted_schema(
+    promoted_schema_pool: AsyncPostgreSQLPool,
 ) -> None:
-    """Against the schema as the producer ships it today, the feature stays off.
+    """A deployment still on a pre-promotion schema keeps loading with the purge off.
 
-    The reverse case is covered by every other test in this module: they all run on a
-    pool whose fixture added the column, and they all purge.
+    The column is dropped and put back here rather than the pin being un-promoted, so
+    this states what the loader does against a schema that lacks it. The reverse case
+    is every other test in this module: they run on the promoted schema untouched.
     """
-    async with schema_only_pool.connection() as conn:
+    async with promoted_schema_pool.connection() as conn:
         await conn.set_autocommit(True)
         for table in (RELATIONSHIPS, EXTERNAL_LINKS):
             await conn.execute(f"ALTER TABLE {table} DROP COLUMN IF EXISTS updated_at")
 
     try:
-        assert await reconciliation_columns_present(schema_only_pool, logger) is False
+        assert await reconciliation_columns_present(promoted_schema_pool, logger) is False
     finally:
-        async with schema_only_pool.connection() as conn:
+        async with promoted_schema_pool.connection() as conn:
             await conn.set_autocommit(True)
             for table in (RELATIONSHIPS, EXTERNAL_LINKS):
                 await conn.execute(_ADD_UPDATED_AT.format(table=table))
 
 
-async def test_the_probe_reports_the_column_present_once_it_is_declared(
-    reconciliation_pool: AsyncPostgreSQLPool,
+async def test_the_probe_reports_the_column_present_on_the_promoted_schema(
+    promoted_schema_pool: AsyncPostgreSQLPool,
 ) -> None:
-    assert await reconciliation_columns_present(reconciliation_pool, logger) is True
+    """No DDL is issued here at all: the promoted pin is what the probe finds."""
+    assert await reconciliation_columns_present(promoted_schema_pool, logger) is True
 
 
-async def test_a_relationship_removed_upstream_disappears(reconciliation_pool: AsyncPostgreSQLPool) -> None:
+async def test_a_relationship_removed_upstream_disappears(promoted_schema_pool: AsyncPostgreSQLPool) -> None:
     """The acceptance case: the run re-sends one relationship and the other is deleted."""
     processor = _processor()
-    async with reconciliation_pool.connection() as conn:
+    async with promoted_schema_pool.connection() as conn:
         await conn.set_autocommit(True)
         await processor.insert_relationships(
             conn,
@@ -225,25 +223,25 @@ async def test_a_relationship_removed_upstream_disappears(reconciliation_pool: A
             "artist",
             [_relationship(KEPT_TARGET, "member of band"), _relationship(REMOVED_TARGET, "collaboration")],
         )
-    assert await _relationship_targets(reconciliation_pool) == {KEPT_TARGET, REMOVED_TARGET}
+    assert await _relationship_targets(promoted_schema_pool) == {KEPT_TARGET, REMOVED_TARGET}
 
     # Everything in the table predates the extraction that is about to start.
-    await _age_every_row(reconciliation_pool)
-    started_at = await _now(reconciliation_pool)
+    await _age_every_row(promoted_schema_pool)
+    started_at = await _now(promoted_schema_pool)
 
     # This extraction's dump no longer carries the collaboration, only the membership.
-    async with reconciliation_pool.connection() as conn:
+    async with promoted_schema_pool.connection() as conn:
         await conn.set_autocommit(True)
         await processor.insert_relationships(conn, ARTIST, "artist", [_relationship(KEPT_TARGET, "member of band")])
 
-    deleted = await _latched(reconciliation_pool, started_at).purge()
+    deleted = await _latched(promoted_schema_pool, started_at).purge()
 
     assert deleted[RELATIONSHIPS] == 1
-    assert await _relationship_targets(reconciliation_pool) == {KEPT_TARGET}
+    assert await _relationship_targets(promoted_schema_pool) == {KEPT_TARGET}
 
 
 async def test_a_restart_mid_import_does_not_delete_what_that_import_wrote(
-    reconciliation_pool: AsyncPostgreSQLPool,
+    promoted_schema_pool: AsyncPostgreSQLPool,
 ) -> None:
     """The regression a process-start boundary caused.
 
@@ -254,23 +252,23 @@ async def test_a_restart_mid_import_does_not_delete_what_that_import_wrote(
     after them and deleted every one.
     """
     processor = _processor()
-    async with reconciliation_pool.connection() as conn:
+    async with promoted_schema_pool.connection() as conn:
         await conn.set_autocommit(True)
         await processor.insert_relationships(conn, ARTIST, "artist", [_relationship(REMOVED_TARGET, "collaboration")])
 
-    await _age_every_row(reconciliation_pool)
-    started_at = await _now(reconciliation_pool)
+    await _age_every_row(promoted_schema_pool)
+    started_at = await _now(promoted_schema_pool)
 
     # First half of the import, written by the process that is about to die.
-    async with reconciliation_pool.connection() as conn:
+    async with promoted_schema_pool.connection() as conn:
         await conn.set_autocommit(True)
         await processor.insert_relationships(conn, ARTIST, "artist", [_relationship(KEPT_TARGET, "member of band")])
 
     # The restart: a brand-new purge, with no memory of anything before it.
-    restarted = StaleChildRowPurge(reconciliation_pool, logger)
+    restarted = StaleChildRowPurge(promoted_schema_pool, logger)
 
     # Second half of the import, written after the restart.
-    async with reconciliation_pool.connection() as conn:
+    async with promoted_schema_pool.connection() as conn:
         await conn.set_autocommit(True)
         await processor.insert_relationships(conn, ARTIST, "artist", [_relationship(BACKWARD_TARGET, "supporting musician")])
 
@@ -280,15 +278,15 @@ async def test_a_restart_mid_import_does_not_delete_what_that_import_wrote(
 
     assert restarted.boundary == started_at
     assert deleted[RELATIONSHIPS] == 1
-    assert await _relationship_targets(reconciliation_pool) == {KEPT_TARGET, BACKWARD_TARGET}
+    assert await _relationship_targets(promoted_schema_pool) == {KEPT_TARGET, BACKWARD_TARGET}
 
 
 async def test_a_second_extraction_re_latches_on_its_own_boundary(
-    reconciliation_pool: AsyncPostgreSQLPool,
+    promoted_schema_pool: AsyncPostgreSQLPool,
 ) -> None:
     """A long-lived loader reconciles each extraction against that extraction's start."""
     processor = _processor()
-    async with reconciliation_pool.connection() as conn:
+    async with promoted_schema_pool.connection() as conn:
         await conn.set_autocommit(True)
         await processor.insert_relationships(
             conn,
@@ -297,10 +295,10 @@ async def test_a_second_extraction_re_latches_on_its_own_boundary(
             [_relationship(KEPT_TARGET, "member of band"), _relationship(REMOVED_TARGET, "collaboration")],
         )
 
-    await _age_every_row(reconciliation_pool)
-    first_started_at = await _now(reconciliation_pool)
+    await _age_every_row(promoted_schema_pool)
+    first_started_at = await _now(promoted_schema_pool)
 
-    async with reconciliation_pool.connection() as conn:
+    async with promoted_schema_pool.connection() as conn:
         await conn.set_autocommit(True)
         await processor.insert_relationships(
             conn,
@@ -309,18 +307,18 @@ async def test_a_second_extraction_re_latches_on_its_own_boundary(
             [_relationship(KEPT_TARGET, "member of band"), _relationship(REMOVED_TARGET, "collaboration")],
         )
 
-    purge = _latched(reconciliation_pool, first_started_at)
+    purge = _latched(promoted_schema_pool, first_started_at)
     assert await purge.purge() == {RELATIONSHIPS: 0, EXTERNAL_LINKS: 0}
 
     # A second extraction, later, in the same long-lived process. Its first signal must
     # re-latch rather than re-fire the first extraction's purge.
-    second_started_at = await _now(reconciliation_pool)
+    second_started_at = await _now(promoted_schema_pool)
     purge.record_completion("artists", _signal(second_started_at))
     assert purge.boundary == second_started_at
     assert await purge.purge() == {}
-    assert await _relationship_targets(reconciliation_pool) == {KEPT_TARGET, REMOVED_TARGET}
+    assert await _relationship_targets(promoted_schema_pool) == {KEPT_TARGET, REMOVED_TARGET}
 
-    async with reconciliation_pool.connection() as conn:
+    async with promoted_schema_pool.connection() as conn:
         await conn.set_autocommit(True)
         await processor.insert_relationships(conn, ARTIST, "artist", [_relationship(KEPT_TARGET, "member of band")])
 
@@ -328,10 +326,10 @@ async def test_a_second_extraction_re_latches_on_its_own_boundary(
         purge.record_completion(data_type, _signal(second_started_at))
 
     assert (await purge.purge())[RELATIONSHIPS] == 1
-    assert await _relationship_targets(reconciliation_pool) == {KEPT_TARGET}
+    assert await _relationship_targets(promoted_schema_pool) == {KEPT_TARGET}
 
 
-async def test_an_unchanged_upsert_refreshes_updated_at(reconciliation_pool: AsyncPostgreSQLPool) -> None:
+async def test_an_unchanged_upsert_refreshes_updated_at(promoted_schema_pool: AsyncPostgreSQLPool) -> None:
     """Re-sending an identical relationship must mark it as still present.
 
     This is the regression the purge would otherwise turn destructive: the conflict
@@ -340,27 +338,27 @@ async def test_an_unchanged_upsert_refreshes_updated_at(reconciliation_pool: Asy
     """
     processor = _processor()
     links = [{"url": "https://example.invalid/artist", "service": "official homepage"}]
-    async with reconciliation_pool.connection() as conn:
+    async with promoted_schema_pool.connection() as conn:
         await conn.set_autocommit(True)
         await processor.insert_relationships(conn, ARTIST, "artist", [_relationship(KEPT_TARGET, "member of band")])
         await processor.insert_external_links(conn, ARTIST, "artist", links)
 
-    await _age_every_row(reconciliation_pool)
-    started_at = await _now(reconciliation_pool)
+    await _age_every_row(promoted_schema_pool)
+    started_at = await _now(promoted_schema_pool)
 
-    async with reconciliation_pool.connection() as conn:
+    async with promoted_schema_pool.connection() as conn:
         await conn.set_autocommit(True)
         await processor.insert_relationships(conn, ARTIST, "artist", [_relationship(KEPT_TARGET, "member of band")])
         await processor.insert_external_links(conn, ARTIST, "artist", links)
 
-    deleted = await _latched(reconciliation_pool, started_at).purge()
+    deleted = await _latched(promoted_schema_pool, started_at).purge()
 
     assert deleted == {RELATIONSHIPS: 0, EXTERNAL_LINKS: 0}
-    assert await _relationship_targets(reconciliation_pool) == {KEPT_TARGET}
+    assert await _relationship_targets(promoted_schema_pool) == {KEPT_TARGET}
 
 
 async def test_a_backward_relationship_refreshes_the_canonical_row(
-    reconciliation_pool: AsyncPostgreSQLPool,
+    promoted_schema_pool: AsyncPostgreSQLPool,
 ) -> None:
     """Seeing a relationship only from its backward side still saves it from the purge.
 
@@ -370,15 +368,15 @@ async def test_a_backward_relationship_refreshes_the_canonical_row(
     and the purge would delete the first as stale.
     """
     processor = _processor()
-    async with reconciliation_pool.connection() as conn:
+    async with promoted_schema_pool.connection() as conn:
         await conn.set_autocommit(True)
         # First seen from BACKWARD_TARGET's own message, in the forward direction.
         await processor.insert_relationships(conn, BACKWARD_TARGET, "artist", [_relationship(ARTIST, "member of band")])
 
-    await _age_every_row(reconciliation_pool)
-    started_at = await _now(reconciliation_pool)
+    await _age_every_row(promoted_schema_pool)
+    started_at = await _now(promoted_schema_pool)
 
-    async with reconciliation_pool.connection() as conn:
+    async with promoted_schema_pool.connection() as conn:
         await conn.set_autocommit(True)
         # This extraction only sees it from ARTIST's message, reported backward.
         await processor.insert_relationships(
@@ -388,24 +386,24 @@ async def test_a_backward_relationship_refreshes_the_canonical_row(
             [_relationship(BACKWARD_TARGET, "member of band", direction="backward")],
         )
 
-    async with reconciliation_pool.connection() as conn:
+    async with promoted_schema_pool.connection() as conn:
         cursor = await conn.execute("SELECT count(*) FROM musicbrainz.relationships")
         row = await cursor.fetchone()
     assert row is not None
     assert row[0] == 1, "the backward report must refresh the canonical row, not insert a second one"
 
-    deleted = await _latched(reconciliation_pool, started_at).purge()
+    deleted = await _latched(promoted_schema_pool, started_at).purge()
 
     assert deleted[RELATIONSHIPS] == 0
-    assert await _relationship_targets(reconciliation_pool) == {ARTIST}
+    assert await _relationship_targets(promoted_schema_pool) == {ARTIST}
 
 
 async def test_the_delete_fraction_cap_refuses_a_whole_table_shrink(
-    reconciliation_pool: AsyncPostgreSQLPool,
+    promoted_schema_pool: AsyncPostgreSQLPool,
 ) -> None:
     """Nothing is refreshed this extraction, so the cap must stop the tables being emptied."""
     processor = _processor()
-    async with reconciliation_pool.connection() as conn:
+    async with promoted_schema_pool.connection() as conn:
         await conn.set_autocommit(True)
         await processor.insert_relationships(
             conn,
@@ -414,19 +412,19 @@ async def test_the_delete_fraction_cap_refuses_a_whole_table_shrink(
             [_relationship(KEPT_TARGET, "member of band"), _relationship(REMOVED_TARGET, "collaboration")],
         )
 
-    await _age_every_row(reconciliation_pool)
-    started_at = await _now(reconciliation_pool)
+    await _age_every_row(promoted_schema_pool)
+    started_at = await _now(promoted_schema_pool)
 
-    deleted = await _latched(reconciliation_pool, started_at).purge()
+    deleted = await _latched(promoted_schema_pool, started_at).purge()
 
     assert deleted[RELATIONSHIPS] == 0
-    assert await _relationship_targets(reconciliation_pool) == {KEPT_TARGET, REMOVED_TARGET}
+    assert await _relationship_targets(promoted_schema_pool) == {KEPT_TARGET, REMOVED_TARGET}
 
 
-async def test_the_purge_is_idempotent(reconciliation_pool: AsyncPostgreSQLPool) -> None:
+async def test_the_purge_is_idempotent(promoted_schema_pool: AsyncPostgreSQLPool) -> None:
     """A second pass over the reconciled tables deletes nothing more."""
     processor = _processor()
-    async with reconciliation_pool.connection() as conn:
+    async with promoted_schema_pool.connection() as conn:
         await conn.set_autocommit(True)
         await processor.insert_relationships(
             conn,
@@ -439,10 +437,10 @@ async def test_the_purge_is_idempotent(reconciliation_pool: AsyncPostgreSQLPool)
             ],
         )
 
-    await _age_every_row(reconciliation_pool)
-    started_at = await _now(reconciliation_pool)
+    await _age_every_row(promoted_schema_pool)
+    started_at = await _now(promoted_schema_pool)
 
-    async with reconciliation_pool.connection() as conn:
+    async with promoted_schema_pool.connection() as conn:
         await conn.set_autocommit(True)
         await processor.insert_relationships(
             conn,
@@ -451,21 +449,21 @@ async def test_the_purge_is_idempotent(reconciliation_pool: AsyncPostgreSQLPool)
             [_relationship(KEPT_TARGET, "member of band"), _relationship(BACKWARD_TARGET, "supporting musician")],
         )
 
-    purge = _latched(reconciliation_pool, started_at)
+    purge = _latched(promoted_schema_pool, started_at)
     assert (await purge.purge())[RELATIONSHIPS] == 1
 
     # Re-collecting the same extraction's signals must not delete anything further.
-    replayed = _latched(reconciliation_pool, started_at)
+    replayed = _latched(promoted_schema_pool, started_at)
     assert (await replayed.purge())[RELATIONSHIPS] == 0
-    assert await _relationship_targets(reconciliation_pool) == {KEPT_TARGET, BACKWARD_TARGET}
+    assert await _relationship_targets(promoted_schema_pool) == {KEPT_TARGET, BACKWARD_TARGET}
 
 
 async def test_a_dead_letter_vetoes_the_purge_against_a_real_table(
-    reconciliation_pool: AsyncPostgreSQLPool,
+    promoted_schema_pool: AsyncPostgreSQLPool,
 ) -> None:
     """A vetoed extraction must leave every row in place, stale or not."""
     processor = _processor()
-    async with reconciliation_pool.connection() as conn:
+    async with promoted_schema_pool.connection() as conn:
         await conn.set_autocommit(True)
         await processor.insert_relationships(
             conn,
@@ -474,26 +472,26 @@ async def test_a_dead_letter_vetoes_the_purge_against_a_real_table(
             [_relationship(KEPT_TARGET, "member of band"), _relationship(REMOVED_TARGET, "collaboration")],
         )
 
-    await _age_every_row(reconciliation_pool)
-    started_at = await _now(reconciliation_pool)
+    await _age_every_row(promoted_schema_pool)
+    started_at = await _now(promoted_schema_pool)
 
-    async with reconciliation_pool.connection() as conn:
+    async with promoted_schema_pool.connection() as conn:
         await conn.set_autocommit(True)
         await processor.insert_relationships(conn, ARTIST, "artist", [_relationship(KEPT_TARGET, "member of band")])
 
-    purge = _latched(reconciliation_pool, started_at)
+    purge = _latched(promoted_schema_pool, started_at)
     purge.record_dead_letter("artists")
 
     assert await purge.purge() == {}
-    assert await _relationship_targets(reconciliation_pool) == {KEPT_TARGET, REMOVED_TARGET}
+    assert await _relationship_targets(promoted_schema_pool) == {KEPT_TARGET, REMOVED_TARGET}
 
 
 async def test_a_writer_without_the_refresh_leaves_rows_looking_stale(
-    reconciliation_pool: AsyncPostgreSQLPool,
+    promoted_schema_pool: AsyncPostgreSQLPool,
 ) -> None:
     """Proves the conditional clause is what saves live rows, not the purge's own logic."""
     unrefreshing = MusicBrainzRecordProcessor(PostgreSQLMusicBrainzWriter(), _NullObserver(), lambda record: record)
-    async with reconciliation_pool.connection() as conn:
+    async with promoted_schema_pool.connection() as conn:
         await conn.set_autocommit(True)
         await unrefreshing.insert_relationships(
             conn,
@@ -502,14 +500,14 @@ async def test_a_writer_without_the_refresh_leaves_rows_looking_stale(
             [_relationship(KEPT_TARGET, "member of band"), _relationship(REMOVED_TARGET, "collaboration")],
         )
 
-    await _age_every_row(reconciliation_pool)
-    started_at = await _now(reconciliation_pool)
+    await _age_every_row(promoted_schema_pool)
+    started_at = await _now(promoted_schema_pool)
 
-    async with reconciliation_pool.connection() as conn:
+    async with promoted_schema_pool.connection() as conn:
         await conn.set_autocommit(True)
         await unrefreshing.insert_relationships(conn, ARTIST, "artist", [_relationship(KEPT_TARGET, "member of band")])
 
-    async with reconciliation_pool.connection() as conn:
+    async with promoted_schema_pool.connection() as conn:
         cursor = await conn.execute("SELECT count(*) FROM musicbrainz.relationships WHERE updated_at < %s", (started_at,))
         row = await cursor.fetchone()
     assert row is not None
@@ -517,7 +515,7 @@ async def test_a_writer_without_the_refresh_leaves_rows_looking_stale(
 
 
 async def test_the_probe_rejects_a_column_declared_with_a_narrower_type(
-    reconciliation_pool: AsyncPostgreSQLPool,
+    promoted_schema_pool: AsyncPostgreSQLPool,
 ) -> None:
     """A `date` column passes a name-only probe and then deletes live rows.
 
@@ -526,32 +524,32 @@ async def test_the_probe_rejects_a_column_declared_with_a_narrower_type(
     taken earlier the same day. This asserts against a real server that the probe
     refuses the column rather than enabling a purge that would silently delete it.
     """
-    async with reconciliation_pool.connection() as conn:
+    async with promoted_schema_pool.connection() as conn:
         await conn.set_autocommit(True)
         for table in (RELATIONSHIPS, EXTERNAL_LINKS):
             await conn.execute(f"ALTER TABLE {table} ALTER COLUMN updated_at TYPE DATE")
 
     try:
-        assert await reconciliation_columns_present(reconciliation_pool, logger) is False
+        assert await reconciliation_columns_present(promoted_schema_pool, logger) is False
     finally:
-        async with reconciliation_pool.connection() as conn:
+        async with promoted_schema_pool.connection() as conn:
             await conn.set_autocommit(True)
             for table in (RELATIONSHIPS, EXTERNAL_LINKS):
                 await conn.execute(f"ALTER TABLE {table} ALTER COLUMN updated_at TYPE TIMESTAMPTZ")
 
 
 async def test_a_truncating_column_would_have_deleted_a_live_row(
-    reconciliation_pool: AsyncPostgreSQLPool,
+    promoted_schema_pool: AsyncPostgreSQLPool,
 ) -> None:
     """Shows the loss the probe prevents, so the type check is not merely cosmetic."""
     processor = _processor()
-    async with reconciliation_pool.connection() as conn:
+    async with promoted_schema_pool.connection() as conn:
         await conn.set_autocommit(True)
         for table in (RELATIONSHIPS, EXTERNAL_LINKS):
             await conn.execute(f"ALTER TABLE {table} ALTER COLUMN updated_at TYPE DATE")
 
     try:
-        async with reconciliation_pool.connection() as conn:
+        async with promoted_schema_pool.connection() as conn:
             await conn.set_autocommit(True)
             await processor.insert_relationships(conn, ARTIST, "artist", [_relationship(KEPT_TARGET, "member of band")])
             # A boundary later in the same day than the truncated refresh.
@@ -567,18 +565,18 @@ async def test_a_truncating_column_would_have_deleted_a_live_row(
         assert stale is not None
         assert stale[0] == 1, "a truncated updated_at reads as stale, which is what the probe refuses to enable"
     finally:
-        async with reconciliation_pool.connection() as conn:
+        async with promoted_schema_pool.connection() as conn:
             await conn.set_autocommit(True)
             for table in (RELATIONSHIPS, EXTERNAL_LINKS):
                 await conn.execute(f"ALTER TABLE {table} ALTER COLUMN updated_at TYPE TIMESTAMPTZ")
 
 
 async def test_a_repeated_signal_at_a_vetoed_boundary_leaves_every_row_in_place(
-    reconciliation_pool: AsyncPostgreSQLPool,
+    promoted_schema_pool: AsyncPostgreSQLPool,
 ) -> None:
     """At-least-once delivery must not defeat the dead-letter veto on a real table."""
     processor = _processor()
-    async with reconciliation_pool.connection() as conn:
+    async with promoted_schema_pool.connection() as conn:
         await conn.set_autocommit(True)
         await processor.insert_relationships(
             conn,
@@ -587,14 +585,14 @@ async def test_a_repeated_signal_at_a_vetoed_boundary_leaves_every_row_in_place(
             [_relationship(KEPT_TARGET, "member of band"), _relationship(REMOVED_TARGET, "collaboration")],
         )
 
-    await _age_every_row(reconciliation_pool)
-    started_at = await _now(reconciliation_pool)
+    await _age_every_row(promoted_schema_pool)
+    started_at = await _now(promoted_schema_pool)
 
-    async with reconciliation_pool.connection() as conn:
+    async with promoted_schema_pool.connection() as conn:
         await conn.set_autocommit(True)
         await processor.insert_relationships(conn, ARTIST, "artist", [_relationship(KEPT_TARGET, "member of band")])
 
-    purge = _latched(reconciliation_pool, started_at)
+    purge = _latched(promoted_schema_pool, started_at)
     purge.record_dead_letter("artists")
     assert await purge.purge() == {}
 
@@ -603,4 +601,95 @@ async def test_a_repeated_signal_at_a_vetoed_boundary_leaves_every_row_in_place(
         purge.record_completion(data_type, _signal(started_at))
 
     assert await purge.purge() == {}
-    assert await _relationship_targets(reconciliation_pool) == {KEPT_TARGET, REMOVED_TARGET}
+    assert await _relationship_targets(promoted_schema_pool) == {KEPT_TARGET, REMOVED_TARGET}
+
+
+# One record per MusicBrainz entity kind, so the import below is a *full* one: all
+# four kinds write into the same two child tables, which is the whole reason the
+# purge waits for four `extraction_complete` signals before it fires.
+LABEL = str(uuid.UUID(int=0x1ABE1))
+RELEASE_GROUP = str(uuid.UUID(int=0x69))
+RELEASE = str(uuid.UUID(int=0x4E1EA5E))
+
+
+def _full_import(*, carrying_the_removed_relationship: bool) -> list[tuple[str, dict[str, Any]]]:
+    """One record per entity kind, optionally still naming the relationship upstream drops."""
+    artist_relations = [_relationship(KEPT_TARGET, "member of band")]
+    if carrying_the_removed_relationship:
+        artist_relations.append(_relationship(REMOVED_TARGET, "collaboration"))
+
+    return [
+        ("artists", {"id": ARTIST, "mbid": ARTIST, "name": "Reconciled Artist", "relations": artist_relations}),
+        ("labels", {"id": LABEL, "mbid": LABEL, "name": "Reconciled Label", "relations": [_relationship(KEPT_TARGET, "label founder")]}),
+        (
+            "release-groups",
+            {"id": RELEASE_GROUP, "mbid": RELEASE_GROUP, "name": "Reconciled Group", "relations": [_relationship(ARTIST, "tribute")]},
+        ),
+        (
+            "releases",
+            {
+                "id": RELEASE,
+                "mbid": RELEASE,
+                "name": "Reconciled Release",
+                "media_raw": [{"format": '12" Vinyl', "position": 1, "track_count": 9}],
+                "relations": [_relationship(ARTIST, "supporting musician")],
+            },
+        ),
+    ]
+
+
+async def _run_import(pool: AsyncPostgreSQLPool, processor: MusicBrainzRecordProcessor, records: list[tuple[str, dict[str, Any]]]) -> None:
+    """Write every record through the same per-message transaction the service uses."""
+    handlers = {
+        "artists": processor.process_artist,
+        "labels": processor.process_label,
+        "release-groups": processor.process_release_group,
+        "releases": processor.process_release,
+    }
+    for data_type, record in records:
+        async with pool.connection() as conn:
+            await conn.set_autocommit(False)
+            async with conn.transaction():
+                await handlers[data_type](conn, record)
+
+
+async def test_the_promoted_schema_enables_the_purge_and_a_removed_relationship_disappears(
+    promoted_schema_pool: AsyncPostgreSQLPool,
+) -> None:
+    """The acceptance case for the promoted pin, with nothing about it stubbed.
+
+    No DDL is issued: the column comes from the schema the pin now names. The probe
+    answers against that schema, and its answer -- not a hardcoded ``True`` -- is what
+    arms the writer, exactly as ``main`` does at startup. Then a full import of all
+    four entity kinds runs twice, the second pass no longer naming one of the artist's
+    relationships, and the purge deletes that row and only that row.
+    """
+    enabled = await reconciliation_columns_present(promoted_schema_pool, logger)
+    assert enabled is True, "the promoted schema must satisfy the startup probe"
+
+    writer = PostgreSQLMusicBrainzWriter()
+    writer.set_refresh_updated_at(enabled)
+    assert writer.refresh_updated_at is True
+    processor = MusicBrainzRecordProcessor(writer, _NullObserver(), map_musicbrainz_release)
+
+    await _run_import(promoted_schema_pool, processor, _full_import(carrying_the_removed_relationship=True))
+    assert await _relationship_targets(promoted_schema_pool) >= {KEPT_TARGET, REMOVED_TARGET}
+
+    # Everything written so far belongs to the extraction that is now finished with.
+    await _age_every_row(promoted_schema_pool)
+    started_at = await _now(promoted_schema_pool)
+
+    # The next extraction's dump no longer carries the collaboration.
+    await _run_import(promoted_schema_pool, processor, _full_import(carrying_the_removed_relationship=False))
+
+    purge = StaleChildRowPurge(promoted_schema_pool, logger)
+    for data_type in DATA_TYPES[:-1]:
+        purge.record_completion(data_type, _signal(started_at))
+        assert not purge.is_latched(), "the purge must wait for every entity kind"
+        assert await purge.purge() == {}, "an unlatched purge must delete nothing"
+
+    purge.record_completion(DATA_TYPES[-1], _signal(started_at))
+    deleted = await purge.purge()
+
+    assert deleted[RELATIONSHIPS] == 1
+    assert await _relationship_targets(promoted_schema_pool) == {KEPT_TARGET, ARTIST}

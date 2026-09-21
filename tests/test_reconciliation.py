@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from common import DeliveryResult, Settlement
+from psycopg.errors import IntegrityError
 
 import brainztableinator.brainztableinator as service
 from brainztableinator._persistence import PostgreSQLMusicBrainzWriter
@@ -816,12 +817,50 @@ class TestServiceLatching:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A non-UUID id is rejected to the DLQ, which must veto this run's purge."""
+        """A non-UUID id is rejected to the DLQ, which must veto this run's purge.
+
+        The mark is recorded twice, and deliberately: once by ``_reject`` before the
+        broker is told, which is what closes the window a concurrent signal could latch
+        in, and once after ``run_delivery`` returns, which is the only mark a rejection
+        the classifier produced would ever get. The real purge holds a set, so the
+        repeat costs nothing; the double-entry list here is what makes the order
+        visible.
+        """
         purge = _RecordingPurge()
         monkeypatch.setattr(service, "stale_row_purge", purge)
         monkeypatch.setattr(service, "shutdown_requested", False)
         message = AsyncMock()
         message.body = b'{"id": "not-a-uuid", "name": "Artist"}'
+        message.headers = {}
+
+        result = await service.on_data_message(message, "artists")
+
+        assert result.settlement is Settlement.REJECT
+        assert purge.dead_lettered_types == ["artists", "artists"]
+
+    @pytest.mark.asyncio
+    async def test_a_rejection_the_classifier_produced_is_recorded_too(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mock_async_pool: MagicMock,
+    ) -> None:
+        """An IntegrityError never reaches ``_reject``, so only the later mark fires.
+
+        This is why the mark after ``run_delivery`` cannot simply be dropped in favour
+        of the early one: the classifier turns a deterministic database error into a
+        rejection the handler itself never returned.
+        """
+        purge = _RecordingPurge()
+        monkeypatch.setattr(service, "stale_row_purge", purge)
+        monkeypatch.setattr(service, "shutdown_requested", False)
+        monkeypatch.setattr(service, "connection_pool", mock_async_pool)
+        monkeypatch.setitem(
+            service.PROCESSORS,
+            "artists",
+            AsyncMock(side_effect=IntegrityError("duplicate key value violates unique constraint")),
+        )
+        message = AsyncMock()
+        message.body = b'{"id": "0e2b0f6e-0000-4000-8000-000000000000", "name": "Artist"}'
         message.headers = {}
 
         result = await service.on_data_message(message, "artists")
@@ -860,3 +899,64 @@ class TestServiceLatching:
         result = await service._handle_data_message(_extraction_complete_message(), "releases")
 
         assert result == DeliveryResult(Settlement.ACK, "skipped")
+
+
+class TestTheDeadLetterVetoIsRecordedBeforeSettlement:
+    """The veto and the nack must not be two steps a concurrent signal can slip between.
+
+    With a prefetch above one, an ``extraction_complete`` delivery runs concurrently
+    with record deliveries. If the mark were recorded only after the broker had been
+    told, a signal latching in that window would purge the very rows the rejected
+    record's veto exists to protect. ``_reject`` marks first; these assert the order
+    rather than merely the outcome.
+    """
+
+    @pytest.mark.parametrize(
+        ("body", "data_type", "error_type"),
+        [
+            pytest.param(b"{not json", "artists", "JSONDecodeError", id="unparseable body"),
+            pytest.param(b'{"name": "no id"}', "artists", "ValidationError", id="missing id"),
+            pytest.param(b'{"id": ""}', "artists", "ValidationError", id="empty id"),
+            pytest.param(b'{"id": "not-a-uuid"}', "artists", "ValidationError", id="non-UUID id"),
+            pytest.param(b'{"id": "0e2b0f6e-0000-4000-8000-000000000000"}', "sleeves", "UnknownEntity", id="unknown entity"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_every_rejection_marks_the_veto_before_the_broker_is_told(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        body: bytes,
+        data_type: str,
+        error_type: str,
+    ) -> None:
+        purge = StaleChildRowPurge(MagicMock(), MagicMock())
+        monkeypatch.setattr(service, "stale_row_purge", purge)
+        monkeypatch.setattr(service, "shutdown_requested", False)
+
+        marked_when_settled: list[frozenset[str]] = []
+        message = AsyncMock()
+        message.body = body
+        message.headers = {}
+        message.nack.side_effect = lambda **_kwargs: marked_when_settled.append(purge.dead_lettered)
+
+        result = await service.on_data_message(message, data_type)
+
+        assert result == DeliveryResult(Settlement.REJECT, "failed", error_type)
+        message.nack.assert_awaited_once_with(requeue=False)
+        assert marked_when_settled == [frozenset({data_type})], "the veto must already exist when the delivery is nacked"
+        assert purge.dead_lettered == frozenset({data_type})
+
+    @pytest.mark.asyncio
+    async def test_a_rejection_without_a_purge_still_settles(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The probe found no column, so there is nothing to veto and nothing to fail on."""
+        monkeypatch.setattr(service, "stale_row_purge", None)
+        monkeypatch.setattr(service, "shutdown_requested", False)
+
+        message = AsyncMock()
+        message.body = b'{"name": "no id"}'
+        message.headers = {}
+
+        result = await service.on_data_message(message, "artists")
+
+        assert result == DeliveryResult(Settlement.REJECT, "failed", "ValidationError")
+        message.nack.assert_awaited_once_with(requeue=False)
