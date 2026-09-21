@@ -155,6 +155,12 @@ just test-integration
 PostgreSQL container. Set `TEST_DATABASE_URL` to use an already provisioned disposable test
 database instead.
 
+`just test-parity` is the one lane that needs a second engine. It feeds the same fixture
+events to this loader's PostgreSQL and to a pinned `musicbrainz-graph-enricher`'s Neo4j,
+then compares the two graphs per edge label against a registry of the differences that
+remain and why. It starts and removes both containers itself, and is outside `just check`
+and outside CI. See [Cross-store parity with the graph enricher](docs/store-parity.md).
+
 `just check` is credential-free: PostgreSQL and RabbitMQ boundaries are mocked. The
 operator-facing recipe surface is:
 
@@ -167,6 +173,7 @@ operator-facing recipe surface is:
 | `just typecheck` | Type-check the Python source and tests. |
 | `just test` / `just coverage` | Run the same unit and regression suite with coverage; CI uses `coverage`. |
 | `just test-integration` | Exercise delivery settlement and transactions against disposable PostgreSQL. |
+| `just test-parity` | Compare this loader's edges with the graph enricher's, in disposable PostgreSQL and Neo4j. |
 | `just secret-scan` | Scan Git history and the working tree with Gitleaks. |
 | `just build` | Build the wheel and source distribution. |
 | `just install-check` | Build, then verify the wheel in an isolated environment. |

@@ -41,6 +41,7 @@ from orjson import loads
 from psycopg.errors import DataError, IntegrityError, InterfaceError, OperationalError
 
 from brainztableinator._persistence import PostgreSQLMusicBrainzWriter
+from brainztableinator._reconciliation import StaleChildRowPurge, reconciliation_columns_present
 from brainztableinator._record_processing import MusicBrainzRecordProcessor
 from brainztableinator.config import MusicBrainzSQLLoaderConfig
 from brainztableinator.queue_names import (
@@ -316,8 +317,12 @@ class _RuntimeBatchObserver:
         _set_span_outcome(span, outcome)
 
 
+# Held by name so the startup probe can turn the delete-reconciliation column's
+# refresh on; the writer emits no reference to a column the schema has not declared.
+_persistence_writer = PostgreSQLMusicBrainzWriter()
+
 _record_processor = MusicBrainzRecordProcessor(
-    PostgreSQLMusicBrainzWriter(),
+    _persistence_writer,
     _RuntimeBatchObserver(),
     map_musicbrainz_release,
 )
@@ -433,6 +438,11 @@ idle_mode = False
 connection_params: dict[str, Any] = {}
 
 connection_pool: AsyncPostgreSQLPool | None = None
+
+# Built in main() once the pool is up, because it needs both the pool and a run start
+# read from the database clock. None until then, which is what makes every consumer of
+# it a no-op in the unit suite and in any process that never reached a live database.
+stale_row_purge: StaleChildRowPurge | None = None
 
 rabbitmq_manager: Any = None  # Will hold AsyncResilientRabbitMQ instance
 active_connection: Any = None  # Current active connection
@@ -850,13 +860,69 @@ def make_data_handler(
     return handler
 
 
+async def _reconcile_deleted_child_rows(data_type: str, data: dict[str, Any]) -> bool:
+    """Reconcile the child-row tables once every entity type has signalled completion.
+
+    ``musicbrainz.relationships`` and ``musicbrainz.external_links`` are written by all
+    four entity kinds, so the purge cannot fire on the first ``extraction_complete`` —
+    it would delete every row the other three kinds have not sent yet. The boundary and
+    the per-type record counts both come from the message, never from this process, so a
+    restart cannot move them; see the ``_reconciliation`` module docstring. Returns
+    ``False`` only when the reconciliation was attempted and failed, which is the one
+    case the signal must be requeued for.
+    """
+    purge = stale_row_purge
+    if purge is None:
+        return True
+
+    purge.record_completion(data_type, data)
+    if not purge.is_latched():
+        logger.info(
+            "⏳ Deferring MusicBrainz delete-reconciliation until every entity type completes",
+            signalled=sorted(purge.signalled),
+            pending=purge.pending_data_types(),
+            boundary=purge.boundary.isoformat() if purge.boundary else None,
+        )
+        return True
+
+    try:
+        await purge.purge()
+    except Exception as error:
+        logger.error(
+            "❌ Delete-reconciliation failed, requeueing extraction_complete",
+            error=str(error),
+        )
+        return False
+    return True
+
+
+def _reject(data_type: str, error_type: str) -> DeliveryResult:
+    """Reject a delivery to the dead-letter queue, vetoing the reconciliation first.
+
+    The veto is recorded here rather than only after ``run_delivery`` returns because
+    settlement and the mark are otherwise two steps with a gap between them: with a
+    prefetch above one, an ``extraction_complete`` delivery running concurrently can
+    latch and purge in that gap, after this record was nacked and before the mark that
+    protects it exists. Marking before the broker is told closes the window for every
+    rejection this function names. ``on_data_message`` still marks afterwards, because
+    the shared classifier can turn a raised failure into a rejection this function never
+    sees; the mark is a set membership, so recording it twice costs nothing.
+
+    A mark can only ever *skip* a purge, never widen one, so recording one early is the
+    safe direction to be wrong in.
+    """
+    if stale_row_purge is not None:
+        stale_row_purge.record_dead_letter(data_type)
+    return DeliveryResult(Settlement.REJECT, "failed", error_type)
+
+
 async def _handle_data_message(message: AbstractIncomingMessage, data_type: str) -> DeliveryResult:
     """Run one local transaction and return settlement intent without touching the broker."""
     try:
         data: dict[str, Any] = loads(message.body)
     except Exception as error:
         logger.error("❌ Failed to parse message", error=str(error))
-        return DeliveryResult(Settlement.REJECT, "failed", type(error).__name__)
+        return _reject(data_type, type(error).__name__)
 
     if data.get("type") == "file_complete":
         total_processed = data.get("total_processed", 0)
@@ -873,18 +939,25 @@ async def _handle_data_message(message: AbstractIncomingMessage, data_type: str)
             version=data.get("version"),
         )
         completed_files.add(data_type)
+        if not await _reconcile_deleted_child_rows(data_type, data):
+            # The reconciliation is this run's only chance to remove rows dropped
+            # upstream, so a failure requeues the signal rather than acking past it.
+            # Completion is withdrawn with it: the signal is still pending, and idle
+            # detection must not treat this type as finished while it is.
+            completed_files.discard(data_type)
+            return DeliveryResult(Settlement.REQUEUE, "failed", "ReconciliationFailed")
         if CONSUMER_CANCEL_DELAY > 0 and data_type in queues:
             await schedule_consumer_cancellation(data_type, queues[data_type])
         return DeliveryResult(Settlement.ACK, "skipped")
 
     if "id" not in data:
         logger.error("❌ Message missing 'id' field", data=data)
-        return DeliveryResult(Settlement.REJECT, "failed", "ValidationError")
+        return _reject(data_type, "ValidationError")
 
     data_id: str = data["id"]
     if not data_id:
         logger.warning("⚠️ Nacking record with empty mbid/id", data_type=data_type)
-        return DeliveryResult(Settlement.REJECT, "failed", "ValidationError")
+        return _reject(data_type, "ValidationError")
 
     try:
         uuid.UUID(data_id)
@@ -894,12 +967,12 @@ async def _handle_data_message(message: AbstractIncomingMessage, data_type: str)
             data_type=data_type,
             data_id=data_id,
         )
-        return DeliveryResult(Settlement.REJECT, "failed", "ValidationError")
+        return _reject(data_type, "ValidationError")
 
     processor = PROCESSORS.get(data_type)
     if processor is None:
         logger.error("❌ No processor for data type", data_type=data_type)
-        return DeliveryResult(Settlement.REJECT, "failed", "UnknownEntity")
+        return _reject(data_type, "UnknownEntity")
 
     record_name = data.get("name", "Unknown")
     logger.debug(
@@ -951,6 +1024,12 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> D
         headers=message.headers,
         wait_before_requeue=classifier.wait_before_requeue,
     )
+    if result.settlement is Settlement.REJECT and stale_row_purge is not None:
+        # A rejected delivery is dead-lettered with its row never upserted, so that
+        # row's updated_at was never refreshed even though the record is still present
+        # upstream. Purging on top of that would delete a still-current record beyond
+        # the dead-letter queue, so any rejection this run vetoes the reconciliation.
+        stale_row_purge.record_dead_letter(data_type)
     if result.settlement is Settlement.ACK and result.outcome == "processed":
         outage_backoff.reset()
         if data_type in message_counts:
@@ -1050,6 +1129,7 @@ async def progress_reporter() -> None:
 async def main() -> None:
     """Main entry point for the MusicBrainz SQL loader service."""
     global connection_pool, config, connection_params, queues, rabbitmq_manager, active_connection, active_channel, connection_check_task
+    global stale_row_purge
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -1108,6 +1188,19 @@ async def main() -> None:
     except Exception as e:
         logger.error("❌ Failed to initialize connection pool", error=str(e))
         return
+
+    # Delete-reconciliation is maintenance, not ingestion, and this loader issues no DDL:
+    # it probes for the column groovemap-database-schema owns and stays off until it is
+    # there. Both the probe answering False and the probe itself failing leave
+    # `stale_row_purge` None, so every call site no-ops, the upserts emit no reference to
+    # a column the schema has not declared, and the loader keeps loading either way.
+    stale_row_purge = None
+    try:
+        if await reconciliation_columns_present(connection_pool, logger):
+            _persistence_writer.set_refresh_updated_at(True)
+            stale_row_purge = StaleChildRowPurge(connection_pool, logger)
+    except Exception as e:
+        logger.error("❌ Delete-reconciliation unavailable this run", error=str(e))
 
     print(STARTUP_BANNER)
 

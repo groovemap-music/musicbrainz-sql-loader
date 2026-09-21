@@ -7,8 +7,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PERSISTENCE_PRODUCER_COMMIT = "03e8aba11f72d26237f7dfbbecf234ae9437e85e"
-APPLICATION_RUNTIME_COMMIT = "e372b6a7598ae31ee6578fdff39bc920bedd7136"
+PERSISTENCE_PRODUCER_COMMIT = "06629c6a7681127f74995bbae638ba048e2abd6d"
+APPLICATION_RUNTIME_COMMIT = "6e84fe9acfd9551bd3bba2f2e78fef0ec1ef38ef"
 
 
 def digest(path: Path) -> str:

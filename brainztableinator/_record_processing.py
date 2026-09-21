@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 import structlog
 from common.identifiers import alias_refs_for_release
 from common.identity import AliasRef, attach_aliases, resolve_aliases
+from common.media import medium_label
 
 
 if TYPE_CHECKING:
@@ -115,6 +116,84 @@ def _life_span(record: dict[str, Any]) -> dict[str, Any]:
 def _canonical_entity_type(entity_type: str) -> str:
     """Normalize the legacy producer spelling used by in-flight or DLQ events."""
     return _ENTITY_TYPE_ALIASES.get(entity_type, entity_type)
+
+
+# ── The MusicBrainz half of graph.issued_on ──────────────────────────────────
+# Everything from here to `media_edge_rows` derives the shared media relations
+# exactly as brainzgraphinator — the MusicBrainz graph enricher — derives the
+# `:Medium` nodes and `[:ISSUED_ON]` edges it writes into Neo4j, so a release
+# projects to the same media, under the same key, with the same quantity in both
+# stores. The functions mirrored are `media_edge_rows`, `_medium_label`, and
+# `reconcile_release_media` in `brainzgraphinator/_projections.py`, together with
+# `MEDIA_SOURCE` and the two Cypher statements those run.
+#
+# The same rows are also what `groovemap_schema.postgres` projects out of the
+# stored media block: `_MEDIA_SOURCE`'s `musicbrainz` branch unnests
+# `musicbrainz.releases.media -> 'items'` and the `issued_on` body groups it by
+# `(release_id, medium_id, provider)` summing `qty`. This module writes the rows
+# that projection would produce for the document it is writing in the same
+# transaction, which is what keeps the dual write and the bootstrap fill in
+# agreement rather than merely adjacent.
+MEDIA_SOURCE = "musicbrainz"
+
+# The quantity rule, from the same two places. brainzgraphinator keeps a `qty`
+# that is a non-boolean `int` of at least one and defaults everything else to
+# one. The nine-digit ceiling is the schema's addition, not the enricher's:
+# `_MEDIUM_QUANTITY` bounds the value it casts so a pathological quantity
+# defaults rather than overflowing, and `graph.issued_on.qty` is the same
+# `bigint` column here, so the bound is kept rather than left to the column.
+_MAX_MEDIUM_QUANTITY = 999_999_999
+
+
+def _medium_quantity(value: object) -> int:
+    """Return one media entry's unit count, defaulting to one."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 1
+    return value if 1 <= value <= _MAX_MEDIUM_QUANTITY else 1
+
+
+def _medium_label(medium_id: str) -> str:
+    """Return a medium's taxonomy label, falling back to its id.
+
+    `medium_label` raises `KeyError` for an id the vendored vocabulary does not hold, which a
+    block written under an older taxonomy version can still carry. The enricher falls back to
+    the id itself, and so does `graph.medium_label`, whose `CASE` ends in `ELSE medium_id`.
+    """
+    try:
+        return medium_label(medium_id)
+    except KeyError:
+        return medium_id
+
+
+def media_edge_rows(media: dict[str, Any]) -> list[dict[str, Any]]:
+    """Collapse a canonical media block into one deterministic row per canonical medium.
+
+    Two format entries that resolve to the same medium — a 2xLP the provider states as two
+    entries — are one edge whose quantity is their sum, which is what the enricher's
+    `media_edge_rows` does and what the schema's `issued_on` body does with its `GROUP BY ...
+    SUM(media.qty)`. An entry whose medium or family is missing, not a string, or empty
+    contributes nothing: the enricher drops a non-string, and the schema's `_MEDIA_SOURCE`
+    drops an empty one through `_non_empty`, so requiring both holds either rule.
+
+    Rows come back ordered by medium id. The enricher returns them in first-seen order, which
+    is equivalent for a set of rows keyed on the medium; sorting makes the statements this
+    feeds take the vocabulary's row locks in one order across concurrent messages.
+    """
+    rows: dict[str, dict[str, Any]] = {}
+    for item in media.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        medium_id = item.get("medium")
+        family = item.get("family")
+        if not isinstance(medium_id, str) or not medium_id or not isinstance(family, str) or not family:
+            continue
+        quantity = _medium_quantity(item.get("qty"))
+        row = rows.get(medium_id)
+        if row is None:
+            rows[medium_id] = {"medium": medium_id, "family": family, "label": _medium_label(medium_id), "qty": quantity}
+        else:
+            row["qty"] += quantity
+    return [rows[medium_id] for medium_id in sorted(rows)]
 
 
 class MusicBrainzRecordProcessor:
@@ -298,6 +377,53 @@ class MusicBrainzRecordProcessor:
             }
         )
 
+    async def write_release_media(self, conn: Any, record: dict[str, Any], media: dict[str, Any]) -> bool:
+        """Write this release's half of `graph.issued_on` and top up the shared media vocabulary.
+
+        Answers whether media was written, so a caller can count what it skipped.
+
+        **The release key.** The graph keys a release on its Discogs id:
+        `graph.release.release_id` is `public.releases.data_id` as text, and the schema's own
+        projection of these rows reaches the MusicBrainz side through
+        `musicbrainz.releases.discogs_release_id`. A MusicBrainz release that names no
+        `discogs_release_id` therefore has no key to write a row under, and is skipped.
+        `enrich_release` in brainzgraphinator does exactly that with the same record — it
+        counts it under `entities_skipped_no_discogs_match` and reconciles no media — because
+        its `MATCH (r:Release {id: $discogs_id})` has nothing to bind either. Neither side
+        invents a key, and neither drops the message: the release row itself is still written,
+        and the media rows appear once a reconciliation supplies the Discogs id.
+
+        **What is not gated.** The row is written whether or not `public.releases` already
+        holds that Discogs release. No edge table in the `graph` schema declares a foreign
+        key, and the schema says why: a loader writes an edge in the same transaction as the
+        document it came from and may legitimately name an entity it has not ingested yet,
+        exactly as the enricher merges a target node as it writes the edge.
+
+        **What is pruned.** The write is a delete-then-insert scoped to this release *and*
+        this source, so the rows `discogs-sql-loader` wrote under `source = 'discogs'` are
+        untouched. A release whose media block no longer yields a medium prunes to nothing
+        rather than keeping a stale row, which is what the enricher's prune does when its
+        `$medium_ids` comes back empty and what the schema's projection of the block this
+        loader just stored would produce.
+        """
+        discogs_release_id = record.get("discogs_release_id")
+        if discogs_release_id is None:
+            logger.debug("⏭️ Skipped release media with no Discogs release key", mbid=record.get("mbid", record.get("id", "")))
+            return False
+
+        release_id = str(discogs_release_id)
+        rows = media_edge_rows(media)
+        await self._writer.upsert_media_families(conn, sorted({row["family"] for row in rows}))
+        await self._writer.upsert_media(conn, [(row["medium"], row["family"], row["label"]) for row in rows])
+        await self._writer.replace_release_media_edges(
+            conn,
+            release_id,
+            MEDIA_SOURCE,
+            [(release_id, row["medium"], MEDIA_SOURCE, row["qty"]) for row in rows],
+        )
+        logger.debug("💿 Wrote release media edges", release_id=release_id, source=MEDIA_SOURCE, media=len(rows))
+        return True
+
     async def _attach_identifier_aliases(self, conn: Any, mbid: str, record: dict[str, Any], native_id: UUID | None) -> None:
         """Attach the release's barcode and catalogue numbers as aliases of its native id.
 
@@ -334,6 +460,10 @@ class MusicBrainzRecordProcessor:
     async def process_release(self, conn: Any, record: dict[str, Any]) -> None:
         mbid = record.get("mbid", record.get("id", ""))
         gm_item_id = await self._native_id(conn, "release", mbid, record.get("discogs_release_id"))
+        # The block is derived once and both written and projected: the row stored in
+        # `musicbrainz.releases.media` and the `graph.issued_on` rows below must describe the
+        # same media, and they are committed together by the caller's transaction.
+        media = self.release_media_block(record)
         await self._writer.upsert_release(
             conn,
             (
@@ -343,11 +473,12 @@ class MusicBrainzRecordProcessor:
                 record.get("status", ""),
                 record.get("release_group_mbid"),
                 record.get("discogs_release_id"),
-                self.release_media_block(record),
+                media,
                 record,
                 gm_item_id,
             ),
         )
+        await self.write_release_media(conn, record, media)
         await self._attach_identifier_aliases(conn, mbid, record, gm_item_id)
         await self.insert_relationships(conn, mbid, "release", record.get("relations", []))
         await self.insert_external_links(conn, mbid, "release", record.get("external_links", []))
