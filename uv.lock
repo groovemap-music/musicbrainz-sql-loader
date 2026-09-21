@@ -6,6 +6,9 @@ requires-python = "==3.14.*"
 exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for backwards compatibility when using relative exclude-newer values.
 exclude-newer-span = "P2D"
 
+[manifest]
+overrides = [{ name = "groovemap-runtime", extras = ["neo4j", "otel", "postgres", "rabbitmq"], git = "https://github.com/groovemap-music/python-libraries.git?rev=7abcb3ba9f467d9bdcd5b3df0b1a342a2efda73b" }]
+
 [[package]]
 name = "aio-pika"
 version = "10.0.1"
@@ -430,7 +433,7 @@ name = "groovemap-database-schema"
 version = "0.3.0"
 source = { git = "https://github.com/groovemap-music/database-schema.git?rev=06629c6a7681127f74995bbae638ba048e2abd6d#06629c6a7681127f74995bbae638ba048e2abd6d" }
 dependencies = [
-    { name = "groovemap-runtime", extra = ["neo4j", "otel", "postgres"] },
+    { name = "groovemap-runtime", extra = ["neo4j", "otel", "postgres", "rabbitmq"] },
     { name = "psycopg", extra = ["binary"] },
 ]
 
@@ -440,7 +443,7 @@ version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "aio-pika" },
-    { name = "groovemap-runtime", extra = ["otel", "postgres", "rabbitmq"] },
+    { name = "groovemap-runtime", extra = ["neo4j", "otel", "postgres", "rabbitmq"] },
     { name = "orjson" },
     { name = "psycopg", extra = ["binary"] },
     { name = "structlog" },
@@ -466,7 +469,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aio-pika", specifier = ">=10.0.1" },
-    { name = "groovemap-runtime", extras = ["postgres", "rabbitmq", "otel"], git = "https://github.com/groovemap-music/python-libraries.git?rev=6e84fe9acfd9551bd3bba2f2e78fef0ec1ef38ef" },
+    { name = "groovemap-runtime", extras = ["postgres", "rabbitmq", "otel"], git = "https://github.com/groovemap-music/python-libraries.git?rev=7abcb3ba9f467d9bdcd5b3df0b1a342a2efda73b" },
     { name = "orjson", specifier = ">=3.12.0" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.3.5" },
     { name = "structlog", specifier = ">=26.1.0" },
@@ -492,7 +495,7 @@ dev = [
 [[package]]
 name = "groovemap-runtime"
 version = "0.1.0"
-source = { git = "https://github.com/groovemap-music/python-libraries.git?rev=6e84fe9acfd9551bd3bba2f2e78fef0ec1ef38ef#6e84fe9acfd9551bd3bba2f2e78fef0ec1ef38ef" }
+source = { git = "https://github.com/groovemap-music/python-libraries.git?rev=7abcb3ba9f467d9bdcd5b3df0b1a342a2efda73b#7abcb3ba9f467d9bdcd5b3df0b1a342a2efda73b" }
 dependencies = [
     { name = "orjson" },
     { name = "structlog" },

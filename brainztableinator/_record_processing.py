@@ -38,21 +38,14 @@ _ENTITY_TYPE_ALIASES = {"release_group": "release-group"}
 # one per provider's spelling of it.
 RELEASE_GROUP_ENTITY_KIND = "master"
 
-# The identifiers block ADR 0011 publishes is the shape `alias_refs_for_release` validates
-# before it normalizes, so the block this module builds spells version 1 exactly. Version 1
-# pins `source.provider` to `discogs` because the Discogs producer is the only one that
-# attaches a block to an event; a MusicBrainz release names the same constant to satisfy the
-# validator. Nothing built here is stored or published: the block exists solely to reach the
-# one shared normalization and is discarded with the refs it minted, so the released contract
-# is unaffected by the field's Discogs spelling.
+# Only pre-identifiers MusicBrainz events need this compatibility block. Current events carry
+# the producer's authoritative block, including its MusicBrainz provenance, unchanged.
 _IDENTIFIERS_VERSION = "1"
-_IDENTIFIER_BLOCK_PROVIDER = "discogs"
+_IDENTIFIER_BLOCK_PROVIDER = "musicbrainz"
 
-# The block's `source.field` says which provider field a value was lifted from. A MusicBrainz
-# barcode is the release's own barcode, and a catalogue number is lifted from the release's
-# label entries, which are the two fields these enum members name.
-_BARCODE_SOURCE_FIELD = "identifiers"
-_CATALOG_NUMBER_SOURCE_FIELD = "labels[].catno"
+# The block's source fields name the MusicBrainz release resource paths for legacy values.
+_BARCODE_SOURCE_FIELD = "barcode"
+_CATALOG_NUMBER_SOURCE_FIELD = "label-info[].catalog-number"
 
 
 def _identifier_item(identifier_type: str, value: str, source_field: str) -> dict[str, Any]:
@@ -65,8 +58,8 @@ def _identifier_item(identifier_type: str, value: str, source_field: str) -> dic
     }
 
 
-def _identifiers_block(record: dict[str, Any]) -> dict[str, Any] | None:
-    """Return the minimal identifiers block a release's barcode and catalogue numbers make.
+def _legacy_identifiers_block(record: dict[str, Any]) -> dict[str, Any] | None:
+    """Return a compatibility block for events published before ``identifiers`` existed.
 
     Only the two alias-bearing fields a MusicBrainz release carries become items: the barcode,
     and one item per entry of ``catalog_numbers`` that names a catalogue number. An absent,
@@ -425,7 +418,7 @@ class MusicBrainzRecordProcessor:
         return True
 
     async def _attach_identifier_aliases(self, conn: Any, mbid: str, record: dict[str, Any], native_id: UUID | None) -> None:
-        """Attach the release's barcode and catalogue numbers as aliases of its native id.
+        """Attach aliases from the authoritative or legacy release identifiers block.
 
         A barcode or catalogue number learned from MusicBrainz must resolve to the same native
         item a Discogs-sourced value does, so the value is normalized once, by the shared
@@ -444,11 +437,16 @@ class MusicBrainzRecordProcessor:
         if native_id is None:
             return
 
-        block = _identifiers_block(record)
-        if block is None:
-            return
-
-        refs = alias_refs_for_release(block)
+        # Presence, not truthiness, distinguishes a new event from a legacy event. A malformed
+        # producer block must fail validation and follow the caller's message error policy;
+        # silently rebuilding it from raw fields would conceal producer corruption.
+        if "identifiers" in record:
+            refs = alias_refs_for_release(record["identifiers"])
+        else:
+            block = _legacy_identifiers_block(record)
+            if block is None:
+                return
+            refs = alias_refs_for_release(block)
         if not refs:
             return
 
