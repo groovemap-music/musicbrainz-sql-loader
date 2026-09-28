@@ -9,7 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 PERSISTENCE_PRODUCER_COMMIT = "06629c6a7681127f74995bbae638ba048e2abd6d"
 SCHEMA_TESTED_RUNTIME_COMMIT = "6e84fe9acfd9551bd3bba2f2e78fef0ec1ef38ef"
-APPLICATION_RUNTIME_COMMIT = "7abcb3ba9f467d9bdcd5b3df0b1a342a2efda73b"
+APPLICATION_RUNTIME_COMMIT = "9bac0220df80fdb550fde78d4db8228ca4273625"
 
 
 def digest(path: Path) -> str:
