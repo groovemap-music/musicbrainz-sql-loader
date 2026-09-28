@@ -1,6 +1,6 @@
 {
   "runtime_repository": "https://github.com/groovemap-music/python-libraries",
-  "runtime_commit": "7abcb3ba9f467d9bdcd5b3df0b1a342a2efda73b",
-  "required_capability": "MusicBrainz identifiers-block source provenance and fields (gm-python-libraries-rc7.1)",
+  "runtime_commit": "9bac0220df80fdb550fde78d4db8228ca4273625",
+  "required_capability": "Bounded /logs file rotation via RotatingFileHandler, LOG_FILE_MAX_BYTES/LOG_FILE_BACKUP_COUNT (gm-python-libraries-dg-9wo9)",
   "producer_contract_commit": "ae01d967e72e18c82cac2e844daa1dfeb81a32a6"
 }
