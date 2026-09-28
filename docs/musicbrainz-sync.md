@@ -158,11 +158,109 @@ RabbitMQ can redeliver it once when the service restarts; a handler already insi
 transaction may still finish normally. Idempotent upserts make redelivery safe.
 
 Completion and active-consumer sets are process memory. On process start they begin empty;
-the loader declares the same durable exchanges, quorum queues, classic dead-letter queues,
-and all four consumers. Periodic recovery is the later idle/stuck-state path. Durable queue
+the loader declares the same durable exchanges, quorum live queues, classic dead-letter
+queues, and all four consumers. Periodic recovery is the later idle/stuck-state path. Durable queue
 names intentionally retain the `brainztableinator` consumer suffix for compatibility:
 `groovemap-musicbrainz-brainztableinator-{entity}`, with `.dlx` and `.dlq` suffixes for
 dead-letter routing.
+
+Every successful subscription logs its data type, durable queue name, broker consumer tag,
+and whether it was created during recovery. Connection teardown logs both the full tag set
+registered on that connection and the subset still active at close. Those two records make
+"never registered" distinguishable from "registered and later dropped" without relying on
+the health endpoint.
+
+## Release-group starvation incident
+
+**What is fixed and proven (defect 1 — the detector's blind spot).** The stall/stuck detector
+used to require `has_processed_messages`: at least one message processed *anywhere* before it
+would report anything. A stream whose consumer never registered, or registered but never
+received a single delivery while its siblings finished, was invisible under that gate — the
+health endpoint stayed healthy and recovery never fired. `_consumer_alarm_types()` replaces the
+gate: once `STARTUP_IDLE_TIMEOUT` has elapsed since `consumer_watch_started_at`, an incomplete
+stream missing from the active tag set is reported in `consumer_alarm_types`, marks health
+unhealthy, and triggers recovery; a stream that still holds its local tag but has received zero
+messages is reported once every sibling stream has completed. Both are covered by tests (see
+`tests/test_brainztableinator.py`). Every successful `queue.consume()` also logs
+`"Registered RabbitMQ consumer"` with the data type, durable queue name, broker consumer tag,
+and whether the registration happened during recovery, and `close_rabbitmq_connection` /
+`_recover_consumers` log the full registered-tag set alongside the still-active subset before
+clearing it — see [Restart guarantees](#restart-guarantees) above.
+
+**What is NOT established from code review alone (defect 2 — why release-groups specifically
+consumed nothing on 2026-08-17).** No root cause has been confirmed against the live
+2026-08-17 incident; do not treat any single explanation below as settled. Three hypotheses
+were on the table, in descending likelihood as read from the source (see
+`gm-musicbrainz-sql-loader-dg-cev8` for the full reasoning):
+
+1. **Registered, then dropped when the connection closed.** For `brainztableinator` specifically,
+   `close_rabbitmq_connection` only runs once `check_all_consumers_idle()` is true, which
+   requires *every* data type — including release-groups — to already be in `completed_files`.
+   A stream that never received a delivery can't reach `completed_files` (it never gets an
+   `extraction_complete` to mark it), so this loader's own close path cannot have dropped a
+   release-groups consumer that was still carrying an unconsumed backlog; `check_all_consumers_idle`
+   structurally requires the opposite. This narrows hypothesis 1 to `brainzgraphinator`, whose
+   idle/close condition differs (that service's own fix and its evidence trail are
+   `gm-musicbrainz-graph-enricher-tw9`, not this repository).
+2. **Alias/binding mismatch** (`_ENTITY_TYPE_ALIASES`, `release_group` vs `release-group(s)`
+   vs `master`) — a hyphen/underscore or singular/plural slip in the seam documented at
+   `brainztableinator.py:506-515` would produce exactly this symptom: messages land in the
+   correct queue, but the consumer that was registered attaches under a name the broker
+   never matches to it, with no exception raised on either side.
+3. **Delivery-limit exhaustion** (`x-delivery-limit: 20`) — explains a large DLQ but not the
+   complete absence of log lines and errors for release-groups, so it is the weakest fit and
+   most likely a downstream consequence of whichever of the above is the actual cause, not the
+   cause itself.
+   One earlier candidate — the pre-2026-07-19 recovery path that registered consumers only for
+   queues with a backlog at its passive-declare snapshot (fixed in `f9ef40d`, 2026-07-20) — is
+   **ruled out**: that fix landed a full month before the 2026-08-17 incident, so it cannot
+   explain that specific run's outage. It remains worth keeping fixed regardless (a5c9be0
+   preserves it), but it is not this incident's root cause and must not be cited as one.
+
+**Establishing defect 2, DLQ bounding, and the parked-message decision are tracked in the
+operator bead [`gm-musicbrainz-sql-loader-35v`](https://github.com/groovemap-music/musicbrainz-sql-loader),
+not this one** — they need live broker access and a deliberate operational call that a code
+change in this repository cannot make or certify on its own. The procedure below is kept here
+as the concrete plan that bead should execute, using the new instrumentation this fix adds:
+
+1. Deploy this fix and watch the startup log for `"Registered RabbitMQ consumer"` with
+   `data_type=release-groups` for `brainztableinator` (and the equivalent line in
+   `brainzgraphinator`). Its absence at startup is direct evidence for hypothesis 2 (binding
+   never took); its presence rules out hypothesis 2 and shifts weight to 1 or 3.
+2. If the line is present at startup, watch for `"Closing RabbitMQ connection"` /
+   `"Dropping RabbitMQ connection for consumer recovery"` and check whether
+   `release-groups` is present in `registered_consumer_tags` but absent from
+   `active_consumer_tags` at that point — that is direct evidence for hypothesis 1.
+3. Cross-reference the RabbitMQ management API's per-queue `message_stats` (redeliver /
+   dead-letter counters) for `brainztableinator-release-groups` against
+   `x-delivery-limit: 20` to confirm or rule out hypothesis 3.
+4. Record the finding (which hypothesis, with the specific log lines / stats as evidence) in
+   `gm-musicbrainz-sql-loader-35v`. Only that record — not this document — can close the
+   "root cause identified with evidence" question; it requires a live recurrence or deliberate
+   reproduction against the new logging.
+5. **Decide and record** (in the same bead): discard the parked `20260815-001001` live and
+   dead-letter messages and re-extract, or re-drive them from the DLQ. The capped live queues
+   previously head-dropped records in arbitrary order, so the DLQ set is not an authoritative
+   complete import and replaying it is not obviously equivalent to a clean re-extract — but the
+   operator makes and records the final call.
+6. **Live verification** (in the same bead): after whichever disposition is chosen, confirm
+   from the RabbitMQ management API — not from a green process healthcheck — that
+   `brainztableinator-release-groups` and `brainzgraphinator-release-groups` each show
+   `consumers > 0` and that both queue depths are decreasing over successive samples.
+   `"Registered RabbitMQ consumer"` in the application log for `data_type=release-groups` is
+   necessary but not sufficient by itself; the broker-side consumer count and draining depth
+   are the actual proof.
+
+DLQ bounding itself is [`gm-deployment-8mb`](https://github.com/groovemap-music/deployment): a
+broker policy that bounds the classic DLQs directly (`.dlq` queues stay `x-queue-type: classic`
+here, matching every sibling catalog service — RabbitMQ cannot change an existing queue's type
+in place, and redeclaring an existing classic DLQ as quorum fails `PRECONDITION_FAILED` at
+startup). A bounded DLQ needs its own explicit decision about behaviour at its limit, which
+that policy bead owns.
+
+The graph-enricher owns its own declaration and detector implementation, so its matching code
+change and live verification must be delivered in that repository; this loader does not reach
+across repository boundaries.
 
 ## Observe an import
 
