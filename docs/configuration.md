@@ -40,6 +40,21 @@ authority for entity vocabulary, exchange names, queue templates, and producer p
 Deployment-specific values and secret mounting belong to the
 [`deployment` configuration](https://github.com/groovemap-music/deployment/blob/main/docs/configuration.md).
 
+## Logging
+
+The service writes JSON logs to stdout and to `/logs/musicbrainz-sql-loader.log` via
+`groovemap-runtime`'s `setup_logging`. The file sink is a size-capped rotating handler, not
+an unbounded append-only file.
+
+| Variable | Default | Description |
+| --- | ---: | --- |
+| `LOG_LEVEL` | `INFO` | Log verbosity; an unrecognized value falls back to `INFO` |
+| `LOG_FILE_MAX_BYTES` | `104857600` (100 MiB) | Size the active log file rolls over at |
+| `LOG_FILE_BACKUP_COUNT` | `5` | Number of rotated backup files retained |
+
+A non-numeric or non-positive override for either variable falls back to its default
+rather than disabling rotation.
+
 ## Runtime endpoints
 
 The health server always listens on port `8010`. A typical response includes the service
