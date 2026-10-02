@@ -3,6 +3,7 @@
 - [Configuration reference](configuration.md)
 - [MusicBrainz import and restart behavior](musicbrainz-sync.md)
 - [Graph media: the MusicBrainz half of `graph.issued_on`](graph-media.md)
+- [SQL/PGQ removal and recovery](sql-pgq-removal.md)
 - [Cross-store parity with the graph enricher](store-parity.md)
 - [Consumer cancellation and draining](consumer-cancellation.md)
 - [File and extraction completion](file-completion-tracking.md)
