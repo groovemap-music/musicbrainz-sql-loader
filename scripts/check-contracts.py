@@ -7,8 +7,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PERSISTENCE_PRODUCER_COMMIT = "06629c6a7681127f74995bbae638ba048e2abd6d"
-SCHEMA_TESTED_RUNTIME_COMMIT = "6e84fe9acfd9551bd3bba2f2e78fef0ec1ef38ef"
+PERSISTENCE_PRODUCER_COMMIT = "9a50949b1810f3e61adae2f89b86acec2e20c4a3"
+SCHEMA_TESTED_RUNTIME_COMMIT = "9bac0220df80fdb550fde78d4db8228ca4273625"
 APPLICATION_RUNTIME_COMMIT = "9bac0220df80fdb550fde78d4db8228ca4273625"
 
 
@@ -31,6 +31,7 @@ assert digest(ROOT / "contracts/persistence/v1/compatibility.json") == persisten
 assert persistence_source["producer_commit"] == PERSISTENCE_PRODUCER_COMMIT
 assert compatibility["contract"] == "groovemap.persistence"
 assert compatibility["version"] == 1
+assert "property_graph" not in compatibility["graph_schema"]
 assert compatibility["application_runtime"]["tested_version"] == "0.1.0"
 # This is the schema owner's immutable historical test pin, not the loader's active pin.
 assert compatibility["application_runtime"]["tested_commit"] == SCHEMA_TESTED_RUNTIME_COMMIT
