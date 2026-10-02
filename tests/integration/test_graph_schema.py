@@ -3,7 +3,7 @@
 The producer revision comes from ``groovemap-database-schema``, pinned as a dev
 dependency on the same commit ``contracts/persistence/v1/source.json`` records
 this repository as tested against
-(``06629c6a7681127f74995bbae638ba048e2abd6d``). Applying the producer's own DDL,
+(``9a50949b1810f3e61adae2f89b86acec2e20c4a3``). Applying the producer's own DDL,
 rather than asserting against a hand-copied subset, is what keeps this test from
 drifting behind the relations the loader writes: ``graph.issued_on``, the
 ``graph.medium`` and ``graph.media_family`` vertex tables it upserts into, the
