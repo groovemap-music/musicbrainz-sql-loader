@@ -429,6 +429,8 @@ connection_consumer_tags: dict[str, str] = {}
 consumer_watch_started_at = 0.0
 consumer_cancel_tasks: dict[str, asyncio.Task[None]] = {}
 queues: dict[str, Any] = {}
+CONSUMER_CANCEL_TIMEOUT = 5.0  # Bound cancel-ok and uncertain-channel closure.
+consumer_cancellation_failed = False
 CONSUMER_CANCEL_DELAY = int(os.environ.get("CONSUMER_CANCEL_DELAY", "300"))
 
 QUEUE_CHECK_INTERVAL = int(os.environ.get("QUEUE_CHECK_INTERVAL", "3600"))
@@ -518,7 +520,7 @@ def get_health_data() -> dict[str, Any]:
             active_task = "Initializing PostgreSQL connection"
         else:
             status = "unhealthy"
-    elif is_stuck:
+    elif is_stuck or consumer_cancellation_failed:
         status = "unhealthy"
     else:
         status = "healthy"
@@ -530,6 +532,7 @@ def get_health_data() -> dict[str, Any]:
         "progress": current_progress,
         "message_counts": message_counts.copy(),
         "last_message_time": last_message_time.copy(),
+        "consumer_cancellation_failed": consumer_cancellation_failed,
         "active_consumers": list(consumer_tags.keys()),
         "consumer_alarm_types": alarm_types,
         "completed_files": list(completed_files),
@@ -558,39 +561,57 @@ def get_connection() -> Any:
 async def schedule_consumer_cancellation(data_type: str, queue: Any) -> None:
     """Schedule cancellation of a consumer after a delay."""
 
+    consumer_tag = consumer_tags.get(data_type)
+
     async def cancel_after_delay() -> None:
+        global consumer_cancellation_failed
+        cancel_started = False
         try:
             await asyncio.sleep(CONSUMER_CANCEL_DELAY)
 
-            if data_type in consumer_tags:
-                consumer_tag = consumer_tags[data_type]
+            if consumer_tag is not None and consumer_tags.get(data_type) == consumer_tag:
                 logger.info(
                     f"🔧 Canceling consumer for {data_type} after {CONSUMER_CANCEL_DELAY}s grace period",
                     data_type=data_type,
                     CONSUMER_CANCEL_DELAY=CONSUMER_CANCEL_DELAY,
                 )
 
-                await queue.cancel(consumer_tag, nowait=True)
+                # Confirm cancel-ok, with both broker RPC and task deadlines. Completion
+                # state alone is never evidence that the subscriber has stopped.
+                cancel_started = True
+                await asyncio.wait_for(queue.cancel(consumer_tag, nowait=False, timeout=CONSUMER_CANCEL_TIMEOUT), timeout=CONSUMER_CANCEL_TIMEOUT)
 
-                del consumer_tags[data_type]
-                _record_consumer_delta(-1)
+                # Remove from tracking
+                if consumer_tags.get(data_type) == consumer_tag:
+                    del consumer_tags[data_type]
+                    _record_consumer_delta(-1)
 
                 logger.info(
                     f"✅ Consumer for {data_type} successfully canceled",
                     data_type=data_type,
                 )
 
+                # Check if all consumers are now idle
                 if await check_all_consumers_idle():
                     logger.info("🔧 All consumers idle, closing RabbitMQ connection")
                     await close_rabbitmq_connection()
+        except asyncio.CancelledError:
+            if cancel_started:
+                consumer_cancellation_failed = True
+            raise
         except Exception as e:
-            logger.error("❌ Failed to cancel consumer", data_type=data_type, error=str(e))
+            consumer_cancellation_failed = True
+            logger.error("❌ Failed to confirm consumer cancel; recovery required", data_type=data_type, error_type=type(e).__name__)
         finally:
-            consumer_cancel_tasks.pop(data_type, None)
+            # Clean up the task reference
+            if consumer_cancel_tasks.get(data_type) is asyncio.current_task():
+                consumer_cancel_tasks.pop(data_type, None)
 
+    # Cancel any existing scheduled cancellation
     if data_type in consumer_cancel_tasks:
         consumer_cancel_tasks[data_type].cancel()
 
+    # Schedule new cancellation
     consumer_cancel_tasks[data_type] = asyncio.create_task(cancel_after_delay())
 
 
@@ -603,61 +624,84 @@ async def cancel_all_consumers() -> None:
     seconds-long flush/teardown sequence, so nothing is redelivered into a
     service that is on its way out. Best-effort: teardown continues regardless.
     """
+    global consumer_cancellation_failed
+
+    # Prevent completion timers from racing shutdown's confirmed cancellation RPCs.
+    pending = list(consumer_cancel_tasks.values())
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
     for data_type, consumer_tag in list(consumer_tags.items()):
         queue = queues.get(data_type)
         if queue is None:
-            consumer_tags.pop(data_type, None)
-            _record_consumer_delta(-1)
+            consumer_cancellation_failed = True
+            logger.warning("⚠️ Missing consumer queue at shutdown; cancellation unconfirmed", data_type=data_type)
             continue
         try:
-            await queue.cancel(consumer_tag, nowait=True)
-            consumer_tags.pop(data_type, None)
-            _record_consumer_delta(-1)
+            await asyncio.wait_for(queue.cancel(consumer_tag, nowait=False, timeout=CONSUMER_CANCEL_TIMEOUT), timeout=CONSUMER_CANCEL_TIMEOUT)
+            if consumer_tags.get(data_type) == consumer_tag:
+                consumer_tags.pop(data_type, None)
+                _record_consumer_delta(-1)
         except Exception as e:
-            logger.warning(
-                "⚠️ Failed to cancel consumer during shutdown",
-                data_type=data_type,
-                error=str(e),
-            )
-    logger.info("✅ Consumers cancelled for shutdown")
+            consumer_cancellation_failed = True
+            logger.warning("⚠️ Failed to confirm consumer cancel during shutdown", data_type=data_type, error_type=type(e).__name__)
+            # A timed-out RPC can poison this channel. Close it once during teardown
+            # rather than spending one full deadline per remaining subscriber.
+            break
+    logger.info("Consumer shutdown cancellation finished", unconfirmed_consumers=list(consumer_tags))
 
 
-async def close_rabbitmq_connection() -> None:
-    """Close the RabbitMQ connection and channel when all consumers are idle."""
-    global active_connection, active_channel
+async def close_rabbitmq_connection() -> bool:
+    """Close the delivery channel with deadlines; keep uncertain tags until confirmed.
 
-    try:
-        logger.info(
-            "Closing RabbitMQ connection",
-            registered_consumer_tags=connection_consumer_tags.copy(),
-            active_consumer_tags=consumer_tags.copy(),
-            completed_files=sorted(completed_files),
-            shutdown_requested=shutdown_requested,
-        )
-        if active_channel:
-            try:
-                await active_channel.close()
-                logger.info("🔧 Closed RabbitMQ channel - all consumers idle")
-            except Exception as e:
-                logger.warning("⚠️ Error closing channel", error=str(e))
+    Preserve per-connection registration evidence for close logs, including normally
+    cancelled streams. A timeout is not proof of closure and must not erase state.
+    """
+    global active_connection, active_channel, consumer_cancellation_failed
+
+    logger.info(
+        "Closing RabbitMQ connection",
+        registered_consumer_tags=connection_consumer_tags.copy(),
+        active_consumer_tags=consumer_tags.copy(),
+        completed_files=sorted(completed_files),
+        shutdown_requested=shutdown_requested,
+    )
+    confirmed = active_connection is None and active_channel is None and not consumer_tags
+    if active_channel is not None:
+        try:
+            await asyncio.wait_for(active_channel.close(), timeout=CONSUMER_CANCEL_TIMEOUT)
             active_channel = None
+            confirmed = True
+            logger.info("🔧 Closed RabbitMQ delivery channel")
+        except Exception as error:
+            logger.warning("⚠️ Could not confirm channel closure", error_type=type(error).__name__)
 
-        if active_connection:
-            try:
-                await active_connection.close()
-                logger.info("🔧 Closed RabbitMQ connection - all consumers idle")
-            except Exception as e:
-                logger.warning("⚠️ Error closing connection", error=str(e))
+    if active_connection is not None:
+        try:
+            await asyncio.wait_for(active_connection.close(), timeout=CONSUMER_CANCEL_TIMEOUT)
             active_connection = None
+            active_channel = None
+            confirmed = True
+            logger.info("🔧 Closed RabbitMQ connection")
+        except Exception as error:
+            logger.warning("⚠️ Could not confirm connection closure", error_type=type(error).__name__)
 
-        connection_consumer_tags.clear()
+    if not confirmed:
+        consumer_cancellation_failed = True
+        logger.error("❌ Delivery channel closure unconfirmed; consumer recovery remains pending")
+        return False
 
-        logger.info(
-            f"✅ RabbitMQ connection closed. Will check for new messages every {QUEUE_CHECK_INTERVAL}s",
-            QUEUE_CHECK_INTERVAL=QUEUE_CHECK_INTERVAL,
-        )
-    except Exception as e:
-        logger.error("❌ Error closing RabbitMQ connection", error=str(e))
+    _record_consumer_delta(-len(consumer_tags))
+    consumer_tags.clear()
+    connection_consumer_tags.clear()
+    consumer_cancellation_failed = active_connection is not None
+    logger.info(
+        f"✅ RabbitMQ delivery channel closed. Will check for new messages every {QUEUE_CHECK_INTERVAL}s",
+        QUEUE_CHECK_INTERVAL=QUEUE_CHECK_INTERVAL,
+    )
+    return not consumer_cancellation_failed
 
 
 async def check_all_consumers_idle() -> bool:
@@ -694,6 +738,10 @@ async def periodic_queue_checker() -> None:
         try:
             await asyncio.sleep(STUCK_CHECK_INTERVAL)
 
+            if consumer_cancellation_failed:
+                await _recover_consumers()
+                continue
+
             current_time = time.time()
 
             if await check_consumers_unexpectedly_dead():
@@ -729,21 +777,14 @@ async def _recover_consumers() -> None:
     """Recover consumers by reconnecting to RabbitMQ and restarting consumption."""
     global active_connection, active_channel, queues, idle_mode, consumer_watch_started_at
 
-    if active_connection:
+    if active_connection is not None or active_channel is not None or consumer_cancellation_failed:
         logger.warning(
             "Dropping RabbitMQ connection for consumer recovery",
             registered_consumer_tags=connection_consumer_tags.copy(),
             active_consumer_tags=consumer_tags.copy(),
         )
-        try:
-            await active_connection.close()
-        except Exception as e:
-            logger.warning("⚠️ Error closing broken connection during recovery", error=str(e))
-        active_connection = None
-        active_channel = None
-        _record_consumer_delta(-len(consumer_tags))
-        consumer_tags.clear()
-        connection_consumer_tags.clear()
+        if not await close_rabbitmq_connection():
+            return
 
     try:
         temp_connection = await rabbitmq_manager.connect()
@@ -850,29 +891,17 @@ async def _recover_consumers() -> None:
             idle_mode = False
         else:
             logger.info("⏳ No messages in any queue, connection remains closed")
-            await temp_channel.close()
-            await temp_connection.close()
+            await asyncio.wait_for(temp_channel.close(), timeout=CONSUMER_CANCEL_TIMEOUT)
+            await asyncio.wait_for(temp_connection.close(), timeout=CONSUMER_CANCEL_TIMEOUT)
 
     except Exception as e:
         logger.error("❌ Error during consumer recovery", error=str(e))
-        try:
-            await temp_channel.close()
-            await temp_connection.close()
-        except Exception as close_error:
-            logger.warning(
-                "⚠️ Error closing temporary connection after recovery failure",
-                error=str(close_error),
-            )
-        active_connection = None
-        active_channel = None
-        queues = {}
-        # Clear stale consumer tags: any consumers registered before the error
-        # died with the now-closed connection. Leaving them behind would keep
-        # len(consumer_tags) > 0 forever, permanently gating off both recovery
-        # routes (stuck-check requires 0 tags) while health still reads healthy.
-        _record_consumer_delta(-len(consumer_tags))
-        consumer_tags.clear()
-        connection_consumer_tags.clear()
+        # Partially registered subscriptions still belong to this temporary broker
+        # session. Keep its handles/tags if closure fails; never erase uncertain state.
+        active_connection = temp_connection
+        active_channel = temp_channel
+        if await close_rabbitmq_connection():
+            queues = {}
 
 
 async def _insert_relationships(conn: Any, source_mbid: str, source_type: str, rels: list[dict[str, Any]]) -> None:
@@ -987,6 +1016,14 @@ async def _handle_data_message(message: AbstractIncomingMessage, data_type: str)
     except Exception as error:
         logger.error("❌ Failed to parse message", error=str(error))
         return _reject(data_type, type(error).__name__)
+
+    if data.get("type") not in ("file_complete", "extraction_complete"):
+        # The next extraction's first record re-arms starvation/completion detection
+        # and invalidates the previous extraction's grace-period timer.
+        completed_files.discard(data_type)
+        pending_cancel = consumer_cancel_tasks.pop(data_type, None)
+        if pending_cancel is not None:
+            pending_cancel.cancel()
 
     if data.get("type") == "file_complete":
         total_processed = data.get("total_processed", 0)
@@ -1406,6 +1443,8 @@ async def main() -> None:
             # below: a still-subscribed consumer keeps being handed messages it
             # can only leave unacked.
             await cancel_all_consumers()
+            if consumer_cancellation_failed:
+                await close_rabbitmq_connection()
 
             progress_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

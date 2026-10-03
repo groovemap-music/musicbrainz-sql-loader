@@ -187,69 +187,47 @@ and whether the registration happened during recovery, and `close_rabbitmq_conne
 `_recover_consumers` log the full registered-tag set alongside the still-active subset before
 clearing it — see [Restart guarantees](#restart-guarantees) above.
 
-**What is NOT established from code review alone (defect 2 — why release-groups specifically
-consumed nothing on 2026-08-17).** No root cause has been confirmed against the live
-2026-08-17 incident; do not treat any single explanation below as settled. Three hypotheses
-were on the table, in descending likelihood as read from the source (see
-`gm-musicbrainz-sql-loader-dg-cev8` for the full reasoning):
+**Established cause (defect 2 — an unconfirmed cancellation holds the channel RPC lock).**
+The cancellation epic `gm-musicbrainz-sql-loader-i8v` records the deliberate local
+reproduction on 2026-09-28 and points to `gm-musicbrainz-sql-loader-35v` for the evidence.
+The loader used `await queue.cancel(consumer_tag, nowait=True)` on completion and shutdown.
+In the affected aiormq implementation, a nowait `Basic.Cancel` waits for a `CancelOk`
+that RabbitMQ never sends, holding the channel RPC lock without a timeout. The first
+cancel reaches the broker and removes that stream's subscriber; later cancellation RPCs
+wait behind the lock. Its local tag remains, health reports a subscriber the broker has
+lost, recovery stays gated off, and shutdown hangs. Whichever stream is canceled first
+can therefore starve on the next extraction.
 
-1. **Registered, then dropped when the connection closed.** For `brainztableinator` specifically,
-   `close_rabbitmq_connection` only runs once `check_all_consumers_idle()` is true, which
-   requires *every* data type — including release-groups — to already be in `completed_files`.
-   A stream that never received a delivery can't reach `completed_files` (it never gets an
-   `extraction_complete` to mark it), so this loader's own close path cannot have dropped a
-   release-groups consumer that was still carrying an unconsumed backlog; `check_all_consumers_idle`
-   structurally requires the opposite. This narrows hypothesis 1 to `brainzgraphinator`, whose
-   idle/close condition differs (that service's own fix and its evidence trail are
-   `gm-musicbrainz-graph-enricher-tw9`, not this repository).
-2. **Alias/binding mismatch** (`_ENTITY_TYPE_ALIASES`, `release_group` vs `release-group(s)`
-   vs `master`) — a hyphen/underscore or singular/plural slip in the seam documented at
-   `brainztableinator.py:506-515` would produce exactly this symptom: messages land in the
-   correct queue, but the consumer that was registered attaches under a name the broker
-   never matches to it, with no exception raised on either side.
-3. **Delivery-limit exhaustion** (`x-delivery-limit: 20`) — explains a large DLQ but not the
-   complete absence of log lines and errors for release-groups, so it is the weakest fit and
-   most likely a downstream consequence of whichever of the above is the actual cause, not the
-   cause itself.
-   One earlier candidate — the pre-2026-07-19 recovery path that registered consumers only for
-   queues with a backlog at its passive-declare snapshot (fixed in `f9ef40d`, 2026-07-20) — is
-   **ruled out**: that fix landed a full month before the 2026-08-17 incident, so it cannot
-   explain that specific run's outage. It remains worth keeping fixed regardless (a5c9be0
-   preserves it), but it is not this incident's root cause and must not be cited as one.
+The earlier connection-close, alias/binding-mismatch, and delivery-limit-exhaustion
+hypotheses are ruled out as the root cause by that reproduction. The older passive-declare
+recovery defect fixed by `f9ef40d` on 2026-07-20 also predates the 2026-08-17 incident and
+is not its cause. The never-started detector remains valuable diagnostic instrumentation;
+it does not replace fixing the cancellation RPC.
 
-**Establishing defect 2, DLQ bounding, and the parked-message decision are tracked in the
-operator bead [`gm-musicbrainz-sql-loader-35v`](https://github.com/groovemap-music/musicbrainz-sql-loader),
-not this one** — they need live broker access and a deliberate operational call that a code
-change in this repository cannot make or certify on its own. The procedure below is kept here
-as the concrete plan that bead should execute, using the new instrumentation this fix adds:
+`gm-musicbrainz-sql-loader-i8v.1` changes both cancellation paths to wait for `cancel-ok`
+with bounded RPC/task deadlines. It retains uncertain tags, reports cancellation failure
+in health, and requests confirmed channel closure before recovery. The next extraction's
+first record clears that type's completion marker and old grace timer. Regression tests
+exercise consecutive cancels on one channel, timeout recovery, next-run delivery, timer
+races, truthful registration history, and actual SIGTERM teardown. See
+[Consumer cancellation and draining](consumer-cancellation.md).
 
-1. Deploy this fix and watch the startup log for `"Registered RabbitMQ consumer"` with
-   `data_type=release-groups` for `brainztableinator` (and the equivalent line in
-   `brainzgraphinator`). Its absence at startup is direct evidence for hypothesis 2 (binding
-   never took); its presence rules out hypothesis 2 and shifts weight to 1 or 3.
-2. If the line is present at startup, watch for `"Closing RabbitMQ connection"` /
-   `"Dropping RabbitMQ connection for consumer recovery"` and check whether
-   `release-groups` is present in `registered_consumer_tags` but absent from
-   `active_consumer_tags` at that point — that is direct evidence for hypothesis 1.
-3. Cross-reference the RabbitMQ management API's per-queue `message_stats` (redeliver /
-   dead-letter counters) for `brainztableinator-release-groups` against
-   `x-delivery-limit: 20` to confirm or rule out hypothesis 3.
-4. Record the finding (which hypothesis, with the specific log lines / stats as evidence) in
-   `gm-musicbrainz-sql-loader-35v`. Only that record — not this document — can close the
-   "root cause identified with evidence" question; it requires a live recurrence or deliberate
-   reproduction against the new logging.
-5. **Decide and record** (in the same bead): discard the parked `20260815-001001` live and
-   dead-letter messages and re-extract, or re-drive them from the DLQ. The capped live queues
-   previously head-dropped records in arbitrary order, so the DLQ set is not an authoritative
-   complete import and replaying it is not obviously equivalent to a clean re-extract — but the
-   operator makes and records the final call.
-6. **Live verification** (in the same bead): after whichever disposition is chosen, confirm
-   from the RabbitMQ management API — not from a green process healthcheck — that
-   `brainztableinator-release-groups` and `brainzgraphinator-release-groups` each show
-   `consumers > 0` and that both queue depths are decreasing over successive samples.
-   `"Registered RabbitMQ consumer"` in the application log for `data_type=release-groups` is
-   necessary but not sufficient by itself; the broker-side consumer count and draining depth
-   are the actual proof.
+**Live incident closeout remains an operator action**, tracked in
+`gm-musicbrainz-sql-loader-35v` and its child work. The code change does not certify
+production recovery or decide the fate of parked messages:
+
+1. Integrate and deploy the SQL-loader and graph-enricher cancellation fixes. Retain the
+   registration and connection-close logs as non-secret evidence.
+2. **Decide and record** whether to discard the parked `20260815-001001` live/DLQ messages
+   and re-extract, or re-drive them. The capped live queues previously head-dropped records
+   arbitrarily; the DLQ set is not an authoritative complete import. No disposal or replay
+   is performed by this code change.
+3. Verify through RabbitMQ's management API that `brainztableinator-release-groups` and
+   `brainzgraphinator-release-groups` each have `consumers > 0` and depths decrease across
+   successive samples. A registration log or green application healthcheck alone is not
+   proof that the broker subscriptions are alive and draining.
+4. Record broker samples, final message disposition, and the recovery outcome on the
+   incident bead. DLQ bounding remains the separate deployment policy work below.
 
 DLQ bounding itself is [`gm-deployment-8mb`](https://github.com/groovemap-music/deployment): a
 broker policy that bounds the classic DLQs directly (`.dlq` queues stay `x-queue-type: classic`

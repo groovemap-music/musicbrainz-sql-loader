@@ -1530,7 +1530,7 @@ class TestCancelAfterDelay:
         await asyncio.sleep(0.15)
 
         # Should have cancelled
-        mock_queue.cancel.assert_called_once_with("consumer-tag-123", nowait=True)
+        mock_queue.cancel.assert_called_once_with("consumer-tag-123", nowait=False, timeout=bt.CONSUMER_CANCEL_TIMEOUT)
 
     @pytest.mark.asyncio
     @patch("brainztableinator.brainztableinator.CONSUMER_CANCEL_DELAY", 0.1)
@@ -1657,7 +1657,9 @@ class TestCloseRabbitMQConnection:
 
         mock_logger.error.assert_called_once()
         call_args = mock_logger.error.call_args
-        assert "Error closing RabbitMQ connection" in call_args[0][0]
+        assert "closure unconfirmed" in call_args[0][0]
+        assert bt.active_channel is mock_channel
+        assert bt.consumer_cancellation_failed
 
 
 # ===========================================================================
@@ -3073,7 +3075,7 @@ class TestRecoverConsumersEdgeCases:
         mock_connection.close.assert_called()
 
     @pytest.mark.asyncio
-    async def test_broken_connection_close_error_ignored(self) -> None:
+    async def test_broken_connection_close_error_defers_recovery(self) -> None:
         """Test that errors closing broken connection are silently ignored."""
         import brainztableinator.brainztableinator as bt
 
@@ -3104,7 +3106,9 @@ class TestRecoverConsumersEdgeCases:
         with patch("brainztableinator.brainztableinator.logger"):
             await _recover_consumers()  # Should not raise
 
-        assert bt.active_connection is None
+        assert bt.active_connection is mock_broken_conn
+        assert bt.consumer_cancellation_failed
+        bt.rabbitmq_manager.connect.assert_not_awaited()
 
 
 # ===========================================================================
@@ -3536,14 +3540,15 @@ class TestMainEdgeCases:
 
         bt.shutdown_requested = False
         # Tasks: .cancel() is sync, but the task itself is awaitable
-        _cancel_task = AsyncMock()
-        _cancel_task.cancel = MagicMock()
+        _cancel_task = asyncio.create_task(asyncio.Event().wait())
         _check_task = AsyncMock()
         _check_task.cancel = MagicMock()
         bt.consumer_cancel_tasks = {"artists": _cancel_task}
         bt.connection_check_task = _check_task
 
-        async def raise_keyboard_interrupt(coro: Any, timeout: float) -> None:  # noqa: ARG001
+        async def raise_keyboard_interrupt(coro: Any, timeout: float) -> None:
+            if timeout != 1.0:
+                return await coro
             coro.close()
             raise KeyboardInterrupt()
 
