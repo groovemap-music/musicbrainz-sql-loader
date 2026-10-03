@@ -132,3 +132,12 @@ def stubbed_identity_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr("brainztableinator._record_processing.resolve_aliases", resolve)
     monkeypatch.setattr("brainztableinator._record_processing.attach_aliases", attach)
+
+
+@pytest.fixture(autouse=True)
+def reset_cancellation_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep cancellation health/recovery state local to each unit test."""
+    import brainztableinator.brainztableinator as service
+
+    monkeypatch.setattr(service, "consumer_cancellation_failed", False)
+    monkeypatch.setattr(service, "consumer_cancel_tasks", {})
