@@ -3,6 +3,28 @@
 All notable changes to this repository will be recorded here by Commitizen from
 Conventional Commits.
 
+## v0.4.0 (2026-10-04)
+
+### Feat
+
+- **identifiers**: consume producer-owned MusicBrainz release aliases
+- **graph**: write the MusicBrainz half of graph.issued_on
+- **reconcile**: latch the purge on extraction_complete and dead letters
+- **reconcile**: add the stale child-row purge for the MusicBrainz tables
+
+### Fix
+
+- **deps**: update urllib3 to 2.8.0
+- **consumers**: bound confirmed cancellation and preserve recovery state
+- **consumers**: detect silent stream starvation
+- **reconcile**: veto the purge before the rejected delivery is settled
+- **reconcile**: settle a vetoed boundary and require an aware column type
+- **persistence**: refresh updated_at on every child-row conflict
+
+### Refactor
+
+- **reconcile**: probe for the column and take the boundary from the message
+
 ## v0.3.0 (2026-09-15)
 
 ### Feat
