@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import os
 import signal
+import sys
 import time
 import uuid
 from asyncio import run
@@ -1228,6 +1229,20 @@ async def progress_reporter() -> None:
             )
 
 
+class StartupError(Exception):
+    """Startup gave up; the cli boundary turns this into exit status 1."""
+
+
+async def _close_pool_and_health(health_server: HealthServer) -> None:
+    """Release what a failed start already opened."""
+    health_server.stop()
+    if connection_pool:
+        try:
+            await connection_pool.close()
+        except Exception as e:
+            logger.warning("⚠️ Error closing connection pool", error=str(e))
+
+
 async def main() -> None:
     """Main entry point for the MusicBrainz SQL loader service."""
     global \
@@ -1267,7 +1282,7 @@ async def main() -> None:
         config = MusicBrainzSQLLoaderConfig.from_env()
     except ValueError as e:
         logger.error("❌ Configuration error", error=str(e))
-        return
+        raise StartupError("configuration error") from e
 
     health_server = HealthServer(config.health_port, get_health_data)
     health_server.start_background()
@@ -1300,7 +1315,8 @@ async def main() -> None:
         )
     except Exception as e:
         logger.error("❌ Failed to initialize connection pool", error=str(e))
-        return
+        health_server.stop()
+        raise StartupError("connection pool initialization failed") from e
 
     # Delete-reconciliation is maintenance, not ingestion, and this loader issues no DDL:
     # it probes for the column groovemap-database-schema owns and stays off until it is
@@ -1355,11 +1371,19 @@ async def main() -> None:
                     max_attempts=max_startup_retries,
                     error=str(e),
                 )
-                return
+                await _close_pool_and_health(health_server)
+                raise StartupError("AMQP broker unreachable") from e
 
     if amqp_connection is None:
+        if shutdown_requested:
+            # A signal arrived while connecting: that is a requested stop, not a failed start.
+            logger.info("🛑 Shutdown requested before the AMQP connection was established")
+            await _close_pool_and_health(health_server)
+            shutdown_telemetry()
+            return
         logger.error("❌ No AMQP connection available")
-        return
+        await _close_pool_and_health(health_server)
+        raise StartupError("no AMQP connection available")
 
     async with amqp_connection:
         channel = await amqp_connection.channel()
@@ -1476,8 +1500,16 @@ async def main() -> None:
 
 
 def cli() -> None:
-    """Run the async service from a console-script entry point."""
-    run(main())
+    """Run the async service from a console-script entry point.
+
+    A startup give-up exits 1 so Docker's restart: on-failure policy sees a failure; a
+    signal-driven shutdown returns normally and exits 0.
+    """
+    try:
+        run(main())
+    except StartupError:
+        shutdown_telemetry()
+        sys.exit(1)
 
 
 if __name__ == "__main__":

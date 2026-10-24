@@ -753,6 +753,7 @@ class TestEventLoopMonitor:
             patch("brainztableinator.brainztableinator.setup_telemetry", side_effect=note("setup_telemetry")),
             patch("brainztableinator.brainztableinator.start_event_loop_monitor", side_effect=note_monitor),
             patch.object(bt.MusicBrainzSQLLoaderConfig, "from_env", side_effect=ValueError("stop here")),
+            pytest.raises(bt.StartupError),
         ):
             await bt.main()
 
