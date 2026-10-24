@@ -49,6 +49,13 @@ def test_healthcheck_uses_exec_form() -> None:
     assert 'CMD ["' in healthchecks[0]
 
 
+def test_health_port_defaults_to_role_port_and_healthcheck_honours_override() -> None:
+    instructions = _instructions()
+    assert "EXPOSE 8002" in instructions
+    healthcheck = next(line for line in instructions if line.startswith("HEALTHCHECK "))
+    assert "os.environ.get('HEALTH_PORT', '8002')" in healthcheck
+
+
 def test_image_does_not_persist_credential_placeholders() -> None:
     for instruction in _instructions():
         if instruction.startswith("ENV "):
