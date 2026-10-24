@@ -28,6 +28,7 @@ Credentials have no defaults.
 | `CONSUMER_CANCEL_DELAY` | `300` | Seconds between a completion marker and consumer cancellation; `0` disables cancellation |
 | `QUEUE_CHECK_INTERVAL` | `3600` | Seconds between durable-queue checks while idle |
 | `STUCK_CHECK_INTERVAL` | `30` | Seconds between missing-consumer recovery checks |
+| `HEALTH_PORT` | `8002` | Port for the `/health` endpoint; invalid values fail startup |
 | `STARTUP_IDLE_TIMEOUT` | `30` | Seconds without messages before idle mode |
 | `IDLE_LOG_INTERVAL` | `300` | Seconds between idle status logs |
 | `STARTUP_DELAY` | `5` | Seconds to allow dependencies to start |
@@ -57,7 +58,10 @@ rather than disabling rotation.
 
 ## Runtime endpoints
 
-The health server always listens on port `8010`. A typical response includes the service
+The health server listens on port `8002`, the role port shared by every SQL loader. Set `HEALTH_PORT` to
+any port from `1` to `65535` to override it; the Docker `HEALTHCHECK` honours the same variable. A
+non-numeric or out-of-range value is a configuration error and the service stops at startup instead of
+falling back to the default. A typical response includes the service
 identity, status, current task, per-stream message counts, active consumers, and completed
 streams.
 

@@ -5,7 +5,7 @@ import contextlib
 import json
 import signal
 import time
-from typing import Any
+from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
@@ -1308,6 +1308,37 @@ class TestMusicBrainzSQLLoaderConfig:
             assert cfg.postgres_password == "secret"
             assert cfg.postgres_database == "testdb"
             assert "localhost:5432" in cfg.postgres_host
+
+    _BASE_ENV: ClassVar[dict[str, str]] = {
+        "RABBITMQ_USERNAME": "guest",
+        "RABBITMQ_PASSWORD": "guest",
+        "POSTGRES_HOST": "localhost",
+        "POSTGRES_USERNAME": "user",
+        "POSTGRES_PASSWORD": "secret",
+        "POSTGRES_DATABASE": "testdb",
+    }
+
+    def test_health_port_defaults_to_role_port(self):
+        from brainztableinator.config import MusicBrainzSQLLoaderConfig
+
+        with patch.dict("os.environ", self._BASE_ENV, clear=True):
+            assert MusicBrainzSQLLoaderConfig.from_env().health_port == 8002
+
+    def test_health_port_override(self):
+        from brainztableinator.config import MusicBrainzSQLLoaderConfig
+
+        with patch.dict("os.environ", {**self._BASE_ENV, "HEALTH_PORT": "9123"}, clear=True):
+            assert MusicBrainzSQLLoaderConfig.from_env().health_port == 9123
+
+    @pytest.mark.parametrize("value", ["abc", "", "0", "65536", "-1", "80.5"])
+    def test_health_port_invalid_raises(self, value):
+        from brainztableinator.config import MusicBrainzSQLLoaderConfig
+
+        with (
+            patch.dict("os.environ", {**self._BASE_ENV, "HEALTH_PORT": value}, clear=True),
+            pytest.raises(ValueError, match="HEALTH_PORT"),
+        ):
+            MusicBrainzSQLLoaderConfig.from_env()
 
     def test_from_env_missing_vars_raises(self):
         """Config should raise ValueError when required env vars are missing."""
@@ -2642,6 +2673,20 @@ class TestMain:
         with patch("brainztableinator.brainztableinator.MusicBrainzSQLLoaderConfig") as mock_config_class:
             mock_config_class.from_env.side_effect = ValueError("Missing env vars")
             await main()
+
+    @pytest.mark.asyncio
+    @patch.dict("os.environ", {"STARTUP_DELAY": "0", "HEALTH_PORT": "not-a-port"})
+    @patch("brainztableinator.brainztableinator.setup_logging")
+    @patch("brainztableinator.brainztableinator.HealthServer")
+    async def test_main_invalid_health_port_never_starts_health_server(
+        self,
+        mock_health_server: Mock,
+        _mock_setup_logging: Mock,
+    ) -> None:
+        """An invalid HEALTH_PORT stops startup instead of binding a defaulted port."""
+        await main()
+
+        mock_health_server.assert_not_called()
 
     @pytest.mark.asyncio
     @patch("brainztableinator.brainztableinator.setup_logging")

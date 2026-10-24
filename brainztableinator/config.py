@@ -12,6 +12,23 @@ from common.config import (
 )
 
 
+DEFAULT_HEALTH_PORT = 8002
+
+
+def _resolve_health_port() -> int:
+    """Read HEALTH_PORT, defaulting to the SQL loader role port; reject invalid values."""
+    raw = getenv("HEALTH_PORT")
+    if raw is None:
+        return DEFAULT_HEALTH_PORT
+    try:
+        port = int(raw.strip())
+    except ValueError:
+        raise ValueError(f"HEALTH_PORT must be an integer between 1 and 65535, got {raw!r}") from None
+    if not 1 <= port <= 65535:
+        raise ValueError(f"HEALTH_PORT must be an integer between 1 and 65535, got {raw!r}")
+    return port
+
+
 @dataclass(frozen=True)
 class MusicBrainzSQLLoaderConfig:
     """Configuration for the MusicBrainz SQL loader."""
@@ -23,6 +40,7 @@ class MusicBrainzSQLLoaderConfig:
     postgres_database: str
     postgres_pool_min_size: int = 2
     postgres_pool_max_size: int = 12
+    health_port: int = DEFAULT_HEALTH_PORT
 
     @classmethod
     def from_env(cls) -> MusicBrainzSQLLoaderConfig:
@@ -46,6 +64,7 @@ class MusicBrainzSQLLoaderConfig:
         ]
         if missing_vars:
             raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
+        health_port = _resolve_health_port()
         pool_min, pool_max = resolve_postgres_pool_sizes(default_min=2, default_max=12)
         return cls(
             amqp_connection=_build_amqp_url(),
@@ -55,6 +74,7 @@ class MusicBrainzSQLLoaderConfig:
             postgres_database=cast("str", postgres_database),
             postgres_pool_min_size=pool_min,
             postgres_pool_max_size=pool_max,
+            health_port=health_port,
         )
 
 

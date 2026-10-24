@@ -55,7 +55,7 @@ See [Import and restart behavior](docs/musicbrainz-sync.md),
 
 PostgreSQL and RabbitMQ credentials are required. Credentials support the Docker
 `VAR_FILE=/run/secrets/...` convention; no legacy default credentials are used. The
-health endpoint listens on port `8010` and identifies the service as
+health endpoint listens on port `8002` (the SQL loader role port; override with `HEALTH_PORT`) and identifies the service as
 `musicbrainz-sql-loader`.
 
 See the [configuration reference](docs/configuration.md) for every variable and default.
@@ -64,7 +64,7 @@ See the [configuration reference](docs/configuration.md) for every variable and 
 
 The loader pushes OpenTelemetry metrics **and traces** over **OTLP/HTTP-protobuf** to the
 collector. There is no gRPC transport and no Prometheus scrape endpoint; the JSON `/health`
-endpoint on port `8010` is unchanged. Only standard OTEL environment variables are read,
+endpoint on port `8002` is unchanged. Only standard OTEL environment variables are read,
 and there are no GrooveMap-specific telemetry variables.
 
 | Variable | Effect |

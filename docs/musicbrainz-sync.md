@@ -275,10 +275,10 @@ across repository boundaries.
 
 The
 [`deployment`](https://github.com/groovemap-music/deployment/blob/main/docs/quick-start.md)
-repository exposes the loader health endpoint on port `8010`:
+repository exposes the loader health endpoint on port `8002` (override with `HEALTH_PORT`):
 
 ```bash
-curl --fail http://localhost:8010/health
+curl --fail http://localhost:8002/health
 ```
 
 Use `message_counts`, `active_consumers`, `completed_files`, and `current_task` in the

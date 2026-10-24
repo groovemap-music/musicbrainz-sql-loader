@@ -44,7 +44,7 @@ parked-message decision.
 
 ## Health
 
-Port `8010` reports `starting` before the PostgreSQL pool exists, `unhealthy` for a
+Port `8002` (`HEALTH_PORT`) reports `starting` before the PostgreSQL pool exists, `unhealthy` for a
 detected stuck state, and `healthy` once the pool is available and consumer state is
 consistent. Connection strings and credentials are never returned or logged.
 
