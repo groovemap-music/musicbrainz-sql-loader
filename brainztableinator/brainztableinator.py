@@ -1261,15 +1261,17 @@ async def main() -> None:
         )
         await asyncio.sleep(startup_delay)
 
-    health_server = HealthServer(8010, get_health_data)
-    health_server.start_background()
-    logger.info("🏥 Health server started on port 8010")
-
+    # Config is loaded first because it carries HEALTH_PORT; an invalid value must fail here
+    # rather than leave a health endpoint on a silently defaulted port.
     try:
         config = MusicBrainzSQLLoaderConfig.from_env()
     except ValueError as e:
         logger.error("❌ Configuration error", error=str(e))
         return
+
+    health_server = HealthServer(config.health_port, get_health_data)
+    health_server.start_background()
+    logger.info(f"🏥 Health server started on port {config.health_port}", health_port=config.health_port)
 
     host, port = parse_postgres_host_port(config.postgres_host)
 
