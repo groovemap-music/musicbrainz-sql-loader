@@ -90,6 +90,37 @@ never arrive would stall the import.
 A row whose alias could not be resolved is still written, with `gm_item_id` left NULL for that
 same job to fill. Identity is additive here: it never dead-letters a record.
 
+## Discogs link events
+
+The Identity Ledger dates every change of a MusicBrainz row's Discogs link. The one-time
+backfill dates the history up to the first load; from then on this loader dates each change as
+it happens, in `public.identity_link_events` (owned by `database-schema`).
+
+Each of the four upserts is one statement that reads the id the row held, writes the new row
+as before, and inserts one event when the two ids differ:
+
+| Stored id | Message id | Event |
+| --- | --- | --- |
+| none | an id | `link_added` |
+| an id | a different id | `link_changed` |
+| an id | none | `link_removed` |
+| equal, or the row is new | | no event |
+
+The event carries `provider = 'musicbrainz'`, the entity kind `provider_aliases` uses (`artist`,
+`label`, `release`, and `master` for a release group), the MBID as `external_id`, both ids,
+`dated_from = 'groovemap_load'`, and `event_at` as the load transaction's own timestamp. Because
+the event is part of the upsert statement, it commits or rolls back with the row, and costs no
+extra round trip. A redelivered message finds its own id already stored, so reprocessing it
+writes nothing; the table's `identity_link_events_idempotence_key` is a backstop behind that.
+
+`source_ref` is the dump version. The producer's record messages do not carry one yet, only its
+`extraction_complete` signal does, so a record is read for `dump_version` and, absent that, is
+filed under `unversioned`.
+
+The loader's database role needs `INSERT` on `public.identity_link_events`. The statement reads
+the stored id without a row lock, so two messages for one MBID racing in separate transactions
+can record the earlier one's id as the later one's `before`.
+
 ## Catalogue identifier aliases
 
 A release also publishes identifiers that are not MusicBrainz's own: the printed `barcode`,

@@ -38,6 +38,12 @@ _ENTITY_TYPE_ALIASES = {"release_group": "release-group"}
 # one per provider's spelling of it.
 RELEASE_GROUP_ENTITY_KIND = "master"
 
+# `identity_link_events.source_ref` is NOT NULL, and a load event names the dump it came from.
+# The producer's record messages do not yet carry one (only `extraction_complete` names the
+# dump `version`, after the records), so a record without `dump_version` is recorded under this
+# fixed value rather than under a guess at which dump it belonged to.
+UNVERSIONED_SOURCE_REF = "unversioned"
+
 # Only pre-identifiers MusicBrainz events need this compatibility block. Current events carry
 # the producer's authoritative block, including its MusicBrainz provenance, unchanged.
 _IDENTIFIERS_VERSION = "1"
@@ -99,6 +105,12 @@ def _get_or(record: dict[str, Any], key: str, default: Any) -> Any:
     """Return the default when a producer emitted an explicit JSON null."""
     value = record.get(key)
     return default if value is None else value
+
+
+def _source_ref(record: dict[str, Any]) -> str:
+    """Return the dump version this record's link events are filed under."""
+    dump_version = record.get("dump_version")
+    return dump_version if isinstance(dump_version, str) and dump_version else UNVERSIONED_SOURCE_REF
 
 
 def _life_span(record: dict[str, Any]) -> dict[str, Any]:
@@ -328,6 +340,7 @@ class MusicBrainzRecordProcessor:
                 record,
                 gm_item_id,
             ),
+            _source_ref(record),
         )
         await self.insert_relationships(conn, mbid, "artist", record.get("relations", []))
         await self.insert_external_links(conn, mbid, "artist", record.get("external_links", []))
@@ -352,6 +365,7 @@ class MusicBrainzRecordProcessor:
                 record,
                 gm_item_id,
             ),
+            _source_ref(record),
         )
         await self.insert_relationships(conn, mbid, "label", record.get("relations", []))
         await self.insert_external_links(conn, mbid, "label", record.get("external_links", []))
@@ -475,6 +489,7 @@ class MusicBrainzRecordProcessor:
                 record,
                 gm_item_id,
             ),
+            _source_ref(record),
         )
         await self.write_release_media(conn, record, media)
         await self._attach_identifier_aliases(conn, mbid, record, gm_item_id)
@@ -497,6 +512,7 @@ class MusicBrainzRecordProcessor:
                 record,
                 gm_item_id,
             ),
+            _source_ref(record),
         )
         await self.insert_relationships(conn, mbid, "release-group", record.get("relations", []))
         await self.insert_external_links(conn, mbid, "release-group", record.get("external_links", []))
