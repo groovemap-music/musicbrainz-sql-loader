@@ -13,6 +13,7 @@ from common import DeliveryResult, Settlement
 
 from brainztableinator.brainztableinator import (
     PROCESSORS,
+    StartupError,
     _channel_prefetch,
     _insert_external_links,
     _insert_relationships,
@@ -2655,7 +2656,8 @@ class TestMain:
 
         mock_pool_class.side_effect = Exception("Cannot create pool")
 
-        await main()
+        with pytest.raises(StartupError):
+            await main()
 
     @pytest.mark.asyncio
     @patch.dict("os.environ", {"STARTUP_DELAY": "0"})
@@ -2672,7 +2674,8 @@ class TestMain:
 
         with patch("brainztableinator.brainztableinator.MusicBrainzSQLLoaderConfig") as mock_config_class:
             mock_config_class.from_env.side_effect = ValueError("Missing env vars")
-            await main()
+            with pytest.raises(StartupError):
+                await main()
 
     @pytest.mark.asyncio
     @patch.dict("os.environ", {"STARTUP_DELAY": "0", "HEALTH_PORT": "not-a-port"})
@@ -2684,7 +2687,8 @@ class TestMain:
         _mock_setup_logging: Mock,
     ) -> None:
         """An invalid HEALTH_PORT stops startup instead of binding a defaulted port."""
-        await main()
+        with pytest.raises(StartupError):
+            await main()
 
         mock_health_server.assert_not_called()
 
@@ -2724,10 +2728,7 @@ class TestMain:
         async def fast_sleep(delay: float) -> None:  # noqa: ARG001
             await original_sleep(0)
 
-        with (
-            patch("asyncio.sleep", side_effect=fast_sleep),
-            patch.dict("os.environ", {"STARTUP_DELAY": "0"}),
-        ):
+        with patch("asyncio.sleep", side_effect=fast_sleep), patch.dict("os.environ", {"STARTUP_DELAY": "0"}), pytest.raises(StartupError):
             await main()
 
     @pytest.mark.asyncio
@@ -2765,10 +2766,7 @@ class TestMain:
         async def fast_sleep(delay: float) -> None:  # noqa: ARG001
             await original_sleep(0)
 
-        with (
-            patch("asyncio.sleep", side_effect=fast_sleep),
-            patch.dict("os.environ", {"STARTUP_DELAY": "0"}),
-        ):
+        with patch("asyncio.sleep", side_effect=fast_sleep), patch.dict("os.environ", {"STARTUP_DELAY": "0"}), pytest.raises(StartupError):
             await main()
 
 
@@ -3533,6 +3531,8 @@ class TestMainEdgeCases:
         with (
             patch("asyncio.sleep", side_effect=fast_sleep),
             patch("brainztableinator.brainztableinator.logger") as mock_logger,
+            patch("brainztableinator.brainztableinator.shutdown_requested", False),
+            pytest.raises(StartupError),
         ):
             await main()
 
