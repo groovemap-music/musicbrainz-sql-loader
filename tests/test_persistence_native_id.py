@@ -50,16 +50,17 @@ async def test_every_upsert_inserts_and_refreshes_the_native_id(
     native_id_position: int,
 ) -> None:
     native_id = uuid4()
-    await getattr(PostgreSQLMusicBrainzWriter(), method)(mock_connection, _values(method, native_id, native_id_position))
+    await getattr(PostgreSQLMusicBrainzWriter(), method)(mock_connection, _values(method, native_id, native_id_position), "20261021-001001")
 
     sql, params = mock_cursor.execute.await_args.args
     columns = re.search(rf"INSERT INTO {re.escape(table)} \(([^)]*)\)", sql).group(1)
     placeholders = re.search(r"VALUES \(([^)]*)\)", sql).group(1)
+    insert_params = params[:-2]  # the trailing two are the link-event lookup's MBID and source_ref
 
     assert [column.strip() for column in columns.split(",")][-1] == "gm_item_id"
     assert len(placeholders.split(",")) == len(columns.split(","))
     assert "gm_item_id = EXCLUDED.gm_item_id" in sql
-    assert len(params) == len(columns.split(","))
+    assert len(insert_params) == len(columns.split(","))
     assert params[native_id_position] == native_id
 
 
@@ -73,6 +74,6 @@ async def test_an_unresolved_record_still_upserts_with_a_null_native_id(
 ) -> None:
     # Identity is additive: a row whose alias could not be resolved is still written, with the
     # column left NULL for the reconciliation job to fill rather than the message dead-lettered.
-    await getattr(PostgreSQLMusicBrainzWriter(), method)(mock_connection, _values(method, None, native_id_position))
+    await getattr(PostgreSQLMusicBrainzWriter(), method)(mock_connection, _values(method, None, native_id_position), "20261021-001001")
 
     assert mock_cursor.execute.await_args.args[1][native_id_position] is None

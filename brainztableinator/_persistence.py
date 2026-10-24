@@ -44,16 +44,46 @@ EXTERNAL_LINK_UPSERTS: dict[bool, str] = {
 }
 
 
+# The Identity Ledger's live half. A load that changes an existing row's Discogs id records the
+# change in `public.identity_link_events` in the same statement as the upsert, so the event
+# commits or rolls back with the row it describes and costs no second round trip.
+#
+# Each upsert below is a three-part statement: `upsert` is the unchanged INSERT ... ON CONFLICT
+# with a RETURNING of the id it stored, `old` reads the id the row held, and the final INSERT
+# writes one event when the two differ. The parameters are the upsert's own, then the MBID
+# `old` looks up, then the `source_ref`. All three see one snapshot, so `old` is the id the row
+# held before this statement whatever `upsert` does. A brand-new row has no `old` row and the
+# join yields nothing, so it writes no event; an unchanged id compares equal and writes none; a
+# redelivered message finds its own id already stored and compares equal, which is what keeps
+# a reprocess from duplicating an event. The event kind is read off the two ids, matching the
+# table's `identity_link_events_link_matches_event` CHECK: no before id is an add, no after id a
+# removal, anything else a change.
+#
+# `event_at` is `now()`, the load transaction's own start, which is how `dated_from =
+# 'groovemap_load'` dates an event. `ON CONFLICT ON CONSTRAINT identity_link_events_idempotence_key
+# DO NOTHING` is the schema's rerun guard and a backstop here: the comparison above already
+# keeps a reprocess from reaching it.
+#
+# `entity_kind` is the value `provider_aliases` holds for the MusicBrainz row: `master` for a
+# release group, as `_record_processing.RELEASE_GROUP_ENTITY_KIND` states.
+#
+# `old` takes no row lock: a lock taken inside this statement could be skipped as
+# self-modified if `upsert` ran first, and taking it in a statement of its own would add the
+# round trip this design avoids. Two messages for one MBID racing in separate transactions can
+# therefore record the earlier one's stored id as the later one's `before`. Each message is one
+# transaction, so the one `event_at` per transaction never collides within the idempotence key.
+
+
 class MusicBrainzWriter(Protocol):
     """Database operations required by MusicBrainz record processing."""
 
-    async def upsert_artist(self, conn: Any, values: tuple[Any, ...]) -> None: ...
+    async def upsert_artist(self, conn: Any, values: tuple[Any, ...], source_ref: str) -> None: ...
 
-    async def upsert_label(self, conn: Any, values: tuple[Any, ...]) -> None: ...
+    async def upsert_label(self, conn: Any, values: tuple[Any, ...], source_ref: str) -> None: ...
 
-    async def upsert_release(self, conn: Any, values: tuple[Any, ...]) -> None: ...
+    async def upsert_release(self, conn: Any, values: tuple[Any, ...], source_ref: str) -> None: ...
 
-    async def upsert_release_group(self, conn: Any, values: tuple[Any, ...]) -> None: ...
+    async def upsert_release_group(self, conn: Any, values: tuple[Any, ...], source_ref: str) -> None: ...
 
     async def insert_relationships(self, conn: Any, rows: list[tuple[Any, ...]]) -> None: ...
 
@@ -87,10 +117,11 @@ class PostgreSQLMusicBrainzWriter:
         """Enable the refresh once the startup probe has found the column."""
         self._refresh_updated_at = enabled
 
-    async def upsert_artist(self, conn: Any, values: tuple[Any, ...]) -> None:
-        params = (*values[:13], Jsonb(values[13]), Jsonb(values[14]), Jsonb(values[15]), values[16])
+    async def upsert_artist(self, conn: Any, values: tuple[Any, ...], source_ref: str) -> None:
+        params = (*values[:13], Jsonb(values[13]), Jsonb(values[14]), Jsonb(values[15]), values[16], values[0], source_ref)
         async with conn.cursor() as cursor:
             await cursor.execute(
+                "WITH upsert AS ("
                 "INSERT INTO musicbrainz.artists "
                 "(mbid, name, sort_name, type, gender, begin_date, end_date, ended, "
                 "area, begin_area, end_area, disambiguation, discogs_artist_id, aliases, tags, data, gm_item_id) "
@@ -105,14 +136,26 @@ class PostgreSQLMusicBrainzWriter:
                 "discogs_artist_id = EXCLUDED.discogs_artist_id, "
                 "aliases = EXCLUDED.aliases, tags = EXCLUDED.tags, "
                 "gm_item_id = EXCLUDED.gm_item_id, "
-                "data = EXCLUDED.data, updated_at = NOW()",
+                "data = EXCLUDED.data, updated_at = NOW() "
+                "RETURNING mbid, discogs_artist_id), "
+                "old AS (SELECT discogs_artist_id FROM musicbrainz.artists WHERE mbid = %s) "
+                "INSERT INTO public.identity_link_events "
+                "(provider, entity_kind, external_id, event, discogs_id_before, discogs_id_after, event_at, dated_from, source_ref) "
+                "SELECT 'musicbrainz', 'artist', upsert.mbid::text, "
+                "CASE WHEN old.discogs_artist_id IS NULL THEN 'link_added' "
+                "WHEN upsert.discogs_artist_id IS NULL THEN 'link_removed' ELSE 'link_changed' END, "
+                "old.discogs_artist_id, upsert.discogs_artist_id, NOW(), 'groovemap_load', %s "
+                "FROM upsert CROSS JOIN old "
+                "WHERE old.discogs_artist_id IS DISTINCT FROM upsert.discogs_artist_id "
+                "ON CONFLICT ON CONSTRAINT identity_link_events_idempotence_key DO NOTHING",
                 params,
             )
 
-    async def upsert_label(self, conn: Any, values: tuple[Any, ...]) -> None:
-        params = (*values[:10], Jsonb(values[10]), values[11])
+    async def upsert_label(self, conn: Any, values: tuple[Any, ...], source_ref: str) -> None:
+        params = (*values[:10], Jsonb(values[10]), values[11], values[0], source_ref)
         async with conn.cursor() as cursor:
             await cursor.execute(
+                "WITH upsert AS ("
                 "INSERT INTO musicbrainz.labels "
                 "(mbid, name, type, label_code, begin_date, end_date, ended, area, disambiguation, discogs_label_id, data, gm_item_id) "
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
@@ -124,14 +167,26 @@ class PostgreSQLMusicBrainzWriter:
                 "disambiguation = EXCLUDED.disambiguation, "
                 "discogs_label_id = EXCLUDED.discogs_label_id, "
                 "gm_item_id = EXCLUDED.gm_item_id, "
-                "data = EXCLUDED.data, updated_at = NOW()",
+                "data = EXCLUDED.data, updated_at = NOW() "
+                "RETURNING mbid, discogs_label_id), "
+                "old AS (SELECT discogs_label_id FROM musicbrainz.labels WHERE mbid = %s) "
+                "INSERT INTO public.identity_link_events "
+                "(provider, entity_kind, external_id, event, discogs_id_before, discogs_id_after, event_at, dated_from, source_ref) "
+                "SELECT 'musicbrainz', 'label', upsert.mbid::text, "
+                "CASE WHEN old.discogs_label_id IS NULL THEN 'link_added' "
+                "WHEN upsert.discogs_label_id IS NULL THEN 'link_removed' ELSE 'link_changed' END, "
+                "old.discogs_label_id, upsert.discogs_label_id, NOW(), 'groovemap_load', %s "
+                "FROM upsert CROSS JOIN old "
+                "WHERE old.discogs_label_id IS DISTINCT FROM upsert.discogs_label_id "
+                "ON CONFLICT ON CONSTRAINT identity_link_events_idempotence_key DO NOTHING",
                 params,
             )
 
-    async def upsert_release(self, conn: Any, values: tuple[Any, ...]) -> None:
-        params = (*values[:6], Jsonb(values[6]), Jsonb(values[7]), values[8])
+    async def upsert_release(self, conn: Any, values: tuple[Any, ...], source_ref: str) -> None:
+        params = (*values[:6], Jsonb(values[6]), Jsonb(values[7]), values[8], values[0], source_ref)
         async with conn.cursor() as cursor:
             await cursor.execute(
+                "WITH upsert AS ("
                 "INSERT INTO musicbrainz.releases "
                 "(mbid, name, barcode, status, release_group_mbid, discogs_release_id, media, data, gm_item_id) "
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
@@ -142,14 +197,26 @@ class PostgreSQLMusicBrainzWriter:
                 "discogs_release_id = EXCLUDED.discogs_release_id, "
                 "media = EXCLUDED.media, "
                 "gm_item_id = EXCLUDED.gm_item_id, "
-                "data = EXCLUDED.data, updated_at = NOW()",
+                "data = EXCLUDED.data, updated_at = NOW() "
+                "RETURNING mbid, discogs_release_id), "
+                "old AS (SELECT discogs_release_id FROM musicbrainz.releases WHERE mbid = %s) "
+                "INSERT INTO public.identity_link_events "
+                "(provider, entity_kind, external_id, event, discogs_id_before, discogs_id_after, event_at, dated_from, source_ref) "
+                "SELECT 'musicbrainz', 'release', upsert.mbid::text, "
+                "CASE WHEN old.discogs_release_id IS NULL THEN 'link_added' "
+                "WHEN upsert.discogs_release_id IS NULL THEN 'link_removed' ELSE 'link_changed' END, "
+                "old.discogs_release_id, upsert.discogs_release_id, NOW(), 'groovemap_load', %s "
+                "FROM upsert CROSS JOIN old "
+                "WHERE old.discogs_release_id IS DISTINCT FROM upsert.discogs_release_id "
+                "ON CONFLICT ON CONSTRAINT identity_link_events_idempotence_key DO NOTHING",
                 params,
             )
 
-    async def upsert_release_group(self, conn: Any, values: tuple[Any, ...]) -> None:
-        params = (*values[:3], Jsonb(values[3]), *values[4:7], Jsonb(values[7]), values[8])
+    async def upsert_release_group(self, conn: Any, values: tuple[Any, ...], source_ref: str) -> None:
+        params = (*values[:3], Jsonb(values[3]), *values[4:7], Jsonb(values[7]), values[8], values[0], source_ref)
         async with conn.cursor() as cursor:
             await cursor.execute(
+                "WITH upsert AS ("
                 "INSERT INTO musicbrainz.release_groups "
                 "(mbid, name, type, secondary_types, first_release_date, disambiguation, discogs_master_id, data, gm_item_id) "
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
@@ -160,7 +227,18 @@ class PostgreSQLMusicBrainzWriter:
                 "disambiguation = EXCLUDED.disambiguation, "
                 "discogs_master_id = EXCLUDED.discogs_master_id, "
                 "gm_item_id = EXCLUDED.gm_item_id, "
-                "data = EXCLUDED.data, updated_at = NOW()",
+                "data = EXCLUDED.data, updated_at = NOW() "
+                "RETURNING mbid, discogs_master_id), "
+                "old AS (SELECT discogs_master_id FROM musicbrainz.release_groups WHERE mbid = %s) "
+                "INSERT INTO public.identity_link_events "
+                "(provider, entity_kind, external_id, event, discogs_id_before, discogs_id_after, event_at, dated_from, source_ref) "
+                "SELECT 'musicbrainz', 'master', upsert.mbid::text, "
+                "CASE WHEN old.discogs_master_id IS NULL THEN 'link_added' "
+                "WHEN upsert.discogs_master_id IS NULL THEN 'link_removed' ELSE 'link_changed' END, "
+                "old.discogs_master_id, upsert.discogs_master_id, NOW(), 'groovemap_load', %s "
+                "FROM upsert CROSS JOIN old "
+                "WHERE old.discogs_master_id IS DISTINCT FROM upsert.discogs_master_id "
+                "ON CONFLICT ON CONSTRAINT identity_link_events_idempotence_key DO NOTHING",
                 params,
             )
 
