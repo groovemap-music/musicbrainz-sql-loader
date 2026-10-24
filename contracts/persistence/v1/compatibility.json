@@ -76,6 +76,27 @@
     "rollback": "every destructive migration requires a tested rollback or restore procedure"
   },
   "contract": "groovemap.persistence",
+  "extraction_history_source": {
+    "check": {
+      "allowed": [
+        "discogs",
+        "musicbrainz"
+      ],
+      "constraint": "extraction_history_source_check",
+      "null_allowed": true
+    },
+    "column": "source",
+    "consumers": [
+      "catalog-api"
+    ],
+    "data": "no default and no backfill: rows written before the column existed keep source NULL, meaning the extractor was not recorded",
+    "index": "idx_extraction_history_source_created_at ON extraction_history (source, created_at DESC)",
+    "introduced_in_contract_version": 1,
+    "kind": "additive",
+    "relation": "public.extraction_history",
+    "type": "VARCHAR(20) NULL",
+    "consumer_rollout": "expand phase: catalog-api pins the revision containing this column before it writes or reads source"
+  },
   "extraction_latch": {
     "columns": {
       "loader_extraction_latch.created_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
@@ -138,6 +159,68 @@
     "semantics": "The future loader commits the final signal and pending job before acknowledging its delivery. It scans due and expired jobs at startup and periodically, claims transactionally with row locking, and fences on both lease token/epoch and the per-loader cursor at the refresh transaction's commit. Refresh, latch stamp, and completed state commit atomically. A failure rolls back or schedules bounded retry; a superseded generation cannot stamp refreshed_at. No delivery may be acknowledged while its sole refresh obligation is in process memory.",
     "rollout": "Schema first. Existing latch rows have NULL generation and remain readable by the current inline writer; the loader cutover must reconcile any unfinished legacy latch before acknowledging a terminal signal under the new protocol. Neither relation schedules work until a loader adopts it. Reverting the loader to inline behavior is safe while retaining these additive objects.",
     "failure_visibility": "The loader must expose pending age, current and last completed versions, attempt count, lease expiry, retry due, sanitized last failure, and superseded count; the schema stores these facts but does not report health itself."
+  },
+  "identity_link_events": {
+    "checks": {
+      "dated_from": [
+        "musicbrainz_fullexport",
+        "groovemap_load"
+      ],
+      "events": [
+        "link_added",
+        "link_changed",
+        "link_removed"
+      ],
+      "link_matches_event": {
+        "constraint": "identity_link_events_link_matches_event",
+        "link_added": "discogs_id_before IS NULL and discogs_id_after IS NOT NULL",
+        "link_changed": "both set and distinct",
+        "link_removed": "discogs_id_before IS NOT NULL and discogs_id_after IS NULL"
+      },
+      "provider": [
+        "musicbrainz"
+      ]
+    },
+    "columns": [
+      "id",
+      "provider",
+      "entity_kind",
+      "external_id",
+      "event",
+      "discogs_id_before",
+      "discogs_id_after",
+      "event_at",
+      "dated_from",
+      "source_ref",
+      "decision_ref",
+      "recorded_at"
+    ],
+    "consumers": [
+      "catalog-api",
+      "musicbrainz-sql-loader"
+    ],
+    "design_decision": "One store for the Identity Ledger's dated link changes, from both the one-time full-export backfill and live loads. provider_aliases and catalog_item_supersessions stamp now() at write time and a supersession's cause is a closed set, so neither can date a link change. dated_from keeps the two provenances apart: a backfilled event reads 'dated from the MusicBrainz full export' because about 9% of its dates belong to older links MusicBrainz replaced, while a load event is dated by its own transaction. discogs_id_before and discogs_id_after are BIGINT, the type of the musicbrainz.*.discogs_*_id columns. entity_kind takes the values provider_aliases uses for MusicBrainz rows. decision_ref is a bare UUID naming the backfill run's admin_audit_log entry and is NULL for a load row. No user data is stored.",
+    "idempotence_key": {
+      "columns": [
+        "dated_from",
+        "source_ref",
+        "provider",
+        "entity_kind",
+        "external_id",
+        "event",
+        "event_at"
+      ],
+      "constraint": "identity_link_events_idempotence_key",
+      "meaning": "a rerun of the same backfill or load inserts the same keys, so INSERT ... ON CONFLICT DO NOTHING makes it a no-op"
+    },
+    "indexes": [
+      "idx_identity_link_events_entity_event_at ON identity_link_events (provider, entity_kind, external_id, event_at)",
+      "idx_identity_link_events_event_at ON identity_link_events (event_at)"
+    ],
+    "introduced_in_contract_version": 1,
+    "kind": "additive",
+    "relation": "public.identity_link_events",
+    "consumer_rollout": "expand phase: catalog-api and musicbrainz-sql-loader pin the revision containing this table before they write or read it"
   },
   "graph_schema": {
     "availability": "unconditional",
@@ -688,6 +771,24 @@
   "owners": [
     "database-schema"
   ],
+  "retired_relations": {
+    "consumer_rollout": "contract phase of expand, migrate consumers, then contract: catalog-api stopped writing and reading both tables (gm-catalog-api-gz4r) and operations-console reads queue and service-health history from VictoriaMetrics, so the drop lands only after a catalog-api release containing that removal is deployed",
+    "data": "historical rows are not migrated; VictoriaMetrics holds the same series at finer resolution for its retention window (ADR 0018)",
+    "decision": "design ADR 0018",
+    "drop_statements": {
+      "public.queue_metrics": "DROP TABLE IF EXISTS queue_metrics",
+      "public.service_health_metrics": "DROP TABLE IF EXISTS service_health_metrics"
+    },
+    "indexes_dropped_with_table": [
+      "idx_queue_metrics_recorded_queue",
+      "idx_service_health_recorded_service"
+    ],
+    "kind": "retirement",
+    "relations": [
+      "public.queue_metrics",
+      "public.service_health_metrics"
+    ]
+  },
   "sources": [
     "src/groovemap_schema/neo4j.py",
     "src/groovemap_schema/postgres.py"
