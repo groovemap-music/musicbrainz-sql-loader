@@ -434,7 +434,7 @@ wheels = [
 [[package]]
 name = "groovemap-database-schema"
 version = "0.4.1"
-source = { git = "https://github.com/groovemap-music/database-schema.git?rev=825bd5c7ba61380b78fa633172444d7ad7e0f633#825bd5c7ba61380b78fa633172444d7ad7e0f633" }
+source = { git = "https://github.com/groovemap-music/database-schema.git?rev=244cb2ba40d8dd80717bcbd5315049896662c99f#244cb2ba40d8dd80717bcbd5315049896662c99f" }
 dependencies = [
     { name = "groovemap-runtime", extra = ["neo4j", "otel", "postgres", "rabbitmq"] },
     { name = "psycopg", extra = ["binary"] },
@@ -483,7 +483,7 @@ dev = [
     { name = "build", specifier = ">=1.6.1" },
     { name = "commitizen", specifier = ">=4.19.2" },
     { name = "cyclonedx-bom", specifier = ">=7.5.0" },
-    { name = "groovemap-database-schema", git = "https://github.com/groovemap-music/database-schema.git?rev=825bd5c7ba61380b78fa633172444d7ad7e0f633" },
+    { name = "groovemap-database-schema", git = "https://github.com/groovemap-music/database-schema.git?rev=244cb2ba40d8dd80717bcbd5315049896662c99f" },
     { name = "mypy", specifier = ">=2.4.0" },
     { name = "pip-audit", specifier = ">=2.10.1" },
     { name = "pip-licenses", specifier = ">=5.5.5" },
