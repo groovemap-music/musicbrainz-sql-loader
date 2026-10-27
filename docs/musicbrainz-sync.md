@@ -28,7 +28,9 @@ flowchart TD
    stream's cancellation grace-period task.
 4. After all four files finish, the producer publishes `extraction_complete` to all four
    exchanges. Each delivered marker reasserts completion for its receiving stream and also
-   starts or replaces its cancellation timer.
+   starts or replaces its cancellation timer. Once all four streams have delivered it for
+   the same extraction, the loader runs the guarded child-row delete-reconciliation
+   described in [File and extraction completion](file-completion-tracking.md#extraction_complete).
 5. When all four streams are marked complete and all four consumers have canceled, the
    loader closes its broker connection. The periodic queue checker later reconnects and
    restarts all stream consumers if any durable queue has work.
@@ -49,14 +51,16 @@ embed a competing schema definition.
 | Release upsert | `musicbrainz.releases` |
 | Relationship batch | `musicbrainz.relationships` |
 | External-link batch | `musicbrainz.external_links` |
+| Release media projection | `graph.issued_on`, `graph.medium`, `graph.media_family` |
+| Discogs link change | `public.identity_link_events` |
 
 The authoritative table and index inventory remains in the
 [`database-schema` architecture](https://github.com/groovemap-music/database-schema/blob/main/docs/architecture.md#postgresql-media-schema).
 
 ## Native catalog identity
 
-Every row this loader writes carries `gm_item_id`, the native catalog identifier from
-[ADR 0009](https://github.com/groovemap-music/design/blob/main/docs/adr/0009-native-catalog-identity.md).
+Every entity row this loader writes carries `gm_item_id`, the native catalog identifier from
+[ADR 0009](https://github.com/groovemap-music/design/blob/main/docs/adr/0009-native-identity-and-provider-aliases.md).
 A provider's own identifier is evidence, not identity: `provider_aliases` maps a
 `(provider, entity_kind, external_id)` triple onto one GrooveMap-minted UUID, and the four
 upserts write the id that mapping yields.
@@ -126,7 +130,7 @@ can record the earlier one's id as the later one's `before`.
 A release also publishes identifiers that are not MusicBrainz's own: the printed `barcode`,
 and the catalogue numbers inside `catalog_numbers`, each an entry of the release's label
 information. Both are alias namespaces the
-[ADR 0009](https://github.com/groovemap-music/design/blob/main/docs/adr/0009-native-catalog-identity.md)
+[ADR 0009](https://github.com/groovemap-music/design/blob/main/docs/adr/0009-native-identity-and-provider-aliases.md)
 provider vocabulary reserves, and
 [ADR 0011](https://github.com/groovemap-music/design/blob/main/docs/adr/0011-catalog-identifiers-and-manufacturing-credits.md)
 decides what fills them. `process_release` attaches both to the release's native id, right
@@ -253,8 +257,9 @@ production recovery or decide the fate of parked messages:
    and re-extract, or re-drive them. The capped live queues previously head-dropped records
    arbitrarily; the DLQ set is not an authoritative complete import. No disposal or replay
    is performed by this code change.
-3. Verify through RabbitMQ's management API that `brainztableinator-release-groups` and
-   `brainzgraphinator-release-groups` each have `consumers > 0` and depths decrease across
+3. Verify through RabbitMQ's management API that
+   `groovemap-musicbrainz-brainztableinator-release-groups` and
+   `groovemap-musicbrainz-brainzgraphinator-release-groups` each have `consumers > 0` and depths decrease across
    successive samples. A registration log or green application healthcheck alone is not
    proof that the broker subscriptions are alive and draining.
 4. Record broker samples, final message disposition, and the recovery outcome on the
