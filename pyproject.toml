@@ -66,7 +66,7 @@ override-dependencies = ["groovemap-runtime[neo4j,otel,postgres,rabbitmq] @ git+
 
 [tool.uv.sources]
 groovemap-runtime = { git = "https://github.com/groovemap-music/python-libraries.git", rev = "9bac0220df80fdb550fde78d4db8228ca4273625" }
-groovemap-database-schema = { git = "https://github.com/groovemap-music/database-schema.git", rev = "825bd5c7ba61380b78fa633172444d7ad7e0f633" }
+groovemap-database-schema = { git = "https://github.com/groovemap-music/database-schema.git", rev = "244cb2ba40d8dd80717bcbd5315049896662c99f" }
 
 [tool.ruff]
 extend-exclude = ["brainztableinator/catalog_contract.py"]
