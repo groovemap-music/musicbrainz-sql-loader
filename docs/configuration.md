@@ -52,9 +52,13 @@ an unbounded append-only file.
 | `LOG_LEVEL` | `INFO` | Log verbosity; an unrecognized value falls back to `INFO` |
 | `LOG_FILE_MAX_BYTES` | `104857600` (100 MiB) | Size the active log file rolls over at |
 | `LOG_FILE_BACKUP_COUNT` | `5` | Number of rotated backup files retained |
+| `ENVIRONMENT` | `development` | Value of the `environment` field on every log entry; does not change verbosity |
 
-A non-numeric or non-positive override for either variable falls back to its default
-rather than disabling rotation.
+A non-numeric or non-positive override for either rotation variable falls back to its
+default rather than disabling rotation.
+
+The OpenTelemetry variables are listed in the README's
+[Telemetry](../README.md#telemetry) section.
 
 ## Runtime endpoints
 

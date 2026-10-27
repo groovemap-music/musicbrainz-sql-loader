@@ -29,8 +29,15 @@ acknowledging `file_complete`, preventing a false stuck state. Once all four str
 marked complete and their consumers have canceled, the loader closes the active broker
 connection and enters periodic queue-check mode.
 
-Unlike SQL loaders that own stale-row purging, this service does not infer deletion from
-a timestamp. It stores the current MusicBrainz records supplied by the producer. Schema
+The signal also drives delete-reconciliation of the two child-row tables every entity
+kind writes, `musicbrainz.relationships` and `musicbrainz.external_links`. Because all four
+kinds share those tables, the purge waits until every stream has delivered
+`extraction_complete` for the same `started_at`, then deletes the rows whose `updated_at`
+predates that boundary. It is skipped when a record was dead-lettered during the
+extraction, when the producer reported no records for some entity kind, or when the delete
+would remove 90% or more of a table. A failed purge requeues the signal and withdraws that
+stream's completion. When the pinned schema does not provide `updated_at` on those tables,
+reconciliation stays off and loading continues. Entity rows are never purged. Schema
 constraints and migrations remain owned by `database-schema`.
 
 ## Recovery and monitoring

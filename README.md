@@ -30,6 +30,13 @@ Each record is written in a single transaction with idempotent `ON CONFLICT` beh
 [`database-schema`](https://github.com/groovemap-music/database-schema) repository owns
 the `musicbrainz` schema definition and initialization image.
 
+A release also writes the MusicBrainz half of `graph.issued_on` and the shared
+`graph.medium` and `graph.media_family` vocabulary rows (see
+[Graph media](docs/graph-media.md)), and each entity upsert records a change of its Discogs
+link in `public.identity_link_events` (see
+[Discogs link events](docs/musicbrainz-sync.md#discogs-link-events)). Both commit in the
+same transaction as the record.
+
 Each of the four entity upserts also writes `gm_item_id`, the native catalog identifier. A
 record naming its Discogs counterpart attaches to that item's existing id rather than minting
 a parallel one; everything else mints its own. See
@@ -42,7 +49,10 @@ resolves to the same item. See
 
 Both `file_complete` and `extraction_complete` mark the receiving stream complete and
 schedule its consumer for cancellation after a configurable grace period. The producer
-publishes the version-level `extraction_complete` signal to all four exchanges. A graceful
+publishes the version-level `extraction_complete` signal to all four exchanges. Once all
+four streams have delivered it for the same extraction, the loader removes the
+`musicbrainz.relationships` and `musicbrainz.external_links` rows that extraction did not
+refresh, behind dead-letter, record-count, and delete-fraction guards. A graceful
 shutdown cancels subscriptions before closing the connection; a delivery that reaches the
 shutdown guard is left unsettled so RabbitMQ can redeliver it once after restart. Completion
 state is intentionally in memory, while records and queues remain durable.
@@ -170,7 +180,7 @@ operator-facing recipe surface is:
 | `just format-check` / `just lint` / `just contract-check` | Run the three source checks independently. |
 | `just source-check` | Run format, lint, and promoted-contract checks together. |
 | `just format` | Apply Ruff formatting and safe lint fixes to the worktree. |
-| `just typecheck` | Type-check the Python source and tests. |
+| `just typecheck` | Type-check the `brainztableinator` package. |
 | `just test` / `just coverage` | Run the same unit and regression suite with coverage; CI uses `coverage`. |
 | `just test-integration` | Exercise delivery settlement and transactions against disposable PostgreSQL. |
 | `just test-parity` | Compare this loader's edges with the graph enricher's, in disposable PostgreSQL and Neo4j. |
