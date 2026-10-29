@@ -14,7 +14,7 @@ from common import DeliveryResult, Settlement
 from brainztableinator.brainztableinator import (
     PROCESSORS,
     StartupError,
-    _channel_prefetch,
+    _consumer_prefetch,
     _insert_external_links,
     _insert_relationships,
     _recover_consumers,
@@ -834,22 +834,22 @@ class TestNullFieldCoalescing:
 # ===========================================================================
 
 
-class TestChannelPrefetch:
-    """Tests for _channel_prefetch (RabbitMQ prefetch coupled to pool capacity)."""
+class TestConsumerPrefetch:
+    """Tests for per-consumer prefetch coupled to the shared pool budget."""
 
     def test_prefetch_matches_pool_max_when_config_loaded(self):
         """Prefetch equals the configured pool max so in-flight handlers can't exceed it."""
         mock_config = MagicMock()
         mock_config.postgres_pool_max_size = 7
         with patch("brainztableinator.brainztableinator.config", mock_config):
-            assert _channel_prefetch() == 7
+            assert _consumer_prefetch() == 7
 
     def test_prefetch_falls_back_when_config_unset(self):
         """Before config loads, prefetch falls back to the default pool max."""
         from brainztableinator.brainztableinator import _DEFAULT_POOL_MAX
 
         with patch("brainztableinator.brainztableinator.config", None):
-            assert _channel_prefetch() == _DEFAULT_POOL_MAX
+            assert _consumer_prefetch() == _DEFAULT_POOL_MAX
 
 
 # ===========================================================================
@@ -3472,6 +3472,8 @@ class TestMainEdgeCases:
         mock_config.postgres_username = "user"
         mock_config.postgres_password = "pass"
         mock_config.postgres_database = "testdb"
+        mock_config.postgres_pool_max_size = 12
+        mock_config.postgres_pool_min_size = 2
         mock_config.amqp_connection = "amqp://guest:guest@localhost:5672/"
 
         original_sleep = asyncio.sleep
@@ -3482,9 +3484,11 @@ class TestMainEdgeCases:
         with (
             patch("asyncio.sleep", side_effect=fast_sleep),
             patch("brainztableinator.brainztableinator.MusicBrainzSQLLoaderConfig") as mock_config_class,
+            patch("brainztableinator.brainztableinator.shutdown_requested", False),
         ):
             mock_config_class.from_env.return_value = mock_config
-            await main()
+            with pytest.raises(StartupError, match="AMQP broker unreachable"):
+                await main()
 
         # Should have used default port 5432
         call_args = mock_pool_class.call_args

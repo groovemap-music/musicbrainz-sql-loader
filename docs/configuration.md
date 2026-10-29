@@ -24,7 +24,7 @@ Credentials have no defaults.
 | --- | ---: | --- |
 | `MUSICBRAINZ_EXCHANGE_PREFIX` | `groovemap-musicbrainz` | Fanout exchange prefix from the promoted producer contract |
 | `POSTGRES_POOL_MIN_SIZE` | `2` | Minimum PostgreSQL pool size |
-| `POSTGRES_POOL_MAX_SIZE` | `12` | Maximum pool size and channel-global AMQP prefetch |
+| `POSTGRES_POOL_MAX_SIZE` | `12` | Maximum pool size, shared database-writer bound, and per-consumer AMQP delivery limit |
 | `CONSUMER_CANCEL_DELAY` | `300` | Seconds between a completion marker and consumer cancellation; `0` disables cancellation |
 | `QUEUE_CHECK_INTERVAL` | `3600` | Seconds between durable-queue checks while idle |
 | `STUCK_CHECK_INTERVAL` | `30` | Seconds between missing-consumer recovery checks |
@@ -33,8 +33,9 @@ Credentials have no defaults.
 | `IDLE_LOG_INTERVAL` | `300` | Seconds between idle status logs |
 | `STARTUP_DELAY` | `5` | Seconds to allow dependencies to start |
 
-Pool sizes are clamped so `1 <= min <= max`. RabbitMQ prefetch is tied to the maximum
-pool size because every in-flight delivery can hold one PostgreSQL connection.
+Pool sizes are clamped so `1 <= min <= max`. Each RabbitMQ consumer's prefetch is tied to
+the maximum pool size; one shared admission budget caps actual PostgreSQL writers across
+all entity consumers and reconciliation work.
 
 The promoted [catalog-event contract](../contracts/catalog-events/v1/contract.json) is the
 authority for entity vocabulary, exchange names, queue templates, and producer provenance.

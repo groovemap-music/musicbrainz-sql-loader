@@ -123,6 +123,7 @@ a repeated signal cannot find them empty and purge the rows the veto protected.
 
 from __future__ import annotations
 
+from contextlib import AsyncExitStack
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -133,6 +134,8 @@ from brainztableinator.queue_names import MUSICBRAINZ_DATA_TYPES
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
+
+    from common import WriteAdmission
 
 
 # The two child-row tables this module reconciles, as (schema, table) pairs. Both
@@ -261,8 +264,10 @@ class StaleChildRowPurge:
         max_delete_fraction: float = DEFAULT_MAX_DELETE_FRACTION,
         tables: Sequence[tuple[str, str]] = RECONCILED_TABLES,
         expected_data_types: Sequence[str] = tuple(MUSICBRAINZ_DATA_TYPES),
+        admission: WriteAdmission | None = None,
     ) -> None:
         self._connection_pool = connection_pool
+        self._admission = admission
         self._logger = logger
         self._max_delete_fraction = max_delete_fraction
         self._tables = tuple(tables)
@@ -421,11 +426,15 @@ class StaleChildRowPurge:
         boundary = self._boundary
         deleted: dict[str, int] = {}
         try:
-            async with self._connection_pool.connection() as conn:
+            async with AsyncExitStack() as stack:
+                if self._admission is not None:
+                    await stack.enter_async_context(self._admission.slot())
+                conn = await stack.enter_async_context(self._connection_pool.connection())
                 await conn.set_autocommit(False)
-                async with conn.transaction(), conn.cursor() as cursor:
-                    for schema, table in self._tables:
-                        deleted[_qualified(schema, table)] = await self._purge_table(cursor, schema, table, boundary)
+                await stack.enter_async_context(conn.transaction())
+                cursor = await stack.enter_async_context(conn.cursor())
+                for schema, table in self._tables:
+                    deleted[_qualified(schema, table)] = await self._purge_table(cursor, schema, table, boundary)
         except Exception as exc:
             self._logger.error(
                 "❌ MusicBrainz delete-reconciliation failed",

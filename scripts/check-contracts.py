@@ -8,8 +8,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PERSISTENCE_PRODUCER_COMMIT = "244cb2ba40d8dd80717bcbd5315049896662c99f"
-SCHEMA_TESTED_RUNTIME_COMMIT = "9bac0220df80fdb550fde78d4db8228ca4273625"
-APPLICATION_RUNTIME_COMMIT = "9bac0220df80fdb550fde78d4db8228ca4273625"
+PERSISTENCE_TESTED_RUNTIME_COMMIT = "9bac0220df80fdb550fde78d4db8228ca4273625"
+APPLICATION_RUNTIME_COMMIT = "fb4577ecef1090d29ad3ea9f6d2a5e9e8edf90d7"
 
 
 def digest(path: Path) -> str:
@@ -33,8 +33,8 @@ assert compatibility["contract"] == "groovemap.persistence"
 assert compatibility["version"] == 1
 assert "property_graph" not in compatibility["graph_schema"]
 assert compatibility["application_runtime"]["tested_version"] == "0.1.0"
-# This is the schema owner's immutable historical test pin, not the loader's active pin.
-assert compatibility["application_runtime"]["tested_commit"] == SCHEMA_TESTED_RUNTIME_COMMIT
+# This is the schema owner's immutable tested runtime pin in the promoted producer artifact.
+assert compatibility["application_runtime"]["tested_commit"] == PERSISTENCE_TESTED_RUNTIME_COMMIT
 runtime_source = pyproject["tool"]["uv"]["sources"]["groovemap-runtime"]
 assert runtime_source["rev"] == APPLICATION_RUNTIME_COMMIT
 assert runtime_compatibility["runtime_commit"] == APPLICATION_RUNTIME_COMMIT
