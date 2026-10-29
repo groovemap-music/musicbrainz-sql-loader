@@ -70,12 +70,14 @@ async def test_real_consumers_bound_writes_and_recover_cancelled_delivery() -> N
     await pool.initialize()
     pool.active = 0
     pool.peak = 0
+    pool.checkout_count = 0
     original_connection = pool.connection
 
     @asynccontextmanager
     async def tracked_connection() -> AsyncIterator[psycopg.AsyncConnection[Any]]:
         async with original_connection() as pooled_connection:
             pool.active += 1
+            pool.checkout_count += 1
             pool.peak = max(pool.peak, pool.active)
             try:
                 yield pooled_connection
@@ -223,14 +225,16 @@ async def test_real_consumers_bound_writes_and_recover_cancelled_delivery() -> N
                         old_holders_started.put_nowait(None)
                         await release_old_holders.wait()
 
-                old_holders = [asyncio.create_task(hold_old_sql_scope()) for _ in range(2)]
-                await asyncio.wait_for(old_holders_started.get(), timeout=5)
-                await asyncio.wait_for(old_holders_started.get(), timeout=5)
-                assert pool.active == 2
-                assert await _count_rows(dsn, schema) == 16
-
                 # Re-enter the loader's actual broker recovery path on the owned broker.
+                old_holders: list[asyncio.Task[None]] = []
                 try:
+                    for _ in range(2):
+                        old_holders.append(asyncio.create_task(hold_old_sql_scope()))
+                    await asyncio.wait_for(old_holders_started.get(), timeout=5)
+                    await asyncio.wait_for(old_holders_started.get(), timeout=5)
+                    assert pool.active == 2
+                    assert await _count_rows(dsn, schema) == 16
+
                     admission.slot = observe_recovery_slot
                     with (
                         patch.object(service, "rabbitmq_manager", SimpleNamespace(connect=AsyncMock(return_value=connection))),
@@ -260,6 +264,8 @@ async def test_real_consumers_bound_writes_and_recover_cancelled_delivery() -> N
                     assert pool.peak <= 2
                 finally:
                     release_old_holders.set()
+                    for task in old_holders:
+                        task.cancel()
                     await asyncio.gather(*old_holders, return_exceptions=True)
                     admission.slot = original_recovery_slot
 
@@ -345,6 +351,7 @@ async def test_real_consumers_bound_writes_and_recover_cancelled_delivery() -> N
                         assert len(completion_results) == len(service.MUSICBRAINZ_DATA_TYPES)
                         assert all(result.settlement is service.Settlement.ACK for _, result in completion_results)
                         assert all(result.outcome == "skipped" for _, result in completion_results)
+                        checkouts_after_purge = pool.checkout_count
 
                         # A duplicate completion at the settled boundary is ACKed
                         # without reopening the purge or deleting another row.
@@ -375,6 +382,7 @@ async def test_real_consumers_bound_writes_and_recover_cancelled_delivery() -> N
                         assert purge.settled_boundary == purge_started_at
                         assert len(duplicate_results) == 1
                         assert duplicate_results[0].settlement is service.Settlement.ACK
+                        assert pool.checkout_count == checkouts_after_purge
                     finally:
                         release_purge_holders.set()
                         await asyncio.gather(*purge_holders, return_exceptions=True)
