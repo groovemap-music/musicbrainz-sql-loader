@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import pytest
+from common import WriteAdmission
 
 
 @pytest.mark.asyncio
@@ -17,7 +18,8 @@ async def test_entity_queues_share_admission_and_cancel_safely(monkeypatch) -> N
     cfg.postgres_pool_max_size = 2
     monkeypatch.setattr(service, "config", cfg)
     monkeypatch.setattr(service, "shutdown_requested", False)
-    monkeypatch.setattr(service, "_write_slots", None)
+    gate = WriteAdmission(2)
+    monkeypatch.setattr(service, "write_admission", gate)
     active = peak = 0
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -64,8 +66,7 @@ async def test_entity_queues_share_admission_and_cancel_safely(monkeypatch) -> N
         await asyncio.sleep(0)
         assert active == peak == 2
         # A broker reconnect must retain this same budget while old writes drain.
-        gate = service._write_admission()
-        assert service._write_admission() is gate
+        assert service.write_admission is gate
         tasks[-1].cancel()
         tasks[0].cancel()
         results = await asyncio.gather(tasks[-1], tasks[0], return_exceptions=True)

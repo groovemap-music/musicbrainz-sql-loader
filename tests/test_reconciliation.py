@@ -11,12 +11,13 @@ restart cannot move it forward onto rows the run itself wrote.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from common import DeliveryResult, Settlement
+from common import DeliveryResult, Settlement, WriteAdmission
 from psycopg.errors import IntegrityError
 
 import brainztableinator.brainztableinator as service
@@ -94,6 +95,13 @@ def _script_counts(mock_cursor: MagicMock, counts: Sequence[tuple[int, int]], ro
 
 def _latched(mock_async_pool: MagicMock, started_at: datetime = BOUNDARY, **kwargs: Any) -> StaleChildRowPurge:
     """Return a purge with all four signals collected for one boundary."""
+    if "admission" not in kwargs:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass  # Synchronous latch-only tests never execute the purge.
+        else:
+            kwargs["admission"] = WriteAdmission(4)
     purge = StaleChildRowPurge(mock_async_pool, MagicMock(), **kwargs)
     for data_type in DATA_TYPES:
         purge.record_completion(data_type, _signal(started_at))
@@ -103,6 +111,46 @@ def _latched(mock_async_pool: MagicMock, started_at: datetime = BOUNDARY, **kwar
 
 class TestDeleteFractionCap:
     """The cap refuses a shrink larger than a real upstream deletion could be."""
+
+    @pytest.mark.asyncio
+    async def test_purge_waits_for_shared_admission_before_pool_checkout(
+        self,
+        mock_async_pool: MagicMock,
+    ) -> None:
+        admission = WriteAdmission(1)
+        purge = _latched(mock_async_pool, admission=admission)
+        purge._purge_table = AsyncMock(return_value=0)
+        holder_started = asyncio.Event()
+        release_holder = asyncio.Event()
+
+        async def hold_database_slot() -> None:
+            async with admission.slot():
+                holder_started.set()
+                await release_holder.wait()
+
+        holder = asyncio.create_task(hold_database_slot())
+        await holder_started.wait()
+        purge_task = asyncio.create_task(purge.purge())
+        await asyncio.sleep(0)
+        mock_async_pool.connection.assert_not_called()
+
+        release_holder.set()
+        await holder
+        await purge_task
+
+        mock_async_pool.connection.assert_called_once_with()
+        assert purge._purge_table.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_purge_fails_closed_without_shared_admission(self, mock_async_pool: MagicMock) -> None:
+        purge = _latched(mock_async_pool, admission=None)
+        purge._admission = None
+        purge._purge_table = AsyncMock(return_value=0)
+
+        await purge.purge()
+
+        mock_async_pool.connection.assert_not_called()
+        purge._purge_table.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_purge_refuses_when_the_delete_fraction_reaches_the_cap(
@@ -333,7 +381,7 @@ class TestBoundaryComesFromTheMessage:
         it would sit after everything the run wrote before the restart and delete it.
         """
         _script_counts(mock_cursor, [(100, 10), (100, 10)], rowcounts=[10, 10])
-        restarted = StaleChildRowPurge(mock_async_pool, MagicMock())
+        restarted = StaleChildRowPurge(mock_async_pool, MagicMock(), admission=WriteAdmission(4))
         for data_type in DATA_TYPES:
             restarted.record_completion(data_type, _signal())
 
