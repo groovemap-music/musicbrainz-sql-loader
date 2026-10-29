@@ -19,10 +19,31 @@ flowchart LR
 
 ## PostgreSQL
 
-The async pool defaults to 2–12 connections. Channel-global AMQP prefetch equals the
-configured pool maximum, so RabbitMQ never sends more concurrent work than the pool can
-service. Each catalog record uses one bounded transaction, and relationship and external
-link children use `executemany` to reduce round trips.
+The async pool defaults to 2–12 connections. Each entity consumer's AMQP delivery limit
+equals the configured pool maximum, while one shared `WriteAdmission` budget caps actual
+database writers across all four entity handlers and same-pool reconciliation. Each
+catalog record uses one bounded transaction, and relationship and external-link children
+use `executemany` to reduce round trips.
+
+The budget is created once per service lifespan after the pool initializes and before
+RabbitMQ consumers register. Consumer recovery keeps the same instance. Shutdown waits for
+confirmed consumer cancellation and broker closure, then drains callbacks and SQL scopes
+before closing the pool and clearing the budget. Uncertain cleanup retains both and refuses
+a replacement lifespan; an explicit cleanup retry may clear them after closure and drain
+are confirmed. The published runtime pin `264e1d84c7165525844d3b1210179cfbf72a61f2`
+exposed `DeliveryAdmission`. It was renamed to canonical `WriteAdmission` at
+`40d799c6ae0cd9b11b524f7477642a5c14f5f8f2`, then gained callback and SQL-scope drain
+support at `a86f3e48783a8618be62667c74258eaa30388494`; both producer commits are reviewed
+in [python-libraries PR #21](https://github.com/groovemap-music/python-libraries/pull/21).
+The `40d799c` consumer draft was never published. This additive consumer reconciliation
+builds on earlier local reviewed reference `68851ad31defbe2d24fca28d2354f3b269ea486b`;
+the published loader commits, msgpack 1.2.3 security fix, and producer-owned contract
+artifacts remain intact.
+
+The default checks remain service-free. `just test-admission-integration` starts only
+task-owned disposable RabbitMQ and PostgreSQL containers, disables global QoS in RabbitMQ,
+and exercises the real callback, bounded database activity, cancellation, redelivery, and
+`_recover_consumers` path. It does not accept caller-supplied service URLs.
 
 `InterfaceError`, `OperationalError`, and `DatabaseUnavailableError` are transient. The
 loader waits before requeueing so a maintenance window cannot rapidly consume the quorum

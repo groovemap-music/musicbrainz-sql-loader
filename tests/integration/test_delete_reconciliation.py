@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 import pytest_asyncio
 import structlog
-from common import AsyncPostgreSQLPool
+from common import AsyncPostgreSQLPool, WriteAdmission
 from common.media import map_musicbrainz_release
 from groovemap_schema.postgres import create_postgres_schema
 from psycopg.conninfo import conninfo_to_dict
@@ -111,7 +111,7 @@ def _signal(started_at: datetime) -> dict[str, Any]:
 
 def _latched(pool: AsyncPostgreSQLPool, started_at: datetime) -> StaleChildRowPurge:
     """Return a purge with all four extraction_complete signals collected."""
-    purge = StaleChildRowPurge(pool, logger)
+    purge = StaleChildRowPurge(pool, logger, admission=WriteAdmission(12))
     for data_type in DATA_TYPES:
         purge.record_completion(data_type, _signal(started_at))
     assert purge.is_latched()
@@ -265,7 +265,7 @@ async def test_a_restart_mid_import_does_not_delete_what_that_import_wrote(
         await processor.insert_relationships(conn, ARTIST, "artist", [_relationship(KEPT_TARGET, "member of band")])
 
     # The restart: a brand-new purge, with no memory of anything before it.
-    restarted = StaleChildRowPurge(promoted_schema_pool, logger)
+    restarted = StaleChildRowPurge(promoted_schema_pool, logger, admission=WriteAdmission(12))
 
     # Second half of the import, written after the restart.
     async with promoted_schema_pool.connection() as conn:
@@ -682,7 +682,7 @@ async def test_the_promoted_schema_enables_the_purge_and_a_removed_relationship_
     # The next extraction's dump no longer carries the collaboration.
     await _run_import(promoted_schema_pool, processor, _full_import(carrying_the_removed_relationship=False))
 
-    purge = StaleChildRowPurge(promoted_schema_pool, logger)
+    purge = StaleChildRowPurge(promoted_schema_pool, logger, admission=WriteAdmission(12))
     for data_type in DATA_TYPES[:-1]:
         purge.record_completion(data_type, _signal(started_at))
         assert not purge.is_latched(), "the purge must wait for every entity kind"
