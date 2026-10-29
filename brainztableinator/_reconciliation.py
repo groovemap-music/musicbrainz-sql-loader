@@ -127,6 +127,7 @@ from contextlib import AsyncExitStack
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+from common import DatabaseUnavailableError
 from psycopg import sql
 
 from brainztableinator.queue_names import MUSICBRAINZ_DATA_TYPES
@@ -425,10 +426,11 @@ class StaleChildRowPurge:
 
         boundary = self._boundary
         deleted: dict[str, int] = {}
+        if self._admission is None:
+            raise DatabaseUnavailableError("write admission is not initialized")
         try:
             async with AsyncExitStack() as stack:
-                if self._admission is not None:
-                    await stack.enter_async_context(self._admission.slot())
+                await stack.enter_async_context(self._admission.slot())
                 conn = await stack.enter_async_context(self._connection_pool.connection())
                 await conn.set_autocommit(False)
                 await stack.enter_async_context(conn.transaction())

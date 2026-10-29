@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import uuid
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, patch
@@ -13,10 +15,12 @@ from unittest.mock import AsyncMock, patch
 import aio_pika
 import psycopg
 import pytest
-from common import WriteAdmission
+from common import AsyncPostgreSQLPool, WriteAdmission
 from psycopg import sql
+from psycopg.conninfo import conninfo_to_dict
 
 import brainztableinator.brainztableinator as service
+from brainztableinator._reconciliation import StaleChildRowPurge
 
 
 if TYPE_CHECKING:
@@ -24,27 +28,6 @@ if TYPE_CHECKING:
 
 
 pytestmark = pytest.mark.integration
-
-
-class TrackedPostgresPool:
-    """Minimal real pool protocol that records actual concurrent DB checkouts."""
-
-    def __init__(self, dsn: str, schema: str) -> None:
-        self._dsn = dsn
-        self._schema = schema
-        self.active = 0
-        self.peak = 0
-
-    @asynccontextmanager
-    async def connection(self) -> AsyncIterator[psycopg.AsyncConnection[Any]]:
-        connection = await psycopg.AsyncConnection.connect(self._dsn)
-        self.active += 1
-        self.peak = max(self.peak, self.active)
-        try:
-            yield connection
-        finally:
-            self.active -= 1
-            await connection.close()
 
 
 async def _count_rows(dsn: str, schema: str) -> int:
@@ -69,10 +52,39 @@ async def test_real_consumers_bound_writes_and_recover_cancelled_delivery() -> N
     await admin.set_autocommit(True)
     schema_ident = sql.Identifier(schema)
     await admin.execute(sql.SQL("CREATE SCHEMA {}").format(schema_ident))
-    await admin.execute(sql.SQL("CREATE TABLE {}.writes (id uuid PRIMARY KEY, entity text NOT NULL)").format(schema_ident))
+    await admin.execute(
+        sql.SQL("CREATE TABLE {}.writes (id uuid PRIMARY KEY, entity text NOT NULL, updated_at timestamptz NOT NULL DEFAULT NOW())").format(
+            schema_ident
+        )
+    )
+    await admin.execute(sql.SQL("CREATE TABLE {}.purge_rows (id integer PRIMARY KEY, updated_at timestamptz NOT NULL)").format(schema_ident))
     await admin.close()
 
-    pool = TrackedPostgresPool(dsn, schema)
+    params = conninfo_to_dict(dsn)
+    pool = AsyncPostgreSQLPool(
+        connection_params={key: params[key] for key in ("host", "port", "dbname", "user", "password")},
+        min_connections=1,
+        max_connections=4,
+        max_retries=1,
+    )
+    await pool.initialize()
+    pool.active = 0
+    pool.peak = 0
+    pool.checkout_count = 0
+    original_connection = pool.connection
+
+    @asynccontextmanager
+    async def tracked_connection() -> AsyncIterator[psycopg.AsyncConnection[Any]]:
+        async with original_connection() as pooled_connection:
+            pool.active += 1
+            pool.checkout_count += 1
+            pool.peak = max(pool.peak, pool.active)
+            try:
+                yield pooled_connection
+            finally:
+                pool.active -= 1
+
+    pool.connection = tracked_connection
     admission = WriteAdmission(2)
     connection = await aio_pika.connect(amqp_url)
     queues: dict[str, Any] = {}
@@ -158,58 +170,247 @@ async def test_real_consumers_bound_writes_and_recover_cancelled_delivery() -> N
                 )
                 recovery_id = str(uuid.uuid4())
                 started = asyncio.Event()
+                recovered_handler_started = asyncio.Event()
+                recovered_handler_settled = asyncio.Event()
+                recovered_slot_attempted = asyncio.Event()
                 first_tasks: list[asyncio.Task[Any]] = []
+                original_on_data_message = service.on_data_message
 
-                async def cancel_first(message: Any) -> None:
-                    first_tasks.append(asyncio.current_task())  # type: ignore[arg-type]
+                async def capture_handler_task(message: Any, data_type: str) -> Any:
+                    task = asyncio.current_task()
+                    if task is not None and data_type == "artists":
+                        first_tasks.append(task)
+                        if len(first_tasks) == 2:
+                            recovered_handler_started.set()
+                    result = await original_on_data_message(message, data_type)
+                    if data_type == "artists" and len(first_tasks) == 2:
+                        recovered_handler_settled.set()
+                    return result
 
-                    async def block(_connection: Any, _data: dict[str, Any]) -> None:
-                        started.set()
-                        await asyncio.Future()
+                async def block(_connection: Any, _data: dict[str, Any]) -> None:
+                    started.set()
+                    await asyncio.Future()
 
-                    with patch.dict(service.PROCESSORS, {"artists": block}):
-                        await service.on_data_message(message, "artists")
-
-                first_consumer_tag = await recovery_queue.consume(cancel_first)
-                await recovery_channel.default_exchange.publish(
-                    aio_pika.Message(body=f'{{"id":"{recovery_id}","name":"recovery","entity":"artists"}}'.encode()),
-                    routing_key=recovery_queue.name,
-                )
-                await asyncio.wait_for(started.wait(), timeout=5)
+                with patch.object(service, "on_data_message", capture_handler_task), patch.dict(service.PROCESSORS, {"artists": block}):
+                    first_consumer_tag = await recovery_queue.consume(service.make_data_handler("artists"))
+                    await recovery_channel.default_exchange.publish(
+                        aio_pika.Message(body=f'{{"id":"{recovery_id}","name":"recovery","entity":"artists"}}'.encode()),
+                        routing_key=recovery_queue.name,
+                    )
+                    await asyncio.wait_for(started.wait(), timeout=5)
                 assert first_tasks and first_tasks[0] is not None
+
                 first_tasks[0].cancel()
                 await recovery_queue.cancel(first_consumer_tag)
                 await recovery_channel.close()
                 with pytest.raises(asyncio.CancelledError):
                     await first_tasks[0]
-                assert pool.active == 0
-                assert await _count_rows(dsn, schema) == 16
+
+                # Occupy the complete old budget on real pooled connections while
+                # the broker channel is replaced. The requeued callback must enter
+                # the new consumer but cannot check out a connection until these
+                # old-lifespan SQL scopes release their slots.
+                release_old_holders = asyncio.Event()
+                old_holders_started: asyncio.Queue[None] = asyncio.Queue()
+                original_recovery_slot = admission.slot
+
+                @asynccontextmanager
+                async def observe_recovery_slot() -> AsyncIterator[None]:
+                    recovered_slot_attempted.set()
+                    async with original_recovery_slot():
+                        yield
+
+                async def hold_old_sql_scope() -> None:
+                    async with original_recovery_slot(), pool.connection():
+                        old_holders_started.put_nowait(None)
+                        await release_old_holders.wait()
 
                 # Re-enter the loader's actual broker recovery path on the owned broker.
-                with (
-                    patch.object(service, "rabbitmq_manager", SimpleNamespace(connect=AsyncMock(return_value=connection))),
-                    patch.object(service, "active_connection", None),
-                    patch.object(service, "active_channel", None),
-                    patch.object(service, "consumer_tags", {}),
-                    patch.object(service, "connection_consumer_tags", {}),
-                    patch.object(service, "queues", {}),
-                    patch.object(service, "consumer_cancellation_failed", False),
-                ):
-                    await service._recover_consumers()
-                    channels.append(service.active_channel)
+                old_holders: list[asyncio.Task[None]] = []
+                try:
+                    for _ in range(2):
+                        old_holders.append(asyncio.create_task(hold_old_sql_scope()))
+                    await asyncio.wait_for(old_holders_started.get(), timeout=5)
+                    await asyncio.wait_for(old_holders_started.get(), timeout=5)
+                    assert pool.active == 2
+                    assert await _count_rows(dsn, schema) == 16
 
-                for _ in range(100):
-                    if await _count_rows(dsn, schema) == 17:
-                        break
-                    await asyncio.sleep(0.05)
-                assert await _count_rows(dsn, schema) == 17
-                assert pool.peak <= 2
+                    admission.slot = observe_recovery_slot
+                    with (
+                        patch.object(service, "rabbitmq_manager", SimpleNamespace(connect=AsyncMock(return_value=connection))),
+                        patch.object(service, "active_connection", None),
+                        patch.object(service, "active_channel", None),
+                        patch.object(service, "consumer_tags", {}),
+                        patch.object(service, "connection_consumer_tags", {}),
+                        patch.object(service, "queues", {}),
+                        patch.object(service, "consumer_cancellation_failed", False),
+                        patch.object(service, "on_data_message", capture_handler_task),
+                    ):
+                        await service._recover_consumers()
+                        broker_channel = service.active_channel
+                        channels.append(broker_channel)
+
+                    await asyncio.wait_for(recovered_handler_started.wait(), timeout=5)
+                    await asyncio.wait_for(recovered_slot_attempted.wait(), timeout=5)
+                    assert service.write_admission is admission
+                    assert pool.active == 2
+                    assert await _count_rows(dsn, schema) == 16
+                    assert await admission.drain(timeout=0) is False
+
+                    release_old_holders.set()
+                    await asyncio.gather(*old_holders)
+                    await asyncio.wait_for(recovered_handler_settled.wait(), timeout=5)
+                    assert await _count_rows(dsn, schema) == 17
+                    assert pool.peak <= 2
+                finally:
+                    release_old_holders.set()
+                    for task in old_holders:
+                        task.cancel()
+                    await asyncio.gather(*old_holders, return_exceptions=True)
+                    admission.slot = original_recovery_slot
+
+                # Real extraction_complete callbacks share the same admission.
+                # Hold every permit so the final completion cannot start the SQL
+                # purge or settle its boundary until both previous writers finish.
+                purge_started_at = datetime.now(UTC)
+                await admin_insert_purge_rows(dsn, schema, purge_started_at)
+                purge = StaleChildRowPurge(pool, service.logger, tables=((schema, "purge_rows"),), admission=admission)
+                with (
+                    patch.object(service, "stale_row_purge", purge),
+                    patch.object(service, "completed_files", set()),
+                    patch.object(service, "CONSUMER_CANCEL_DELAY", 0),
+                ):
+                    release_purge_holders = asyncio.Event()
+                    purge_holders_started: asyncio.Queue[None] = asyncio.Queue()
+
+                    original_slot = admission.slot
+
+                    async def hold_purge_permit() -> None:
+                        async with original_slot(), pool.connection():
+                            purge_holders_started.put_nowait(None)
+                            await release_purge_holders.wait()
+
+                    purge_holders = [asyncio.create_task(hold_purge_permit()) for _ in range(2)]
+                    purge_waiting = asyncio.Event()
+
+                    @asynccontextmanager
+                    async def observe_purge_slot() -> AsyncIterator[None]:
+                        purge_waiting.set()
+                        async with original_slot():
+                            yield
+
+                    admission.slot = observe_purge_slot
+                    try:
+                        await asyncio.wait_for(purge_holders_started.get(), timeout=5)
+                        await asyncio.wait_for(purge_holders_started.get(), timeout=5)
+                        assert pool.active == 2
+
+                        completion_results: list[tuple[str, Any]] = []
+                        completion_results_ready = asyncio.Event()
+                        three_completions_settled = asyncio.Event()
+                        original_on_data_message_for_completion = service.on_data_message
+
+                        async def capture_completion_result(message: Any, data_type: str) -> Any:
+                            result = await original_on_data_message_for_completion(message, data_type)
+                            if message.body.find(b"extraction_complete") >= 0:
+                                completion_results.append((data_type, result))
+                                if len(completion_results) == len(service.MUSICBRAINZ_DATA_TYPES) - 1:
+                                    three_completions_settled.set()
+                                if len(completion_results) == len(service.MUSICBRAINZ_DATA_TYPES):
+                                    completion_results_ready.set()
+                            return result
+
+                        with patch.object(service, "on_data_message", capture_completion_result):
+                            for data_type in service.MUSICBRAINZ_DATA_TYPES:
+                                signal = {
+                                    "type": "extraction_complete",
+                                    "version": "2026-09-18",
+                                    "timestamp": purge_started_at.isoformat(),
+                                    "started_at": purge_started_at.isoformat(),
+                                    "record_counts": dict.fromkeys(service.MUSICBRAINZ_DATA_TYPES, 1),
+                                }
+                                await broker_channel.default_exchange.publish(
+                                    aio_pika.Message(body=json.dumps(signal).encode()),
+                                    routing_key=service.catalog_queue_name(service.AMQP_CONSUMER_ID, data_type),
+                                )
+
+                            await asyncio.wait_for(purge_waiting.wait(), timeout=5)
+                            assert purge.is_latched()
+                            assert purge.settled_boundary is None
+                            await asyncio.wait_for(three_completions_settled.wait(), timeout=5)
+                            assert len(completion_results) == len(service.MUSICBRAINZ_DATA_TYPES) - 1
+                            assert await _count_purge_rows(dsn, schema) == 3
+                            assert pool.active == 2
+
+                            release_purge_holders.set()
+                            await asyncio.gather(*purge_holders)
+                            await asyncio.wait_for(completion_results_ready.wait(), timeout=5)
+
+                        assert purge.settled_boundary == purge_started_at
+                        assert await _count_purge_rows(dsn, schema) == 2
+                        assert len(completion_results) == len(service.MUSICBRAINZ_DATA_TYPES)
+                        assert all(result.settlement is service.Settlement.ACK for _, result in completion_results)
+                        assert all(result.outcome == "skipped" for _, result in completion_results)
+                        checkouts_after_purge = pool.checkout_count
+
+                        # A duplicate completion at the settled boundary is ACKed
+                        # without reopening the purge or deleting another row.
+                        duplicate_done = asyncio.Event()
+                        duplicate_results: list[Any] = []
+
+                        async def capture_duplicate(message: Any, data_type: str) -> Any:
+                            result = await original_on_data_message_for_completion(message, data_type)
+                            if message.body.find(b"extraction_complete") >= 0:
+                                duplicate_results.append(result)
+                                duplicate_done.set()
+                            return result
+
+                        with patch.object(service, "on_data_message", capture_duplicate):
+                            duplicate_signal = {
+                                "type": "extraction_complete",
+                                "version": "2026-09-18",
+                                "timestamp": purge_started_at.isoformat(),
+                                "started_at": purge_started_at.isoformat(),
+                                "record_counts": dict.fromkeys(service.MUSICBRAINZ_DATA_TYPES, 1),
+                            }
+                            await broker_channel.default_exchange.publish(
+                                aio_pika.Message(body=json.dumps(duplicate_signal).encode()),
+                                routing_key=service.catalog_queue_name(service.AMQP_CONSUMER_ID, "artists"),
+                            )
+                            await asyncio.wait_for(duplicate_done.wait(), timeout=5)
+                        assert await _count_purge_rows(dsn, schema) == 2
+                        assert purge.settled_boundary == purge_started_at
+                        assert len(duplicate_results) == 1
+                        assert duplicate_results[0].settlement is service.Settlement.ACK
+                        assert pool.checkout_count == checkouts_after_purge
+                    finally:
+                        release_purge_holders.set()
+                        await asyncio.gather(*purge_holders, return_exceptions=True)
+                        admission.slot = original_slot
     finally:
         for channel in channels:
             if not channel.is_closed:
                 await channel.close()
         await connection.close()
+        pool.connection = original_connection
+        await pool.close()
         cleanup = await psycopg.AsyncConnection.connect(dsn)
         await cleanup.set_autocommit(True)
         await cleanup.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema)))
         await cleanup.close()
+
+
+async def admin_insert_purge_rows(dsn: str, schema: str, boundary: datetime) -> None:
+    """Create one stale and two fresh rows for the owned real-purge assertion."""
+    async with await psycopg.AsyncConnection.connect(dsn) as connection:
+        statement = sql.SQL("INSERT INTO {}.purge_rows (id, updated_at) VALUES (%s, %s), (%s, %s), (%s, %s)").format(sql.Identifier(schema))
+        await connection.execute(statement, (1, boundary - timedelta(days=1), 2, boundary, 3, boundary))
+
+
+async def _count_purge_rows(dsn: str, schema: str) -> int:
+    async with await psycopg.AsyncConnection.connect(dsn) as connection:
+        statement = sql.SQL("SELECT count(*) FROM {}.purge_rows").format(sql.Identifier(schema))
+        cursor = await connection.execute(statement)
+        row = await cursor.fetchone()
+        assert row is not None
+        return int(row[0])

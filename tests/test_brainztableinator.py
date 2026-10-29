@@ -5,11 +5,12 @@ import contextlib
 import json
 import signal
 import time
+import uuid
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
-from common import DeliveryResult, Settlement
+from common import DeliveryResult, Settlement, WriteAdmission
 
 from brainztableinator.brainztableinator import (
     PROCESSORS,
@@ -835,7 +836,7 @@ class TestNullFieldCoalescing:
 
 
 class TestConsumerPrefetch:
-    """Tests for per-consumer prefetch coupled to the shared pool budget."""
+    """Tests for per-consumer prefetch coupled to pool capacity."""
 
     def test_prefetch_matches_pool_max_when_config_loaded(self):
         """Prefetch equals the configured pool max so in-flight handlers can't exceed it."""
@@ -2600,7 +2601,7 @@ class TestMain:
         mock_rabbitmq_instance.connect.return_value = mock_connection
 
         mock_channel = AsyncMock()
-        mock_rabbitmq_instance.channel.return_value = mock_channel
+        mock_connection.channel.return_value = mock_channel
 
         mock_queue = AsyncMock()
         mock_channel.declare_queue.return_value = mock_queue
@@ -2608,6 +2609,7 @@ class TestMain:
         with patch("brainztableinator.brainztableinator.shutdown_requested", False):
             created_tasks = []
             original_create_task = asyncio.create_task
+            original_wait_for = asyncio.wait_for
 
             def mock_create_task(coro: Any) -> asyncio.Task[Any]:
                 task = original_create_task(coro)
@@ -2615,13 +2617,18 @@ class TestMain:
                 return task
 
             with patch("asyncio.create_task", side_effect=mock_create_task):
+                stop_requested = False
 
-                async def mock_wait_for(coro: Any, timeout: float) -> None:  # noqa: ARG001
+                async def mock_wait_for(coro: Any, timeout: float) -> Any:
+                    nonlocal stop_requested
                     import brainztableinator.brainztableinator
 
-                    coro.close()
-                    brainztableinator.brainztableinator.shutdown_requested = True
-                    raise TimeoutError()
+                    if not stop_requested:
+                        stop_requested = True
+                        coro.close()
+                        brainztableinator.brainztableinator.shutdown_requested = True
+                        raise TimeoutError()
+                    return await original_wait_for(coro, timeout)
 
                 with patch("asyncio.wait_for", mock_wait_for):
                     await main()
@@ -2633,6 +2640,11 @@ class TestMain:
                         await task
 
         assert mock_pool_class.call_count == 1
+        assert mock_channel.set_qos.call_args.kwargs["global_"] is False
+        import brainztableinator.brainztableinator as bt
+
+        assert bt.connection_pool is None
+        assert bt.write_admission is None
         call_args = mock_pool_class.call_args
         # Budget-aware defaults from MusicBrainzSQLLoaderConfig (resolve_postgres_pool_sizes).
         assert call_args[1]["max_connections"] == 12
@@ -3390,6 +3402,88 @@ class TestMainEdgeCases:
     """Test main() edge cases for improved coverage."""
 
     @pytest.mark.asyncio
+    async def test_confirmed_cleanup_retry_releases_uncertain_lifespan_for_restart(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import brainztableinator.brainztableinator as bt
+
+        pool = MagicMock()
+        pool.close = AsyncMock()
+        admission = WriteAdmission(1)
+        monkeypatch.setattr(bt, "connection_pool", pool)
+        monkeypatch.setattr(bt, "write_admission", admission)
+        monkeypatch.setattr(bt, "_lifecycle_cleanup_uncertain", True)
+
+        with patch.object(bt, "close_rabbitmq_connection", new=AsyncMock(side_effect=[False, True])):
+            assert await bt._dispose_retained_delivery_lifecycle() is False
+            assert bt.connection_pool is pool
+            assert bt.write_admission is admission
+            pool.close.assert_not_awaited()
+
+            with pytest.raises(StartupError, match="previous delivery lifecycle has not drained"):
+                await bt.main()
+
+            assert await bt._dispose_retained_delivery_lifecycle() is True
+
+        assert bt.connection_pool is None
+        assert bt.write_admission is None
+        assert bt._lifecycle_cleanup_uncertain is False
+
+        config = MagicMock(
+            postgres_host="localhost",
+            postgres_database="testdb",
+            postgres_username="test-user",
+            postgres_password=str(uuid.uuid4()),
+            postgres_pool_min_size=1,
+            postgres_pool_max_size=2,
+            health_port=8002,
+            amqp_connection="amqp://guest:guest@localhost:5672/",
+        )
+        restarted_pool = MagicMock()
+        restarted_pool.initialize = AsyncMock()
+        restarted_pool.close = AsyncMock()
+        health = MagicMock()
+        with (
+            patch.object(bt, "shutdown_requested", True),
+            patch.object(bt, "setup_logging"),
+            patch.object(bt, "setup_telemetry"),
+            patch.object(bt, "shutdown_telemetry"),
+            patch.object(bt, "start_event_loop_monitor"),
+            patch.object(bt, "MusicBrainzSQLLoaderConfig") as config_class,
+            patch.object(bt, "HealthServer", return_value=health),
+            patch.object(bt, "AsyncPostgreSQLPool", return_value=restarted_pool) as pool_class,
+            patch.object(bt, "reconciliation_columns_present", new=AsyncMock(return_value=False)),
+            patch.dict("os.environ", {"STARTUP_DELAY": "0"}),
+        ):
+            config_class.from_env.return_value = config
+            await bt.main()
+
+        pool_class.assert_called_once()
+        restarted_pool.close.assert_awaited_once_with()
+        assert bt.connection_pool is None
+        assert bt.write_admission is None
+
+    @pytest.mark.asyncio
+    async def test_clean_failed_start_disposes_pool_and_admission(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import brainztableinator.brainztableinator as bt
+
+        pool = MagicMock()
+        pool.close = AsyncMock()
+        health = MagicMock()
+        monkeypatch.setattr(bt, "connection_pool", pool)
+        monkeypatch.setattr(bt, "write_admission", WriteAdmission(1))
+        monkeypatch.setattr(bt, "stale_row_purge", MagicMock())
+
+        await bt._close_pool_and_health(health)
+
+        health.stop.assert_called_once_with()
+        pool.close.assert_awaited_once_with()
+        assert bt.connection_pool is None
+        assert bt.write_admission is None
+        assert bt.stale_row_purge is None
+
+    @pytest.mark.asyncio
     @patch("brainztableinator.brainztableinator.setup_logging")
     @patch("brainztableinator.brainztableinator.HealthServer")
     @patch("brainztableinator.brainztableinator.AsyncResilientRabbitMQ")
@@ -3428,6 +3522,7 @@ class TestMainEdgeCases:
         with (
             patch("asyncio.sleep", side_effect=fast_sleep),
             patch("brainztableinator.brainztableinator.logger") as mock_logger,
+            pytest.raises(StartupError, match="AMQP broker unreachable"),
         ):
             await main()
 
@@ -3449,6 +3544,8 @@ class TestMainEdgeCases:
         _mock_setup_logging: Mock,
     ) -> None:
         """Test main when postgres_host has no port (default 5432)."""
+        import brainztableinator.brainztableinator as bt
+
         mock_health_instance = MagicMock()
         mock_health_server.return_value = mock_health_instance
 
@@ -3484,7 +3581,6 @@ class TestMainEdgeCases:
         with (
             patch("asyncio.sleep", side_effect=fast_sleep),
             patch("brainztableinator.brainztableinator.MusicBrainzSQLLoaderConfig") as mock_config_class,
-            patch("brainztableinator.brainztableinator.shutdown_requested", False),
         ):
             mock_config_class.from_env.return_value = mock_config
             with pytest.raises(StartupError, match="AMQP broker unreachable"):
@@ -3494,6 +3590,8 @@ class TestMainEdgeCases:
         call_args = mock_pool_class.call_args
         assert call_args[1]["connection_params"]["port"] == 5432
         assert call_args[1]["connection_params"]["host"] == "localhost"
+        assert bt.connection_pool is None
+        assert bt.write_admission is None
 
     @pytest.mark.asyncio
     @patch("brainztableinator.brainztableinator.setup_logging")
@@ -3656,12 +3754,19 @@ class TestMainEdgeCases:
         mock_queue = AsyncMock()
         mock_channel.declare_queue.return_value = mock_queue
 
-        async def mock_wait_for(coro: Any, timeout: float) -> None:  # noqa: ARG001
+        original_wait_for = asyncio.wait_for
+        stop_requested = False
+
+        async def mock_wait_for(coro: Any, timeout: float) -> Any:
+            nonlocal stop_requested
             import brainztableinator.brainztableinator
 
-            coro.close()
-            brainztableinator.brainztableinator.shutdown_requested = True
-            raise TimeoutError()
+            if not stop_requested:
+                stop_requested = True
+                coro.close()
+                brainztableinator.brainztableinator.shutdown_requested = True
+                raise TimeoutError()
+            return await original_wait_for(coro, timeout)
 
         original_sleep = asyncio.sleep
 
@@ -3731,10 +3836,14 @@ class TestRecoverConsumersAllTypesBrainztableinator:
         mock_rmq = AsyncMock()
         mock_rmq.connect = AsyncMock(return_value=mock_connection)
 
+        gate = WriteAdmission(12)
+        bt.write_admission = gate
         with patch.object(bt, "rabbitmq_manager", mock_rmq), patch.object(bt, "logger"):
             await bt._recover_consumers()
 
+        assert bt.write_admission is gate
         assert set(bt.consumer_tags.keys()) == expected
+        assert mock_channel.set_qos.call_args.kwargs["global_"] is False
 
         bt.consumer_tags = {}
         bt.active_connection = None

@@ -146,7 +146,22 @@ def reset_cancellation_failure(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest_asyncio.fixture(autouse=True)
 async def service_write_admission(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Give each async service test one loop-owned write budget, as main does."""
+    """Give each async service test one loop-owned budget, as main does."""
     import brainztableinator.brainztableinator as service
 
     monkeypatch.setattr(service, "write_admission", WriteAdmission(12))
+
+
+@pytest.fixture(autouse=True)
+def isolated_delivery_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep module lifecycle state isolated between service tests."""
+    import brainztableinator.brainztableinator as service
+
+    monkeypatch.setattr(service, "_lifecycle_cleanup_uncertain", False)
+    monkeypatch.setattr(service, "connection_pool", None)
+    monkeypatch.setattr(service, "shutdown_requested", False)
+    monkeypatch.setattr(service, "active_connection", None)
+    monkeypatch.setattr(service, "active_channel", None)
+    monkeypatch.setattr(service, "consumer_tags", {})
+    monkeypatch.setattr(service, "connection_consumer_tags", {})
+    monkeypatch.setattr(service, "consumer_cancellation_failed", False)

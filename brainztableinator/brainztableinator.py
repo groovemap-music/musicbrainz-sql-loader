@@ -405,11 +405,7 @@ async def _configure_consumer_qos(channel: Any) -> None:
     """Set supported per-consumer QoS before registering consumers on this channel."""
     prefetch = _consumer_prefetch()
     await channel.set_qos(prefetch_count=prefetch, global_=False)
-    logger.info(
-        "🔧 RabbitMQ per-consumer delivery limit configured",
-        per_consumer_delivery_limit=prefetch,
-        shared_database_writer_bound=prefetch,
-    )
+    logger.info("RabbitMQ per-consumer delivery limit configured", per_consumer_delivery_limit=prefetch)
 
 
 message_counts = {"artists": 0, "labels": 0, "release-groups": 0, "releases": 0}
@@ -452,6 +448,7 @@ connection_params: dict[str, Any] = {}
 
 connection_pool: AsyncPostgreSQLPool | None = None
 write_admission: WriteAdmission | None = None
+_lifecycle_cleanup_uncertain = False
 
 # Built in main() once the pool is up, because it needs both the pool and a run start
 # read from the database clock. None until then, which is what makes every consumer of
@@ -955,7 +952,11 @@ def make_data_handler(
     """Create a per-data-type message handler that injects data_type context."""
 
     async def handler(message: AbstractIncomingMessage) -> DeliveryResult:
-        return await on_data_message(message, data_type)
+        admission = write_admission
+        if admission is None:
+            raise RuntimeError("Write admission not initialized")
+        async with admission.handler():
+            return await on_data_message(message, data_type)
 
     return handler
 
@@ -1246,11 +1247,34 @@ class StartupError(Exception):
 async def _close_pool_and_health(health_server: HealthServer) -> None:
     """Release what a failed start already opened."""
     health_server.stop()
-    if connection_pool:
+    await _dispose_retained_delivery_lifecycle()
+
+
+async def _dispose_retained_delivery_lifecycle() -> bool:
+    """Close the broker, drain shared work, then release this lifespan's pool."""
+    global connection_pool, write_admission, stale_row_purge, _lifecycle_cleanup_uncertain
+
+    broker_closed = await close_rabbitmq_connection()
+    admission = write_admission
+    drained = await admission.drain(timeout=CONSUMER_CANCEL_TIMEOUT) if broker_closed and admission is not None else admission is None
+    if not broker_closed or not drained:
+        _lifecycle_cleanup_uncertain = True
+        logger.error("Delivery lifecycle cleanup is unconfirmed; retaining pool and write admission")
+        return False
+
+    if connection_pool is not None:
         try:
             await connection_pool.close()
-        except Exception as e:
-            logger.warning("⚠️ Error closing connection pool", error=str(e))
+        except Exception as error:
+            _lifecycle_cleanup_uncertain = True
+            logger.warning("⚠️ Error closing connection pool", error=str(error))
+            return False
+
+    connection_pool = None
+    write_admission = None
+    stale_row_purge = None
+    _lifecycle_cleanup_uncertain = False
+    return True
 
 
 async def main() -> None:
@@ -1266,7 +1290,24 @@ async def main() -> None:
         active_channel, \
         connection_check_task, \
         consumer_watch_started_at, \
-        stale_row_purge
+        stale_row_purge, \
+        _lifecycle_cleanup_uncertain
+
+    if (
+        _lifecycle_cleanup_uncertain
+        or connection_pool is not None
+        or active_connection is not None
+        or active_channel is not None
+        or consumer_tags
+        or connection_consumer_tags
+        or consumer_cancellation_failed
+    ):
+        raise StartupError("previous delivery lifecycle has not drained")
+
+    # The guard proved there is no retained pool/lifecycle. A budget without its pool
+    # cannot own live SQL work; discard it before this new loop's pool is constructed.
+    write_admission = None
+    stale_row_purge = None
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -1318,8 +1359,8 @@ async def main() -> None:
             health_check_interval=30,
         )
         await connection_pool.initialize()
-        # Construct exactly once in this running loop, after pool policy is known and
-        # before any consumer or same-pool maintenance task can start.
+        # One shared permit budget for this pool lifespan, built before consumers
+        # or same-pool maintenance tasks can start. Broker recovery retains it.
         write_admission = WriteAdmission(config.postgres_pool_max_size)
         logger.info("🐘 Connected to PostgreSQL with async resilient connection pool")
         logger.info(
@@ -1329,7 +1370,7 @@ async def main() -> None:
         )
     except Exception as e:
         logger.error("❌ Failed to initialize connection pool", error=str(e))
-        health_server.stop()
+        await _close_pool_and_health(health_server)
         raise StartupError("connection pool initialization failed") from e
 
     # Delete-reconciliation is maintenance, not ingestion, and this loader issues no DDL:
@@ -1403,6 +1444,7 @@ async def main() -> None:
         channel = await amqp_connection.channel()
         active_channel = channel
 
+        # Per-consumer deliveries plus shared pool-capped database write admission.
         await _configure_consumer_qos(channel)
 
         queues = {}
@@ -1476,8 +1518,6 @@ async def main() -> None:
             # below: a still-subscribed consumer keeps being handed messages it
             # can only leave unacked.
             await cancel_all_consumers()
-            if consumer_cancellation_failed:
-                await close_rabbitmq_connection()
 
             progress_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -1489,17 +1529,15 @@ async def main() -> None:
                     await connection_check_task
                 logger.info("✅ Queue checker task stopped")
 
-            for task in list(consumer_cancel_tasks.values()):
+            cancel_tasks = list(consumer_cancel_tasks.values())
+            for task in cancel_tasks:
                 task.cancel()
+            if cancel_tasks:
+                await asyncio.gather(*cancel_tasks, return_exceptions=True)
+            consumer_cancel_tasks.clear()
 
-            await close_rabbitmq_connection()
-
-            try:
-                if connection_pool:
-                    await connection_pool.close()
-                    logger.info("✅ Async connection pool closed")
-            except Exception as e:
-                logger.warning("⚠️ Error closing connection pool", error=str(e))
+            if await _dispose_retained_delivery_lifecycle():
+                logger.info("✅ Async PostgreSQL pool and write admission closed")
 
         health_server.stop()
 

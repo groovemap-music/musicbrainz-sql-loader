@@ -1,212 +1,86 @@
-"""Deterministic coverage for shared database admission across entity consumers."""
-
-from __future__ import annotations
+"""Service wiring must admit database writes before they contend for the pool."""
 
 import asyncio
-from contextlib import asynccontextmanager
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+import contextlib
+import json
+from unittest.mock import AsyncMock, MagicMock
+from uuid import uuid4
 
 import pytest
 from common import WriteAdmission
 
-import brainztableinator.brainztableinator as service
-
-
-VALID_BODY = b'{"id":"550e8400-e29b-41d4-a716-446655440000","name":"Test"}'
-
-
-def _message() -> Any:
-    message = MagicMock()
-    message.body = VALID_BODY
-    return message
-
-
-def _connection() -> AsyncMock:
-    connection = AsyncMock()
-    transaction = AsyncMock()
-    transaction.__aenter__ = AsyncMock(return_value=transaction)
-    transaction.__aexit__ = AsyncMock(return_value=False)
-    connection.transaction = MagicMock(return_value=transaction)
-    return connection
-
 
 @pytest.mark.asyncio
-async def test_mixed_entity_writes_share_the_pool_bound() -> None:
-    """Four entity handlers use one capacity-two budget before pool acquisition."""
-    active = 0
-    peak = 0
+async def test_entity_queues_share_admission_and_cancel_safely(monkeypatch) -> None:
+    from brainztableinator import brainztableinator as service
+
+    cfg = MagicMock()
+    cfg.postgres_pool_max_size = 2
+    monkeypatch.setattr(service, "config", cfg)
+    monkeypatch.setattr(service, "shutdown_requested", False)
+    gate = WriteAdmission(2)
+    monkeypatch.setattr(service, "write_admission", gate)
+    active = peak = 0
     entered = asyncio.Event()
     release = asyncio.Event()
-    pool = MagicMock()
 
-    @asynccontextmanager
-    async def connection():
+    @contextlib.asynccontextmanager
+    async def acquire():
         nonlocal active, peak
         active += 1
         peak = max(peak, active)
-        entered.set()
+        if active == 2:
+            entered.set()
         try:
             await release.wait()
-            yield _connection()
+            yield MagicMock()
         finally:
             active -= 1
 
-    pool.connection = connection
-    processor = AsyncMock()
-    with (
-        patch.object(service, "connection_pool", pool),
-        patch.object(service, "write_admission", WriteAdmission(2)),
-        patch.dict(service.PROCESSORS, dict.fromkeys(service.MUSICBRAINZ_DATA_TYPES, processor)),
-    ):
-        tasks = [asyncio.create_task(service._handle_data_message(_message(), data_type)) for data_type in service.MUSICBRAINZ_DATA_TYPES]
-        await asyncio.wait_for(entered.wait(), timeout=1)
-        await asyncio.sleep(0)
-        assert active == 2
-        assert peak == 2
-        release.set()
-        results = await asyncio.gather(*tasks)
+    conn = MagicMock()
+    conn.set_autocommit = AsyncMock()
+    conn.transaction.return_value = AsyncMock()
 
-    assert peak == 2
-    assert all(result.outcome == "processed" for result in results)
-    assert processor.await_count == len(service.MUSICBRAINZ_DATA_TYPES)
-
-
-@pytest.mark.asyncio
-async def test_cancelled_waiter_does_not_consume_or_leak_a_permit() -> None:
-    admission = WriteAdmission(1)
-    started = asyncio.Event()
-    finish = asyncio.Event()
-
-    async def holder() -> None:
-        async with admission.slot():
-            started.set()
-            await finish.wait()
-
-    first = asyncio.create_task(holder())
-    await started.wait()
-    waiter = asyncio.create_task(holder())
-    await asyncio.sleep(0)
-    waiter.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await waiter
-    finish.set()
-    await first
-    async with asyncio.timeout(1):
-        async with admission.slot():
-            pass
-
-
-@pytest.mark.asyncio
-async def test_cancelled_database_work_releases_admission() -> None:
-    active = 0
-    pool = MagicMock()
-
-    @asynccontextmanager
+    @contextlib.asynccontextmanager
     async def connection():
-        nonlocal active
-        active += 1
-        try:
-            yield _connection()
-        finally:
-            active -= 1
+        async with acquire():
+            yield conn
 
-    pool.connection = connection
-    entered = asyncio.Event()
-
-    async def processor(_connection: Any, _data: dict[str, Any]) -> None:
-        entered.set()
-        await asyncio.Future()
-
-    with (
-        patch.object(service, "connection_pool", pool),
-        patch.object(service, "write_admission", WriteAdmission(1)),
-        patch.dict(service.PROCESSORS, {"artists": processor}),
-    ):
-        task = asyncio.create_task(service._handle_data_message(_message(), "artists"))
-        await entered.wait()
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert active == 0
-        async with asyncio.timeout(1):
-            async with service.write_admission.slot():  # type: ignore[union-attr]
-                pass
-
-
-@pytest.mark.asyncio
-async def test_handler_failure_releases_admission_for_next_entity() -> None:
     pool = MagicMock()
-    pool.connection = MagicMock()
-    connection = _connection()
-    context = AsyncMock()
-    context.__aenter__.return_value = connection
-    context.__aexit__.return_value = False
-    pool.connection.return_value = context
-    failing = AsyncMock(side_effect=RuntimeError("write failed"))
-    succeeding = AsyncMock()
-    with (
-        patch.object(service, "connection_pool", pool),
-        patch.object(service, "write_admission", WriteAdmission(1)),
-        patch.dict(service.PROCESSORS, {"artists": failing, "labels": succeeding}),
-    ):
-        with pytest.raises(RuntimeError, match="write failed"):
-            await service._handle_data_message(_message(), "artists")
-        result = await service._handle_data_message(_message(), "labels")
+    pool.connection.side_effect = connection
+    monkeypatch.setattr(service, "connection_pool", pool)
+    monkeypatch.setattr(service, "PROCESSORS", {kind: AsyncMock() for kind in service.PROCESSORS})
+    kinds = ["artists", "labels", "release-groups", "releases"]
 
-    assert result.outcome == "processed"
-    succeeding.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_negative_control_without_handler_admission_exceeds_pool_budget() -> None:
-    """Demonstrate why global-only QoS cannot bound writes across separate consumers."""
-    active = 0
-    peak = 0
-    started = asyncio.Event()
-    release = asyncio.Event()
-
-    @asynccontextmanager
-    async def unguarded_connection():
-        nonlocal active, peak
-        active += 1
-        peak = max(peak, active)
-        started.set()
-        try:
-            await release.wait()
-            yield _connection()
-        finally:
-            active -= 1
-
-    class NoAdmission:
-        @staticmethod
-        @asynccontextmanager
-        async def slot():
-            yield
-
-    pool = MagicMock(connection=unguarded_connection)
-
-    async def processor(_connection: Any, _data: dict[str, Any]) -> None:
+    messages = []
+    for _ in range(9):
+        message = MagicMock()
+        message.body = json.dumps({"id": str(uuid4()), "sha256": "hash", "name": "record"}).encode()
+        message.headers = {}
+        message.ack = AsyncMock()
+        message.nack = AsyncMock()
+        messages.append(message)
+    tasks = [asyncio.create_task(service.on_data_message(message, kinds[i % 4])) for i, message in enumerate(messages[:8])]
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)
         await asyncio.sleep(0)
-
-    with (
-        patch.object(service, "connection_pool", pool),
-        patch.object(service, "write_admission", NoAdmission()),
-        patch.dict(service.PROCESSORS, dict.fromkeys(service.MUSICBRAINZ_DATA_TYPES, processor)),
-    ):
-        tasks = [asyncio.create_task(service._handle_data_message(_message(), data_type)) for data_type in service.MUSICBRAINZ_DATA_TYPES]
-        await started.wait()
-        await asyncio.sleep(0)
-        assert peak == 4  # Per-consumer prefetch allows four independent consumers in flight.
+        assert active == peak == 2
+        # A broker reconnect must retain this same budget while old writes drain.
+        assert service.write_admission is gate
+        tasks[-1].cancel()
+        tasks[0].cancel()
+        results = await asyncio.gather(tasks[-1], tasks[0], return_exceptions=True)
+        assert all(isinstance(result, asyncio.CancelledError) for result in results)
         release.set()
-        await asyncio.gather(*tasks)
-
-    assert peak > 2
-
-
-@pytest.mark.asyncio
-async def test_consumer_qos_uses_supported_per_consumer_scope() -> None:
-    channel = AsyncMock()
-    with patch.object(service, "config", MagicMock(postgres_pool_max_size=3)):
-        await service._configure_consumer_qos(channel)
-    channel.set_qos.assert_awaited_once_with(prefetch_count=3, global_=False)
+        await asyncio.wait_for(asyncio.gather(*tasks[1:-1]), timeout=2)
+        await asyncio.wait_for(service.on_data_message(messages[-1], kinds[0]), timeout=2)
+        async with asyncio.timeout(2), gate.slot(), gate.slot():
+            assert active == 0 and peak == 2
+        for index, message in enumerate(messages):
+            assert message.ack.await_count == (0 if index in (0, 7) else 1)
+            message.nack.assert_not_awaited()
+    finally:
+        release.set()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
