@@ -2600,7 +2600,7 @@ class TestMain:
         mock_rabbitmq_instance.connect.return_value = mock_connection
 
         mock_channel = AsyncMock()
-        mock_rabbitmq_instance.channel.return_value = mock_channel
+        mock_connection.channel.return_value = mock_channel
 
         mock_queue = AsyncMock()
         mock_channel.declare_queue.return_value = mock_queue
@@ -2633,6 +2633,7 @@ class TestMain:
                         await task
 
         assert mock_pool_class.call_count == 1
+        assert mock_channel.set_qos.call_args.kwargs["global_"] is False
         call_args = mock_pool_class.call_args
         # Budget-aware defaults from MusicBrainzSQLLoaderConfig (resolve_postgres_pool_sizes).
         assert call_args[1]["max_connections"] == 12
@@ -3727,10 +3728,13 @@ class TestRecoverConsumersAllTypesBrainztableinator:
         mock_rmq = AsyncMock()
         mock_rmq.connect = AsyncMock(return_value=mock_connection)
 
+        gate = bt._write_admission()
         with patch.object(bt, "rabbitmq_manager", mock_rmq), patch.object(bt, "logger"):
             await bt._recover_consumers()
 
+        assert bt._write_admission() is gate
         assert set(bt.consumer_tags.keys()) == expected
+        assert mock_channel.set_qos.call_args.kwargs["global_"] is False
 
         bt.consumer_tags = {}
         bt.active_connection = None

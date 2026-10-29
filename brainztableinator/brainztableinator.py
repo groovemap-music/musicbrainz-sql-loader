@@ -20,6 +20,7 @@ from common import (
     AsyncPostgreSQLPool,
     AsyncResilientRabbitMQ,
     DatabaseUnavailableError,
+    DeliveryAdmission,
     DeliveryResult,
     FailureKind,
     HealthServer,
@@ -394,15 +395,25 @@ config: MusicBrainzSQLLoaderConfig | None = None
 # Fallback prefetch when config is not yet loaded (matches MusicBrainzSQLLoaderConfig default).
 _DEFAULT_POOL_MAX = 12
 
+_write_slots: tuple[asyncio.AbstractEventLoop, int, DeliveryAdmission] | None = None
+
+
+def _write_admission() -> DeliveryAdmission:
+    """Share the PostgreSQL writer budget across entity queues and broker reconnects."""
+    global _write_slots
+    loop = asyncio.get_running_loop()
+    capacity = config.postgres_pool_max_size if config is not None else _DEFAULT_POOL_MAX
+    # Settings are fixed while running. Test loops must not reuse a contended gate.
+    if _write_slots is None or _write_slots[:2] != (loop, capacity):
+        _write_slots = (loop, capacity, DeliveryAdmission(capacity))
+    return _write_slots[2]
+
 
 def _channel_prefetch() -> int:
-    """RabbitMQ prefetch coupled to the PostgreSQL pool capacity.
+    """Allow each queue to use the pool; shared admission caps actual writers.
 
-    This loader opens one transaction per message, so every
-    in-flight handler holds a pooled connection for the duration of its write. Bounding
-    the channel's total unacked deliveries (channel-global QoS) to the pool's ``max``
-    means the broker — not the pool's exhausted-wait retry loop — applies backpressure,
-    so the pool is never oversubscribed and the shared PgBouncer budget is respected.
+    Per-consumer QoS bounds unacked deliveries to this count times the consumer
+    count, without RabbitMQ's deprecated channel-global QoS.
     """
     return config.postgres_pool_max_size if config is not None else _DEFAULT_POOL_MAX
 
@@ -817,7 +828,7 @@ async def _recover_consumers() -> None:
             connection_consumer_tags.clear()
             consumer_watch_started_at = time.time()
 
-            await active_channel.set_qos(prefetch_count=_channel_prefetch(), global_=True)
+            await active_channel.set_qos(prefetch_count=_channel_prefetch(), global_=False)
 
             queues = {}
             for data_type in MUSICBRAINZ_DATA_TYPES:
@@ -1087,7 +1098,7 @@ async def _handle_data_message(message: AbstractIncomingMessage, data_type: str)
     if connection_pool is None:
         raise RuntimeError("Connection pool not initialized")
 
-    async with connection_pool.connection() as conn:
+    async with _write_admission().slot(), connection_pool.connection() as conn:
         await conn.set_autocommit(False)
         async with conn.transaction():
             await processor(conn, data)
@@ -1389,13 +1400,14 @@ async def main() -> None:
         channel = await amqp_connection.channel()
         active_channel = channel
 
-        # Channel-global QoS bounds total in-flight handlers across all consumers to the
-        # pool capacity, so the connection pool is never oversubscribed (see _channel_prefetch).
+        # Per-consumer deliveries plus shared pool-capped database write admission.
         prefetch = _channel_prefetch()
-        await channel.set_qos(prefetch_count=prefetch, global_=True)
+        await channel.set_qos(prefetch_count=prefetch, global_=False)
         logger.info(
-            "🔧 QoS prefetch configured (channel-global, coupled to pool max)",
+            "🔧 QoS prefetch configured (per-consumer, shared database admission)",
             prefetch_count=prefetch,
+            channel_wide_max=prefetch * len(MUSICBRAINZ_DATA_TYPES),
+            database_writer_max=prefetch,
         )
 
         queues = {}
