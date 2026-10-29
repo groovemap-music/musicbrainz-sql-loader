@@ -127,6 +127,7 @@ from contextlib import AsyncExitStack
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+from common import DatabaseUnavailableError
 from psycopg import sql
 
 from brainztableinator.queue_names import MUSICBRAINZ_DATA_TYPES
@@ -426,8 +427,7 @@ class StaleChildRowPurge:
         boundary = self._boundary
         deleted: dict[str, int] = {}
         if self._admission is None:
-            self._logger.error("❌ MusicBrainz delete-reconciliation refused: write admission is not initialized")
-            return {}
+            raise DatabaseUnavailableError("write admission is not initialized")
         try:
             async with AsyncExitStack() as stack:
                 await stack.enter_async_context(self._admission.slot())

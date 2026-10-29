@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from common import DeliveryResult, Settlement, WriteAdmission
+from common import DatabaseUnavailableError, DeliveryResult, Settlement, WriteAdmission
 from psycopg.errors import IntegrityError
 
 import brainztableinator.brainztableinator as service
@@ -147,10 +147,14 @@ class TestDeleteFractionCap:
         purge._admission = None
         purge._purge_table = AsyncMock(return_value=0)
 
-        await purge.purge()
+        with pytest.raises(DatabaseUnavailableError, match="write admission is not initialized"):
+            await purge.purge()
 
         mock_async_pool.connection.assert_not_called()
         purge._purge_table.assert_not_awaited()
+        assert purge.boundary == BOUNDARY
+        assert purge.settled_boundary is None
+        assert purge.signalled == frozenset(DATA_TYPES)
 
     @pytest.mark.asyncio
     async def test_purge_refuses_when_the_delete_fraction_reaches_the_cap(
@@ -794,6 +798,17 @@ def _extraction_complete_message() -> MagicMock:
     return message
 
 
+def _settleable_extraction_delivery() -> AsyncMock:
+    import orjson
+
+    message = AsyncMock()
+    message.body = orjson.dumps(_signal())
+    message.headers = {}
+    message.ack = AsyncMock()
+    message.nack = AsyncMock()
+    return message
+
+
 class TestServiceLatching:
     """How ``extraction_complete`` and a dead letter drive the purge."""
 
@@ -827,6 +842,52 @@ class TestServiceLatching:
 
         assert result == DeliveryResult(Settlement.ACK, "skipped")
         assert purge.calls == 1
+
+    @pytest.mark.asyncio
+    async def test_missing_admission_requeues_latched_control_and_retry_purges_once(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mock_async_pool: MagicMock,
+        mock_cursor: MagicMock,
+    ) -> None:
+        """A transient wiring gap must retain the latch until a fresh broker delivery retries it."""
+        _script_counts(mock_cursor, [(100, 10), (100, 5)], rowcounts=[10, 5])
+        purge = _latched(mock_async_pool, admission=None)
+        monkeypatch.setattr(service, "stale_row_purge", purge)
+        monkeypatch.setattr(service, "completed_files", {"artists", "labels", "release-groups"})
+        monkeypatch.setattr(service, "CONSUMER_CANCEL_DELAY", 0)
+
+        first_delivery = _settleable_extraction_delivery()
+        await service.on_data_message(first_delivery, "releases")
+
+        first_delivery.ack.assert_not_awaited()
+        first_delivery.nack.assert_awaited_once_with(requeue=True)
+        mock_async_pool.connection.assert_not_called()
+        assert purge.boundary == BOUNDARY
+        assert purge.settled_boundary is None
+        assert purge.signalled == frozenset(DATA_TYPES)
+        assert "releases" not in service.completed_files
+
+        admission = service.write_admission
+        assert admission is not None
+        purge._admission = admission
+        retry_delivery = _settleable_extraction_delivery()
+        await service.on_data_message(retry_delivery, "releases")
+
+        retry_delivery.ack.assert_awaited_once_with()
+        retry_delivery.nack.assert_not_awaited()
+        mock_async_pool.connection.assert_called_once_with()
+        assert purge.settled_boundary == BOUNDARY
+        executed = mock_cursor.execute.await_count
+        assert executed == 6  # Both tables were counted, stale rows counted, and deleted.
+
+        duplicate_delivery = _settleable_extraction_delivery()
+        await service.on_data_message(duplicate_delivery, "releases")
+
+        duplicate_delivery.ack.assert_awaited_once_with()
+        duplicate_delivery.nack.assert_not_awaited()
+        mock_async_pool.connection.assert_called_once_with()
+        assert mock_cursor.execute.await_count == executed
 
     @pytest.mark.asyncio
     async def test_the_purge_no_longer_reads_completed_files(
