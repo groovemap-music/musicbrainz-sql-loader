@@ -7,7 +7,8 @@ from unittest.mock import MagicMock, create_autospec
 from uuid import NAMESPACE_URL, uuid5
 
 import pytest
-from common import AsyncPostgreSQLPool
+import pytest_asyncio
+from common import AsyncPostgreSQLPool, WriteAdmission
 from psycopg import AsyncConnection, AsyncCursor, AsyncTransaction
 
 
@@ -141,3 +142,11 @@ def reset_cancellation_failure(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(service, "consumer_cancellation_failed", False)
     monkeypatch.setattr(service, "consumer_cancel_tasks", {})
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def service_write_admission(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give each async service test one loop-owned write budget, as main does."""
+    import brainztableinator.brainztableinator as service
+
+    monkeypatch.setattr(service, "write_admission", WriteAdmission(12))
