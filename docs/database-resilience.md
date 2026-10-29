@@ -19,10 +19,26 @@ flowchart LR
 
 ## PostgreSQL
 
-The async pool defaults to 2–12 connections. Channel-global AMQP prefetch equals the
-configured pool maximum, so RabbitMQ never sends more concurrent work than the pool can
-service. Each catalog record uses one bounded transaction, and relationship and external
-link children use `executemany` to reduce round trips.
+The async pool defaults to 2–12 connections. Each entity consumer's AMQP delivery limit
+equals the configured pool maximum, while a single `WriteAdmission` budget shared by all
+four entity handlers and same-pool reconciliation keeps actual database writers within
+that maximum. Per-consumer limits alone allow aggregate deliveries across queues to exceed
+the pool size; the shared admission budget provides the aggregate bound. Each catalog
+record uses one bounded transaction, and relationship and external link children use
+`executemany` to reduce round trips.
+
+The budget is created once per service loop after the PostgreSQL pool initializes and
+before RabbitMQ consumers register. It comes from `groovemap-runtime` commit
+`fb4577ecef1090d29ad3ea9f6d2a5e9e8edf90d7`, pinned in `pyproject.toml` and `uv.lock`.
+At this handoff, that reviewed commit exists in the local `python-libraries` checkout but
+has not been pushed or published. Until that changes, local full checks and wheel staging
+must set `GROOVEMAP_RUNTIME_REPO` to that checkout; the dependency metadata keeps the
+canonical GitHub URL and immutable revision.
+The service's default `just check` remains offline. `just test-admission-integration`
+starts exclusively named disposable RabbitMQ and PostgreSQL containers, disables global
+QoS in RabbitMQ, and exercises the real consumer callback, bounded database activity,
+cancellation, broker redelivery, and recovery. It does not accept caller-supplied service
+URLs.
 
 `InterfaceError`, `OperationalError`, and `DatabaseUnavailableError` are transient. The
 loader waits before requeueing so a maintenance window cannot rapidly consume the quorum

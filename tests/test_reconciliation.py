@@ -11,12 +11,13 @@ restart cannot move it forward onto rows the run itself wrote.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from common import DeliveryResult, Settlement
+from common import DeliveryResult, Settlement, WriteAdmission
 from psycopg.errors import IntegrityError
 
 import brainztableinator.brainztableinator as service
@@ -103,6 +104,35 @@ def _latched(mock_async_pool: MagicMock, started_at: datetime = BOUNDARY, **kwar
 
 class TestDeleteFractionCap:
     """The cap refuses a shrink larger than a real upstream deletion could be."""
+
+    @pytest.mark.asyncio
+    async def test_purge_waits_for_shared_write_admission_before_pool_checkout(
+        self,
+        mock_async_pool: MagicMock,
+    ) -> None:
+        admission = WriteAdmission(1)
+        purge = _latched(mock_async_pool, admission=admission)
+        purge._purge_table = AsyncMock(return_value=0)
+        holder_started = asyncio.Event()
+        release_holder = asyncio.Event()
+
+        async def hold_database_slot() -> None:
+            async with admission.slot():
+                holder_started.set()
+                await release_holder.wait()
+
+        holder = asyncio.create_task(hold_database_slot())
+        await holder_started.wait()
+        purge_task = asyncio.create_task(purge.purge())
+        await asyncio.sleep(0)
+        mock_async_pool.connection.assert_not_called()
+
+        release_holder.set()
+        await holder
+        await purge_task
+
+        mock_async_pool.connection.assert_called_once_with()
+        assert purge._purge_table.await_count == 2
 
     @pytest.mark.asyncio
     async def test_purge_refuses_when_the_delete_fraction_reaches_the_cap(

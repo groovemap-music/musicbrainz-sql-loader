@@ -25,6 +25,7 @@ from common import (
     HealthServer,
     OutageBackoff,
     Settlement,
+    WriteAdmission,
     extract_context,
     flush_span,
     get_meter,
@@ -395,16 +396,20 @@ config: MusicBrainzSQLLoaderConfig | None = None
 _DEFAULT_POOL_MAX = 12
 
 
-def _channel_prefetch() -> int:
-    """RabbitMQ prefetch coupled to the PostgreSQL pool capacity.
-
-    This loader opens one transaction per message, so every
-    in-flight handler holds a pooled connection for the duration of its write. Bounding
-    the channel's total unacked deliveries (channel-global QoS) to the pool's ``max``
-    means the broker — not the pool's exhausted-wait retry loop — applies backpressure,
-    so the pool is never oversubscribed and the shared PgBouncer budget is respected.
-    """
+def _consumer_prefetch() -> int:
+    """Return each consumer's delivery limit, coupled to the shared pool budget."""
     return config.postgres_pool_max_size if config is not None else _DEFAULT_POOL_MAX
+
+
+async def _configure_consumer_qos(channel: Any) -> None:
+    """Set supported per-consumer QoS before registering consumers on this channel."""
+    prefetch = _consumer_prefetch()
+    await channel.set_qos(prefetch_count=prefetch, global_=False)
+    logger.info(
+        "🔧 RabbitMQ per-consumer delivery limit configured",
+        per_consumer_delivery_limit=prefetch,
+        shared_database_writer_bound=prefetch,
+    )
 
 
 message_counts = {"artists": 0, "labels": 0, "release-groups": 0, "releases": 0}
@@ -446,6 +451,7 @@ idle_mode = False
 connection_params: dict[str, Any] = {}
 
 connection_pool: AsyncPostgreSQLPool | None = None
+write_admission: WriteAdmission | None = None
 
 # Built in main() once the pool is up, because it needs both the pool and a run start
 # read from the database clock. None until then, which is what makes every consumer of
@@ -817,7 +823,7 @@ async def _recover_consumers() -> None:
             connection_consumer_tags.clear()
             consumer_watch_started_at = time.time()
 
-            await active_channel.set_qos(prefetch_count=_channel_prefetch(), global_=True)
+            await _configure_consumer_qos(active_channel)
 
             queues = {}
             for data_type in MUSICBRAINZ_DATA_TYPES:
@@ -1087,7 +1093,11 @@ async def _handle_data_message(message: AbstractIncomingMessage, data_type: str)
     if connection_pool is None:
         raise RuntimeError("Connection pool not initialized")
 
-    async with connection_pool.connection() as conn:
+    admission = write_admission
+    if admission is None:
+        raise RuntimeError("Write admission not initialized")
+
+    async with admission.slot(), connection_pool.connection() as conn:
         await conn.set_autocommit(False)
         async with conn.transaction():
             await processor(conn, data)
@@ -1247,6 +1257,7 @@ async def main() -> None:
     """Main entry point for the MusicBrainz SQL loader service."""
     global \
         connection_pool, \
+        write_admission, \
         config, \
         connection_params, \
         queues, \
@@ -1307,6 +1318,9 @@ async def main() -> None:
             health_check_interval=30,
         )
         await connection_pool.initialize()
+        # Construct exactly once in this running loop, after pool policy is known and
+        # before any consumer or same-pool maintenance task can start.
+        write_admission = WriteAdmission(config.postgres_pool_max_size)
         logger.info("🐘 Connected to PostgreSQL with async resilient connection pool")
         logger.info(
             "✅ Async connection pool initialized (min: %d, max: %d connections)",
@@ -1327,7 +1341,7 @@ async def main() -> None:
     try:
         if await reconciliation_columns_present(connection_pool, logger):
             _persistence_writer.set_refresh_updated_at(True)
-            stale_row_purge = StaleChildRowPurge(connection_pool, logger)
+            stale_row_purge = StaleChildRowPurge(connection_pool, logger, admission=write_admission)
     except Exception as e:
         logger.error("❌ Delete-reconciliation unavailable this run", error=str(e))
 
@@ -1389,14 +1403,7 @@ async def main() -> None:
         channel = await amqp_connection.channel()
         active_channel = channel
 
-        # Channel-global QoS bounds total in-flight handlers across all consumers to the
-        # pool capacity, so the connection pool is never oversubscribed (see _channel_prefetch).
-        prefetch = _channel_prefetch()
-        await channel.set_qos(prefetch_count=prefetch, global_=True)
-        logger.info(
-            "🔧 QoS prefetch configured (channel-global, coupled to pool max)",
-            prefetch_count=prefetch,
-        )
+        await _configure_consumer_qos(channel)
 
         queues = {}
         for data_type in MUSICBRAINZ_DATA_TYPES:

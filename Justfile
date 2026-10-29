@@ -41,6 +41,11 @@ coverage: test
 test-integration:
     bash scripts/test-integration.sh
 
+# Owned RabbitMQ/PostgreSQL controls for shared database admission. This lane starts both
+# disposable services itself and denies RabbitMQ global QoS; it is outside the default check.
+test-admission-integration:
+    bash scripts/test-admission-integration.sh
+
 # Cross-store parity against musicbrainz-graph-enricher: the same fixture events into
 # this loader's PostgreSQL and the enricher's Neo4j, then a per-edge-label comparison
 # of the two graphs. Starts both pinned containers and removes them, and their
