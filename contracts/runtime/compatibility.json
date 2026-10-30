@@ -1,6 +1,6 @@
 {
   "runtime_repository": "https://github.com/groovemap-music/python-libraries",
-  "runtime_commit": "a86f3e48783a8618be62667c74258eaa30388494",
-  "required_capability": "Bounded /logs file rotation via RotatingFileHandler, LOG_FILE_MAX_BYTES/LOG_FILE_BACKUP_COUNT (gm-python-libraries-dg-9wo9); shared cancellation-safe WriteAdmission with callback and SQL-scope drain for pool-capped writers (gm-python-libraries-9c2)",
+  "runtime_commit": "6d0425f908e01a446b040e2993045e2afe30460e",
+  "required_capability": "Bounded /logs file rotation via RotatingFileHandler, LOG_FILE_MAX_BYTES/LOG_FILE_BACKUP_COUNT (gm-python-libraries-dg-9wo9); shared cancellation-safe WriteAdmission with callback and SQL-scope drain for pool-capped writers (gm-python-libraries-9c2); LOG_FILE override with console fallback when the log file cannot be opened (gm-python-libraries-gyq)",
   "producer_contract_commit": "ae01d967e72e18c82cac2e844daa1dfeb81a32a6"
 }
