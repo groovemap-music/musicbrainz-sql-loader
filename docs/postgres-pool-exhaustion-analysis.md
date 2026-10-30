@@ -34,8 +34,10 @@ flowchart LR
 
 - The loader's default pool is 2–12 connections and can be clamped with
   `POSTGRES_POOL_MIN_SIZE` and `POSTGRES_POOL_MAX_SIZE`.
-- RabbitMQ channel-global prefetch equals the loader's pool maximum. The broker now
-  applies backpressure before handlers contend for unavailable connections.
+- Each RabbitMQ consumer's prefetch (per-consumer QoS, not channel-global) equals the
+  loader's pool maximum, and one shared write-admission budget of the same size caps actual
+  database writers across all four consumers. The broker now applies backpressure before
+  handlers contend for unavailable connections.
 - Relationship and external-link child rows use `executemany`, reducing each message's
   database round trips to the entity upsert plus two batched child operations.
 - Transient acquisition failures retain bounded retry and outage backoff; deterministic
