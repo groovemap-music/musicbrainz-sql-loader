@@ -171,6 +171,10 @@ then compares the two graphs per edge label against a registry of the difference
 remain and why. It starts and removes both containers itself, and is outside `just check`
 and outside CI. See [Cross-store parity with the graph enricher](docs/store-parity.md).
 
+`just test-admission-integration` is the other opt-in lane. It starts disposable RabbitMQ and
+PostgreSQL containers itself and checks that shared write admission stays bounded across
+cancellation, redelivery, and consumer recovery. See [Database resilience](docs/database-resilience.md#postgresql).
+
 `just check` is credential-free: PostgreSQL and RabbitMQ boundaries are mocked. The
 operator-facing recipe surface is:
 
@@ -183,6 +187,7 @@ operator-facing recipe surface is:
 | `just typecheck` | Type-check the `brainztableinator` package. |
 | `just test` / `just coverage` | Run the same unit and regression suite with coverage; CI uses `coverage`. |
 | `just test-integration` | Exercise delivery settlement and transactions against disposable PostgreSQL. |
+| `just test-admission-integration` | Exercise shared write admission and consumer recovery against disposable RabbitMQ and PostgreSQL. |
 | `just test-parity` | Compare this loader's edges with the graph enricher's, in disposable PostgreSQL and Neo4j. |
 | `just secret-scan` | Scan Git history and the working tree with Gitleaks. |
 | `just build` | Build the wheel and source distribution. |

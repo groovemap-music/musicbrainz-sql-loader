@@ -1,7 +1,8 @@
 # SQL/PGQ removal and recovery
 
 PostgreSQL 19 removed SQL/PGQ before release. This loader therefore pins
-`groovemap-database-schema` at `9a50949b1810f3e61adae2f89b86acec2e20c4a3`, the
+`groovemap-database-schema` at `244cb2ba40d8dd80717bcbd5315049896662c99f` (see
+`pyproject.toml`), which includes `9a50949b1810f3e61adae2f89b86acec2e20c4a3`, the
 revision that removes the experimental property graph declaration and activation switch.
 The promoted copy of `contracts/persistence/v1/compatibility.json` no longer advertises
 `graph.catalog` or an SQL/PGQ activation contract.
