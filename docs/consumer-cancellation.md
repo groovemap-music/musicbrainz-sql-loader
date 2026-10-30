@@ -46,9 +46,17 @@ Process shutdown is a separate path from file completion:
 
 1. Cancel and join pending grace timers, then confirm consumer cancellations.
    After the first failed RPC, close the uncertain channel before further teardown.
-2. Cancel progress, queue-check, and pending cancellation tasks.
+2. Cancel progress, queue-check, and pending cancellation tasks. The health server stops
+   together with the pool cleanup.
 3. Close the RabbitMQ connection, which requeues any unsettled deliveries once.
-4. Close the PostgreSQL pool and health server.
+4. Drain the shared write admission: in-flight callbacks and SQL scopes, bounded by a
+   five-second deadline.
+5. Close the PostgreSQL pool and clear the admission budget.
+
+If broker closure or the drain is unconfirmed, or the pool fails to close, the loader keeps
+the pool and admission and refuses to start a replacement lifespan until cleanup is
+confirmed. See [Database resilience](database-resilience.md#postgresql) for how the
+admission budget is owned.
 
 A delivery that reaches the handler after shutdown begins is deliberately left unsettled; a
 handler already inside its transaction may still finish normally. An immediate
