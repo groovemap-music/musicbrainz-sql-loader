@@ -44,13 +44,16 @@ Deployment-specific values and secret mounting belong to the
 
 ## Logging
 
-The service writes JSON logs to stdout and to `/logs/musicbrainz-sql-loader.log` via
-`groovemap-runtime`'s `setup_logging`. The file sink is a size-capped rotating handler, not
-an unbounded append-only file.
+The service writes JSON logs to stdout and, by default, to `/logs/musicbrainz-sql-loader.log`
+(the path containers mount) via `groovemap-runtime`'s `setup_logging`. The file sink is a
+size-capped rotating handler, not an unbounded append-only file. `/logs` is not required
+locally: if the file cannot be opened, the service logs one warning and continues on the
+console only.
 
 | Variable | Default | Description |
 | --- | ---: | --- |
 | `LOG_LEVEL` | `INFO` | Log verbosity; an unrecognized value falls back to `INFO` |
+| `LOG_FILE` | `/logs/musicbrainz-sql-loader.log` | Log file path; empty disables file logging |
 | `LOG_FILE_MAX_BYTES` | `104857600` (100 MiB) | Size the active log file rolls over at |
 | `LOG_FILE_BACKUP_COUNT` | `5` | Number of rotated backup files retained |
 | `ENVIRONMENT` | `development` | Value of the `environment` field on every log entry; does not change verbosity |
