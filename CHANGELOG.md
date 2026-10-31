@@ -3,6 +3,27 @@
 All notable changes to this repository will be recorded here by Commitizen from
 Conventional Commits.
 
+## v0.5.0 (2026-10-31)
+
+### Feat
+
+- **health**: serve /health on role port 8002 with HEALTH_PORT override
+- **persistence**: record Discogs link changes at upsert time
+
+### Fix
+
+- **logging**: pin runtime with LOG_FILE override and console fallback
+- **ingestion**: share pool admission and drain MusicBrainz callbacks (#17)
+- **consumer**: bound writes with shared admission
+- **reconciliation**: requeue without admission
+- **ingestion**: reconcile MusicBrainz write admission lifecycle
+- **deps**: upgrade msgpack past CVE-2026-114613
+- **ingestion**: bound MusicBrainz writers with shared admission
+- **runtime**: exit 1 when brainztableinator startup gives up
+- **deps**: upgrade filelock to 4.2.1 past CVE-2026-112940
+- **deps**: update certifi to 2026.10.19 and opentelemetry-api to 1.45.1
+- **deps**: update multidict to 6.9.1 (#10)
+
 ## v0.4.0 (2026-10-04)
 
 ### Feat
