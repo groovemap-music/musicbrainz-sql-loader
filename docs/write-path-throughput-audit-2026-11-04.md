@@ -18,10 +18,11 @@ production code changed.
   releases, 25% artists, 10% release groups, 5% labels. **The per-record relation and link
   counts are assumptions.** Relationship volume is the main driver of cost, so every
   absolute number below moves with it.
-- **Partial production data makes any lux timing a lower bound.** Postgres on lux holds
-  3.97M of 19.6M releases and 7.9M of 10.3M artists; labels and release groups are
-  complete. Btree depth, cache hit rate and checkpoint pressure all degrade as the tables
-  fill, so rates measured on small tables are optimistic. Each scaling note says how.
+- **Every rate here is optimistic.** The tables were nearly empty, the database was on
+  loopback, and the setup had no other writers. Btree depth, cache hit rate and checkpoint
+  pressure all degrade as the tables fill, and lux adds network latency. Treat each rate as a
+  ceiling for this code and each duration as a floor. MusicBrainz is not loaded on lux yet,
+  so there is no production MusicBrainz measurement to compare against.
 - Setup: `postgres:18-alpine` in Docker on macOS, loopback, `fsync=on`, default settings,
   schema from `create_postgres_schema` (database-schema 0.6.1), 2,000 records per run,
   `pg_stat_statements` for per-statement numbers. Harness lived outside the repo; databases,
@@ -156,33 +157,62 @@ Not worth doing: the `old` CTE and `identity_link_events` insert in each entity 
 
 ## Full-load duration estimate
 
-Lower bound, from run C (247 rec/s) and run A (100 rec/s), applied to the extraction's
-record counts. Labels and release groups are already complete on lux, so they are excluded
-from the remaining count.
+**Entity counts.** An earlier draft of this report used 19.6M releases and 10.3M artists.
+Those are Discogs figures (the Discogs backlog, matching the ~19M releases and ~10M artists in
+`deployment/docs/architecture.md`) and do not describe MusicBrainz. They are removed. The
+MusicBrainz counts below come from the database statistics of a community mirror of
+musicbrainz.org, [brainz.musichoarders.xyz/statistics](https://brainz.musichoarders.xyz/statistics),
+last updated 2026-05-11. The official musicbrainz.org statistics page could not be fetched
+directly. Wikipedia's May 2026 MusicBrainz figures (2.8M artists, 5.4M releases) agree for
+artists and releases, and the release-group figure agrees with the 4.46M `release-groups`
+events recorded in `musicbrainz-graph-enricher/docs/consumer-cancellation.md`. The extraction
+the loader sees will differ slightly from the live database, so treat these as approximate.
 
-| Scope | Records | At 247 rec/s | At 100 rec/s |
-| --- | --- | --- | --- |
-| Remaining on lux today: 15.6M releases + 2.4M artists | 18.0M | about 20 h | about 50 h |
-| Full load from empty: 19.6M releases + 10.3M artists | 29.9M | about 34 h | about 83 h |
+| Entity | Count (2026-05-11) | Share |
+| --- | --- | --- |
+| Releases | 5.50M | 42% |
+| Artists | 2.87M | 22% |
+| Release groups | 4.29M | 33% |
+| Labels | 0.337M | 3% |
+| **Total records** | **13.0M** | |
 
-How each figure should scale with the real row counts:
+Recordings (38.8M), works and tracks are not consumed by this loader's four queues, so they
+are not counted.
 
-- **Linear in records** to first order, then worse. Rate falls as `relationships`, its eight
-  indexes, `provider_aliases` and `catalog_items` outgrow `shared_buffers`. Treat the numbers
-  as a floor and expect the real run to be slower, not faster.
-- **Linear in relationships per record**, which I assumed (14 per release, 25 per artist).
-  Real MusicBrainz artists in particular can carry hundreds. If real averages are double,
-  expect the relationship statements (the largest server cost here) to roughly double.
-- **Disk** is about 500 B per relationship (heap plus indexes) plus the entity row and its
-  doubled `data`. Size the volume from the real relationship count before the first load.
-- **A rerun costs about the same as a first load** (run D), so a re-extraction after this
-  load will need the same hours again until finding 2 is addressed.
-- Latency to lux Postgres is not in these numbers. At 7 dependent round trips per record,
-  each extra millisecond of network latency adds about 7 ms to every record's time on its
+**Estimate.** Applying the measured rates to 13.0M records:
+
+| Rate used | Source | Full load |
+| --- | --- | --- |
+| 247 rec/s | Run C, 12 concurrent connections (production shape) | about 15 h |
+| 100 rec/s | Run A, sequential | about 36 h |
+
+How the figure should scale with the real data:
+
+- **The real mix is cheaper per record than the synthetic one on release groups and dearer on
+  artists.** The test mix was 60% releases, 25% artists, 10% release groups. The real mix is a
+  third release groups, which carry few relations, so the rate on those should be higher.
+  Real artists can carry far more than the 25 relations I assumed, which pushes the other way.
+  Relationship volume per record is the dominant unknown: the relationship statements were the
+  largest server cost, so a doubling of relations per record roughly doubles that part.
+- **Rate falls as tables grow.** `relationships` and its eight indexes will outgrow
+  `shared_buffers`, and `provider_aliases` and `catalog_items` share the same pressure. Expect
+  the real run to be slower than the ceiling above, hence "floor".
+- **Network latency to lux is not in the numbers.** With about 7 dependent round trips per
+  record, each extra millisecond of latency adds about 7 ms to every record's time on its
   connection.
+- **A rerun costs about the same as a first load** (run D), so a re-extraction will need the
+  same hours again until finding 2 is addressed.
+- **Disk** is about 500 B per relationship (heap plus indexes) plus the entity row and its
+  doubled `data`. Size the volume from the real relationship count, which this audit could not
+  obtain, before the first load.
 
-This estimate should be replaced by a measured run once the Postgres load completes and
-`gm-deployment-vc5s` plans the first full MusicBrainz load.
+**Reference point, not a prediction.** The dispatcher reports that the Discogs loader ran at
+about 2M records an hour on lux, roughly 555 rec/s, with batched writes. That is a different
+loader on different data. It does show the order of magnitude that is reachable, and finding 1
+is aimed at closing part of that gap: at 555 rec/s, 13.0M records would take about 6.5 h.
+
+This estimate should be replaced by a measured run once `gm-deployment-vc5s` plans the first
+full MusicBrainz load.
 
 ## Proposed follow-up beads (not filed; the bead says nothing is implemented here)
 
