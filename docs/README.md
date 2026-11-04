@@ -10,6 +10,7 @@
 - [Database resilience](database-resilience.md)
 - [PostgreSQL connection-budget analysis](postgres-pool-exhaustion-analysis.md)
 - [Test assertion audit](test-assertion-audit.md)
+- [Write-path throughput audit, 2026-11-04](write-path-throughput-audit-2026-11-04.md)
 - [Source-history provenance](extraction.md)
 - [Release compliance](release-compliance.md)
 
