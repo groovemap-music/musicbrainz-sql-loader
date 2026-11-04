@@ -115,3 +115,16 @@ async def test_a_failing_statement_late_in_the_pipeline_rolls_back_the_whole_rec
 
     assert await _count(connection, "SELECT count(*) FROM musicbrainz.artists WHERE mbid = %s", MBID) == 0
     assert await _count(connection, "SELECT count(*) FROM musicbrainz.relationships WHERE source_mbid = %s OR target_mbid = %s", MBID, MBID) == 0
+
+
+async def test_entity_data_omits_the_keys_that_have_their_own_tables(connection: psycopg.AsyncConnection[Any]) -> None:
+    """`data` no longer repeats `relations` and `external_links`, and the tables still hold them."""
+    record = _record([{"target_mbid": TARGET, "target_type": "artist", "type": "producer"}])
+    async with connection.transaction():
+        await _processor().process_release(connection, record)
+
+    async with connection.cursor() as cursor:
+        await cursor.execute("SELECT data ? 'relations', data ? 'external_links', data ->> 'name' FROM musicbrainz.releases WHERE mbid = %s", (MBID,))
+        assert await cursor.fetchone() == (False, False, "A Release")
+    assert await _count(connection, "SELECT count(*) FROM musicbrainz.relationships WHERE source_mbid = %s", MBID) == 1
+    assert await _count(connection, "SELECT count(*) FROM musicbrainz.external_links WHERE mbid = %s", MBID) == 1
