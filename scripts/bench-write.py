@@ -44,6 +44,7 @@ import psycopg
 from common import AsyncPostgreSQLPool
 from common.media import map_musicbrainz_release
 from groovemap_schema.postgres import create_postgres_schema
+from psycopg import sql
 from psycopg.conninfo import conninfo_to_dict
 
 from brainztableinator._persistence import PostgreSQLMusicBrainzWriter
@@ -228,7 +229,7 @@ async def prepare(url: str) -> None:
         raise SystemExit(f"{failures} schema statements failed")
     async with await psycopg.AsyncConnection.connect(url) as conn:
         for table in ("artists", "labels", "releases", "release_groups", "relationships", "external_links"):
-            row = await (await conn.execute(f"SELECT count(*) FROM musicbrainz.{table}")).fetchone()  # type: ignore[call-overload]  # noqa: S608 - fixed literals above
+            row = await (await conn.execute(sql.SQL("SELECT count(*) FROM {}").format(sql.Identifier("musicbrainz", table)))).fetchone()
             if row and row[0]:
                 raise SystemExit(f"refusing to benchmark: musicbrainz.{table} already holds {row[0]} rows; use an empty database")
 
