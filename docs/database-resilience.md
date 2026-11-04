@@ -45,10 +45,14 @@ task-owned disposable RabbitMQ and PostgreSQL containers, disables global QoS in
 and exercises the real callback, bounded database activity, cancellation, redelivery, and
 `_recover_consumers` path. It does not accept caller-supplied service URLs.
 
-`InterfaceError`, `OperationalError`, and `DatabaseUnavailableError` are transient. The
-loader waits before requeueing so a maintenance window cannot rapidly consume the quorum
-queue's finite delivery limit. Deterministic `DataError` and `IntegrityError` failures are
-rejected without retry and arrive in the dead-letter queue.
+`InterfaceError`, `OperationalError` (other than SQLSTATE class 54), and
+`DatabaseUnavailableError` are transient. The loader waits before requeueing so a maintenance
+window cannot rapidly consume the quorum queue's finite delivery limit. Deterministic
+`DataError` and `IntegrityError` failures are rejected without retry and arrive in the
+dead-letter queue. So are `OperationalError`s in SQLSTATE class 54 (`ProgramLimitExceeded`,
+for example an index row larger than the btree maximum): the record itself is the cause, so
+retrying would requeue the same message indefinitely and stall its consumer. The shared
+`is_permanent_operational_error` in `groovemap-runtime` defines that allow-list.
 
 ## RabbitMQ and restart
 
