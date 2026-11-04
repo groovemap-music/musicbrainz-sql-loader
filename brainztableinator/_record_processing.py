@@ -113,6 +113,19 @@ def _source_ref(record: dict[str, Any]) -> str:
     return dump_version if isinstance(dump_version, str) and dump_version else UNVERSIONED_SOURCE_REF
 
 
+# `relations` and `external_links` are written, row for row, to `musicbrainz.relationships` and
+# `musicbrainz.external_links`, which is what every reader queries. Keeping them in the entity's
+# `data` document as well stored every relation twice and, for an artist with dozens of them, made
+# them the bulk of the row. No reader takes them from `data`: the schema's views and indexes, the
+# catalog API and the graph enricher (which reads the message, not this column) were checked.
+_CHILD_ROW_KEYS = frozenset({"relations", "external_links"})
+
+
+def _stored_data(record: dict[str, Any]) -> dict[str, Any]:
+    """Return the record as the entity's `data` document, without the keys that have their own tables."""
+    return {key: value for key, value in record.items() if key not in _CHILD_ROW_KEYS}
+
+
 def _life_span(record: dict[str, Any]) -> dict[str, Any]:
     life_span = record.get("life_span")
     return life_span if isinstance(life_span, dict) else {}
@@ -338,7 +351,7 @@ class MusicBrainzRecordProcessor:
                     record.get("discogs_artist_id"),
                     _get_or(record, "aliases", []),
                     _get_or(record, "tags", []),
-                    record,
+                    _stored_data(record),
                     gm_item_id,
                 ),
                 _source_ref(record),
@@ -364,7 +377,7 @@ class MusicBrainzRecordProcessor:
                     record.get("area", ""),
                     record.get("disambiguation", ""),
                     record.get("discogs_label_id"),
-                    record,
+                    _stored_data(record),
                     gm_item_id,
                 ),
                 _source_ref(record),
@@ -489,7 +502,7 @@ class MusicBrainzRecordProcessor:
                     record.get("release_group_mbid"),
                     record.get("discogs_release_id"),
                     media,
-                    record,
+                    _stored_data(record),
                     gm_item_id,
                 ),
                 _source_ref(record),
@@ -514,7 +527,7 @@ class MusicBrainzRecordProcessor:
                     record.get("first_release_date"),
                     record.get("disambiguation", ""),
                     record.get("discogs_master_id"),
-                    record,
+                    _stored_data(record),
                     gm_item_id,
                 ),
                 _source_ref(record),

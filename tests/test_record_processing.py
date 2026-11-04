@@ -70,7 +70,12 @@ async def test_record_processor_maps_an_artist_before_delegating_writes() -> Non
     assert values[0] == "artist-id"
     assert values[7] is False
     assert values[13] == []
-    assert values[15] is record
+    # The stored document keeps everything the record carried except the two keys that are
+    # written to their own tables; the caller's record is left untouched.
+    assert values[15] == {key: value for key, value in record.items() if key not in ("relations", "external_links")}
+    assert "relations" in record
+    assert "relations" not in values[15]
+    assert "external_links" not in values[15]
     writer.insert_relationships.assert_awaited_once()
     writer.insert_external_links.assert_awaited_once()
     assert [record[:2] for record in observer.records] == [("artist", 1), ("artist", 1)]
