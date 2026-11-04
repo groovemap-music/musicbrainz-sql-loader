@@ -189,6 +189,7 @@ operator-facing recipe surface is:
 | `just test-integration` | Exercise delivery settlement and transactions against disposable PostgreSQL. |
 | `just test-admission-integration` | Exercise shared write admission and consumer recovery against disposable RabbitMQ and PostgreSQL. |
 | `just test-parity` | Compare this loader's edges with the graph enricher's, in disposable PostgreSQL and Neo4j. |
+| `just bench-write` | Measure write throughput and storage against disposable PostgreSQL; see [the benchmark guide](docs/write-benchmark.md). |
 | `just secret-scan` | Scan Git history and the working tree with Gitleaks. |
 | `just build` | Build the wheel and source distribution. |
 | `just install-check` | Build, then verify the wheel in an isolated environment. |

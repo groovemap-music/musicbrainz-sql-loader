@@ -54,6 +54,12 @@ test-admission-integration:
 test-parity:
     bash scripts/test-parity.sh
 
+# Write-path benchmark: the real record processor into a disposable PostgreSQL (random loopback
+# port, removed with its volume on exit). Opt-in and outside `check`. Arguments pass through, for
+# example `just bench-write --records 5000 --latency-ms 1`. Documented in docs/write-benchmark.md.
+bench-write *args:
+    bash scripts/bench-write.sh {{args}}
+
 build:
     uv build --out-dir dist --clear
 
