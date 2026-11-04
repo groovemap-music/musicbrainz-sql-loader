@@ -97,6 +97,11 @@ def _make_mock_conn():
     mock_cursor_ctx.__aenter__ = AsyncMock(return_value=mock_cursor)
     mock_cursor_ctx.__aexit__ = AsyncMock(return_value=False)
     mock_conn.cursor = MagicMock(return_value=mock_cursor_ctx)
+    # `conn.pipeline()` is a synchronous call returning an async context manager.
+    mock_pipeline_ctx = AsyncMock()
+    mock_pipeline_ctx.__aenter__ = AsyncMock(return_value=None)
+    mock_pipeline_ctx.__aexit__ = AsyncMock(return_value=False)
+    mock_conn.pipeline = MagicMock(return_value=mock_pipeline_ctx)
     return mock_conn, mock_cursor
 
 
@@ -2528,6 +2533,10 @@ class TestOnDataMessageExtended:
         mock_cursor_cm.__aenter__ = AsyncMock(return_value=mock_cursor)
         mock_cursor_cm.__aexit__ = AsyncMock(return_value=False)
         mock_conn.cursor = MagicMock(return_value=mock_cursor_cm)
+        mock_pipeline_cm = AsyncMock()
+        mock_pipeline_cm.__aenter__ = AsyncMock(return_value=None)
+        mock_pipeline_cm.__aexit__ = AsyncMock(return_value=False)
+        mock_conn.pipeline = MagicMock(return_value=mock_pipeline_cm)
 
         with (
             patch("brainztableinator.brainztableinator.connection_pool", mock_pool),

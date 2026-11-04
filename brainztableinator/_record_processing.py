@@ -319,56 +319,58 @@ class MusicBrainzRecordProcessor:
         mbid = record.get("mbid", record.get("id", ""))
         life_span = _life_span(record)
         gm_item_id = await self._native_id(conn, "artist", mbid, record.get("discogs_artist_id"))
-        await self._writer.upsert_artist(
-            conn,
-            (
-                mbid,
-                record.get("name", ""),
-                record.get("sort_name", ""),
-                record.get("mb_type", ""),
-                record.get("gender", ""),
-                _get_or(record, "begin_date", life_span.get("begin")),
-                _get_or(record, "end_date", life_span.get("end")),
-                _get_or(record, "ended", _get_or(life_span, "ended", False)),
-                record.get("area", ""),
-                record.get("begin_area", ""),
-                record.get("end_area", ""),
-                record.get("disambiguation", ""),
-                record.get("discogs_artist_id"),
-                _get_or(record, "aliases", []),
-                _get_or(record, "tags", []),
-                record,
-                gm_item_id,
-            ),
-            _source_ref(record),
-        )
-        await self.insert_relationships(conn, mbid, "artist", record.get("relations", []))
-        await self.insert_external_links(conn, mbid, "artist", record.get("external_links", []))
+        async with conn.pipeline():
+            await self._writer.upsert_artist(
+                conn,
+                (
+                    mbid,
+                    record.get("name", ""),
+                    record.get("sort_name", ""),
+                    record.get("mb_type", ""),
+                    record.get("gender", ""),
+                    _get_or(record, "begin_date", life_span.get("begin")),
+                    _get_or(record, "end_date", life_span.get("end")),
+                    _get_or(record, "ended", _get_or(life_span, "ended", False)),
+                    record.get("area", ""),
+                    record.get("begin_area", ""),
+                    record.get("end_area", ""),
+                    record.get("disambiguation", ""),
+                    record.get("discogs_artist_id"),
+                    _get_or(record, "aliases", []),
+                    _get_or(record, "tags", []),
+                    record,
+                    gm_item_id,
+                ),
+                _source_ref(record),
+            )
+            await self.insert_relationships(conn, mbid, "artist", record.get("relations", []))
+            await self.insert_external_links(conn, mbid, "artist", record.get("external_links", []))
 
     async def process_label(self, conn: Any, record: dict[str, Any]) -> None:
         mbid = record.get("mbid", record.get("id", ""))
         life_span = _life_span(record)
         gm_item_id = await self._native_id(conn, "label", mbid, record.get("discogs_label_id"))
-        await self._writer.upsert_label(
-            conn,
-            (
-                mbid,
-                record.get("name", ""),
-                record.get("mb_type", ""),
-                record.get("label_code"),
-                _get_or(record, "begin_date", life_span.get("begin")),
-                _get_or(record, "end_date", life_span.get("end")),
-                _get_or(record, "ended", _get_or(life_span, "ended", False)),
-                record.get("area", ""),
-                record.get("disambiguation", ""),
-                record.get("discogs_label_id"),
-                record,
-                gm_item_id,
-            ),
-            _source_ref(record),
-        )
-        await self.insert_relationships(conn, mbid, "label", record.get("relations", []))
-        await self.insert_external_links(conn, mbid, "label", record.get("external_links", []))
+        async with conn.pipeline():
+            await self._writer.upsert_label(
+                conn,
+                (
+                    mbid,
+                    record.get("name", ""),
+                    record.get("mb_type", ""),
+                    record.get("label_code"),
+                    _get_or(record, "begin_date", life_span.get("begin")),
+                    _get_or(record, "end_date", life_span.get("end")),
+                    _get_or(record, "ended", _get_or(life_span, "ended", False)),
+                    record.get("area", ""),
+                    record.get("disambiguation", ""),
+                    record.get("discogs_label_id"),
+                    record,
+                    gm_item_id,
+                ),
+                _source_ref(record),
+            )
+            await self.insert_relationships(conn, mbid, "label", record.get("relations", []))
+            await self.insert_external_links(conn, mbid, "label", record.get("external_links", []))
 
     def release_media_block(self, record: dict[str, Any]) -> dict[str, Any]:
         """Use canonical producer media, deriving it only for legacy events."""
@@ -476,43 +478,46 @@ class MusicBrainzRecordProcessor:
         # `musicbrainz.releases.media` and the `graph.issued_on` rows below must describe the
         # same media, and they are committed together by the caller's transaction.
         media = self.release_media_block(record)
-        await self._writer.upsert_release(
-            conn,
-            (
-                mbid,
-                record.get("name", ""),
-                record.get("barcode"),
-                record.get("status", ""),
-                record.get("release_group_mbid"),
-                record.get("discogs_release_id"),
-                media,
-                record,
-                gm_item_id,
-            ),
-            _source_ref(record),
-        )
-        await self.write_release_media(conn, record, media)
+        async with conn.pipeline():
+            await self._writer.upsert_release(
+                conn,
+                (
+                    mbid,
+                    record.get("name", ""),
+                    record.get("barcode"),
+                    record.get("status", ""),
+                    record.get("release_group_mbid"),
+                    record.get("discogs_release_id"),
+                    media,
+                    record,
+                    gm_item_id,
+                ),
+                _source_ref(record),
+            )
+            await self.write_release_media(conn, record, media)
+            await self.insert_relationships(conn, mbid, "release", record.get("relations", []))
+            await self.insert_external_links(conn, mbid, "release", record.get("external_links", []))
+
         await self._attach_identifier_aliases(conn, mbid, record, gm_item_id)
-        await self.insert_relationships(conn, mbid, "release", record.get("relations", []))
-        await self.insert_external_links(conn, mbid, "release", record.get("external_links", []))
 
     async def process_release_group(self, conn: Any, record: dict[str, Any]) -> None:
         mbid = record.get("mbid", record.get("id", ""))
         gm_item_id = await self._native_id(conn, RELEASE_GROUP_ENTITY_KIND, mbid, record.get("discogs_master_id"))
-        await self._writer.upsert_release_group(
-            conn,
-            (
-                mbid,
-                record.get("name", ""),
-                record.get("mb_type", ""),
-                _get_or(record, "secondary_types", []),
-                record.get("first_release_date"),
-                record.get("disambiguation", ""),
-                record.get("discogs_master_id"),
-                record,
-                gm_item_id,
-            ),
-            _source_ref(record),
-        )
-        await self.insert_relationships(conn, mbid, "release-group", record.get("relations", []))
-        await self.insert_external_links(conn, mbid, "release-group", record.get("external_links", []))
+        async with conn.pipeline():
+            await self._writer.upsert_release_group(
+                conn,
+                (
+                    mbid,
+                    record.get("name", ""),
+                    record.get("mb_type", ""),
+                    _get_or(record, "secondary_types", []),
+                    record.get("first_release_date"),
+                    record.get("disambiguation", ""),
+                    record.get("discogs_master_id"),
+                    record,
+                    gm_item_id,
+                ),
+                _source_ref(record),
+            )
+            await self.insert_relationships(conn, mbid, "release-group", record.get("relations", []))
+            await self.insert_external_links(conn, mbid, "release-group", record.get("external_links", []))
