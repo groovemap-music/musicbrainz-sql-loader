@@ -38,6 +38,7 @@ from common import (
     shutdown_telemetry,
     start_event_loop_monitor,
 )
+from common.postgres_resilient import is_permanent_operational_error
 from opentelemetry.trace import SpanKind, Status, StatusCode
 from orjson import loads
 from psycopg.errors import DataError, IntegrityError, InterfaceError, OperationalError
@@ -371,6 +372,18 @@ class _MusicBrainzFailureClassifier:
         self._throttle = False
 
     def __call__(self, error: BaseException) -> FailureKind:
+        if is_permanent_operational_error(error):
+            # SQLSTATE class 54 (e.g. ProgramLimitExceeded: index row size) is a verdict on the
+            # record, not the connection. Retrying it requeues the same poison message forever and
+            # stalls the consumer, so quarantine it. Checked before the outage branch: psycopg
+            # raises it as an OperationalError subclass.
+            logger.error(
+                "❌ Permanent database error for record, nacking without requeue",
+                data_type=self._data_type,
+                sqlstate=getattr(error, "sqlstate", None),
+                error=str(error),
+            )
+            return FailureKind.DETERMINISTIC
         if isinstance(error, (InterfaceError, OperationalError, DatabaseUnavailableError)):
             self._throttle = True
             logger.warning("⚠️ Database connection issue, will retry", error=str(error))

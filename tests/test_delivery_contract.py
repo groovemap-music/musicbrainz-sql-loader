@@ -9,13 +9,28 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from common import DeliveryResult, FailureKind, Settlement
-from psycopg.errors import DataError, IntegrityError, InterfaceError, OperationalError
+from psycopg.errors import (
+    DataError,
+    IntegrityError,
+    InterfaceError,
+    InvalidAuthorizationSpecification,
+    OperationalError,
+    ProgramLimitExceeded,
+)
 
 import brainztableinator.brainztableinator as service
 
 
 ROOT = Path(__file__).parent.parent
-RUNTIME_REVISION = "6d0425f908e01a446b040e2993045e2afe30460e"
+RUNTIME_REVISION = "5459343ccaf46da5f71db11cda40d9338ce61d8d"
+
+
+class _UnreviewedClassError(OperationalError):
+    """An OperationalError whose SQLSTATE class is not on the permanent allow-list."""
+
+    sqlstate = "XX001"
+
+
 VALID_BODY = b'{"id":"550e8400-e29b-41d4-a716-446655440000","name":"Artist"}'
 
 
@@ -183,7 +198,11 @@ async def test_settlement_failure_is_visible_without_false_success_or_retry() ->
     [
         (InterfaceError("interface"), FailureKind.TRANSIENT, True),
         (OperationalError("operation"), FailureKind.TRANSIENT, True),
+        (InvalidAuthorizationSpecification("credentials"), FailureKind.TRANSIENT, True),
+        (_UnreviewedClassError("unreviewed class"), FailureKind.TRANSIENT, True),
         (service.DatabaseUnavailableError("pool"), FailureKind.TRANSIENT, True),
+        # 54000 program_limit_exceeded is a verdict on the record (index row size), not a connection problem.
+        (ProgramLimitExceeded("index row size exceeds btree maximum"), FailureKind.DETERMINISTIC, False),
         (DataError("data"), FailureKind.DETERMINISTIC, False),
         (IntegrityError("integrity"), FailureKind.DETERMINISTIC, False),
         (RuntimeError("unknown"), FailureKind.TRANSIENT, False),
@@ -193,6 +212,31 @@ def test_local_failure_classifier_preserves_policy(error: Exception, kind: Failu
     classifier = service._MusicBrainzFailureClassifier("artists")
     assert classifier(error) is kind
     assert classifier._throttle is throttled
+
+
+@pytest.mark.asyncio
+async def test_program_limit_is_quarantined_and_consumer_keeps_going() -> None:
+    poison = StrictDelivery()
+    processor = AsyncMock(side_effect=ProgramLimitExceeded("index row size exceeds btree maximum"))
+    pool, _ = _pool()
+    wait = AsyncMock()
+    with (
+        patch.object(service, "shutdown_requested", False),
+        patch.object(service, "connection_pool", pool),
+        patch.dict(service.PROCESSORS, {"artists": processor}),
+        patch.object(service.outage_backoff, "wait", wait),
+    ):
+        result = await service.on_data_message(poison, "artists")  # type: ignore[arg-type]
+        assert result.settlement is Settlement.REJECT
+        assert poison.calls == [("nack", False)]
+        wait.assert_not_awaited()
+
+        healthy = StrictDelivery()
+        processor.side_effect = None
+        processor.return_value = None
+        next_result = await service.on_data_message(healthy, "artists")  # type: ignore[arg-type]
+    assert next_result == DeliveryResult(Settlement.ACK, "processed")
+    assert healthy.calls == [("ack", None)]
 
 
 def test_runtime_pin_and_private_batch_boundary_are_static() -> None:
