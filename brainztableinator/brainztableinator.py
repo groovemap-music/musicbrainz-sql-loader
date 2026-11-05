@@ -44,6 +44,13 @@ from orjson import loads
 from psycopg.errors import DataError, IntegrityError, InterfaceError, OperationalError
 
 from brainztableinator._persistence import PostgreSQLMusicBrainzWriter
+from brainztableinator._purge_veto import (
+    consecutive_vetoes,
+    extraction_key,
+    purge_veto_column_present,
+    record_extraction,
+    recorded_vetoes,
+)
 from brainztableinator._reconciliation import StaleChildRowPurge, reconciliation_columns_present
 from brainztableinator._record_processing import MusicBrainzRecordProcessor
 from brainztableinator.config import MusicBrainzSQLLoaderConfig
@@ -92,6 +99,7 @@ PIPELINE_MESSAGE_DURATION = "groovemap.pipeline.message.duration"
 PIPELINE_BATCH_SIZE = "groovemap.pipeline.batch.size"
 PIPELINE_BATCH_FLUSH_DURATION = "groovemap.pipeline.batch.flush.duration"
 PIPELINE_CONSUMERS_ACTIVE = "groovemap.pipeline.consumers.active"
+PIPELINE_PURGE_CONSECUTIVE_VETOES = "groovemap.pipeline.purge.consecutive_vetoes"
 
 # The shared delivery runner delegates observation to this service, so these instruments keep
 # their established names and attributes while terminal settlement stays centralized.
@@ -139,6 +147,10 @@ def _build_instruments() -> dict[str, Any]:
         PIPELINE_CONSUMERS_ACTIVE: meter.create_up_down_counter(
             PIPELINE_CONSUMERS_ACTIVE,
             description="Active MusicBrainz pipeline consumers.",
+        ),
+        PIPELINE_PURGE_CONSECUTIVE_VETOES: meter.create_gauge(
+            PIPELINE_PURGE_CONSECUTIVE_VETOES,
+            description="Extractions in a row that vetoed the delete-reconciliation.",
         ),
         MESSAGING_CONSUMED_MESSAGES: meter.create_counter(
             MESSAGING_CONSUMED_MESSAGES,
@@ -201,6 +213,14 @@ def _record_batch_flush(entity: str, size: int, duration_s: float, outcome: str)
         _instrument(PIPELINE_BATCH_FLUSH_DURATION).record(duration_s, attributes)
     except Exception:
         logger.debug("Could not record batch flush metrics", exc_info=True)
+
+
+def _record_purge_consecutive_vetoes(count: int) -> None:
+    """Record how many extractions in a row vetoed the delete-reconciliation."""
+    try:
+        _instrument(PIPELINE_PURGE_CONSECUTIVE_VETOES).set(count, {"source": PIPELINE_SOURCE})
+    except Exception:
+        logger.debug("Could not record the consecutive purge veto metric", exc_info=True)
 
 
 def _record_consumer_delta(delta: int) -> None:
@@ -466,6 +486,9 @@ outage_backoff = OutageBackoff(SERVICE_NAME)
 # Requeues a message may use before it is dead-lettered, read from x-acquired-count. At the
 # 60 s backoff cap this is about 8.2 hours, so an outage does not dead-letter good records.
 MAX_REQUEUES = 500
+# Extractions in a row that may veto the delete-reconciliation before it is reported as an alert.
+# Dumps are a month apart, so one veto is a bad record to deal with and two mean rows are piling up.
+PURGE_VETO_ALERT_RUNS = 2
 current_task = None
 current_progress = 0.0
 
@@ -1007,6 +1030,90 @@ def make_data_handler(
     return handler
 
 
+async def dead_letters_waiting(data_type: str) -> int | None:
+    """Return how many dead letters the broker holds for one type, or None if it cannot say.
+
+    The broker is the only record that survives a restart and sees its own delivery_limit
+    dead-letters, which never reach this process. A new channel, because a passive declare
+    reads the live count only on a channel that does not know the queue yet.
+    """
+    connection = active_connection
+    if connection is None:
+        return None
+    channel = None
+    try:
+        channel = await connection.channel()
+        dlq = await channel.declare_queue(
+            name=catalog_dead_letter_queue_name(AMQP_CONSUMER_ID, data_type),
+            passive=True,
+            robust=False,
+        )
+        return int(dlq.declaration_result.message_count)
+    except Exception as error:
+        logger.warning("⚠️ Could not read the dead-letter queue", data_type=data_type, error_type=type(error).__name__)
+        return None
+    finally:
+        if channel is not None:
+            with contextlib.suppress(Exception):
+                await channel.close()
+
+
+async def _settle_purge_veto(purge: StaleChildRowPurge, data: dict[str, Any]) -> None:
+    """Gather every source of the veto onto the purge, and record it on the latch.
+
+    A dead-lettered record never refreshed its rows, so a purge would delete current ones. Any
+    dead letter counts, including a dead-lettered ``extraction_complete``, and a broker that
+    cannot answer counts too: the veto holds until they are replayed or cleared.
+
+    Raises:
+        Exception: Whatever PostgreSQL raised. The caller must requeue the signal, because
+            acking it would leave no record of the veto.
+    """
+    if purge.is_settled:
+        return
+    for vetoing_type in sorted(purge.expected_data_types):
+        waiting = await dead_letters_waiting(vetoing_type)
+        if waiting is None or waiting > 0:
+            purge.record_dead_letter(vetoing_type)
+
+    pool = connection_pool
+    admission = write_admission
+    version = extraction_key(data)
+    if pool is None or version is None:
+        return
+    if admission is None:
+        raise DatabaseUnavailableError("Write admission not initialized")
+    async with admission.slot():
+        for vetoing_type in await recorded_vetoes(pool, version):
+            purge.record_dead_letter(vetoing_type)
+        await record_extraction(pool, version, sorted(purge.dead_lettered))
+
+
+async def _report_purge_vetoes() -> None:
+    """Report how many extractions in a row vetoed the purge, and shout at the threshold.
+
+    One veto followed by a clean purge is normal. A record rejected in every dump is not: its
+    veto protects live rows, but stale rows then never clear. Reporting must not hold up the
+    signal, so a failure here is only logged.
+    """
+    pool = connection_pool
+    admission = write_admission
+    if pool is None or admission is None:
+        return
+    try:
+        async with admission.slot():
+            consecutive = await consecutive_vetoes(pool)
+    except Exception as error:
+        logger.warning("⚠️ Could not count consecutive purge vetoes", error_type=type(error).__name__)
+        return
+    _record_purge_consecutive_vetoes(consecutive)
+    if consecutive >= PURGE_VETO_ALERT_RUNS:
+        logger.error(
+            "🚨 Delete-reconciliation vetoed on consecutive extractions, so stale rows are not clearing: see docs/database-resilience.md",
+            consecutive=consecutive,
+        )
+
+
 async def _reconcile_deleted_child_rows(data_type: str, data: dict[str, Any]) -> bool:
     """Reconcile the child-row tables once every entity type has signalled completion.
 
@@ -1033,6 +1140,7 @@ async def _reconcile_deleted_child_rows(data_type: str, data: dict[str, Any]) ->
         return True
 
     try:
+        await _settle_purge_veto(purge, data)
         await purge.purge()
     except Exception as error:
         logger.error(
@@ -1041,6 +1149,7 @@ async def _reconcile_deleted_child_rows(data_type: str, data: dict[str, Any]) ->
         )
         return False
     outage_backoff.reset()
+    await _report_purge_vetoes()
     return True
 
 
@@ -1195,8 +1304,8 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> D
         # updated_at was never refreshed even though the record is still present upstream.
         # Purging on top of that would delete a still-current record beyond the dead-letter
         # queue, so a rejected record vetoes the reconciliation. A rejected extraction_complete
-        # is different: it carries no row, and a mark from it would veto the next clean
-        # extraction and stop a replay from recovering this one.
+        # marks nothing here: replaying it must be able to recover its run. While it sits in
+        # the DLQ it still vetoes, through _settle_purge_veto, as any dead letter does.
         stale_row_purge.record_dead_letter(data_type)
     if result.settlement is Settlement.ACK and result.outcome == "processed":
         outage_backoff.reset()
@@ -1436,8 +1545,13 @@ async def main() -> None:
     stale_row_purge = None
     try:
         if await reconciliation_columns_present(connection_pool, logger):
-            _persistence_writer.set_refresh_updated_at(True)
-            stale_row_purge = StaleChildRowPurge(connection_pool, logger, admission=write_admission)
+            if await purge_veto_column_present(connection_pool):
+                _persistence_writer.set_refresh_updated_at(True)
+                stale_row_purge = StaleChildRowPurge(connection_pool, logger, admission=write_admission)
+                # The gauge lives in this process, so a restart must not read as the problem going away.
+                await _report_purge_vetoes()
+            else:
+                logger.warning("⚠️ Delete-reconciliation disabled — the schema has no purge_vetoed column; loading continues")
     except Exception as e:
         logger.error("❌ Delete-reconciliation unavailable this run", error=str(e))
 

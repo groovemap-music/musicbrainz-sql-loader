@@ -21,6 +21,7 @@ import psycopg
 import pytest
 import pytest_asyncio
 from common import AsyncPostgreSQLPool, WriteAdmission
+from groovemap_schema.postgres import create_postgres_schema
 from psycopg import sql
 from psycopg.conninfo import conninfo_to_dict
 
@@ -33,6 +34,13 @@ if TYPE_CHECKING:
 
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration, pytest.mark.timeout(120)]
+
+# Preserved before the default suite fixture stubs them: these are what is under test.
+_DEAD_LETTERS_WAITING = service.dead_letters_waiting
+_RECORDED_VETOES = service.recorded_vetoes
+_RECORD_EXTRACTION = service.record_extraction
+_CONSECUTIVE_VETOES = service.consecutive_vetoes
+_SCHEMA_APPLIED: list[bool] = []
 
 
 class TcpProxy:
@@ -87,16 +95,24 @@ class Stack:
         message = aio_pika.Message(json.dumps(body).encode(), delivery_mode=aio_pika.DeliveryMode.PERSISTENT)
         await self.channel.default_exchange.publish(message, routing_key=self.queue.name)
 
-    async def signal(self) -> None:
+    async def signal(self, version: str = "20261105") -> None:
         await self.publish(
             {
                 "type": "extraction_complete",
-                "version": "2026-11-05",
+                "version": version,
                 "timestamp": self.boundary.isoformat(),
                 "started_at": self.boundary.isoformat(),
                 "record_counts": {"artists": 1},
             }
         )
+
+    async def vetoed(self, version: str = "20261105") -> list[str]:
+        async with await psycopg.AsyncConnection.connect(self.dsn) as connection:
+            cursor = await connection.execute(
+                "SELECT purge_vetoed FROM loader_extraction_latch WHERE loader = 'musicbrainz' AND version = %s", (version,)
+            )
+            row = await cursor.fetchone()
+        return list(row[0]) if row else []
 
     async def rows(self) -> int:
         async with await psycopg.AsyncConnection.connect(self.dsn) as connection:
@@ -157,10 +173,15 @@ async def stack() -> AsyncIterator[Stack]:
         max_retries=1,
     )
     await pool.initialize()
+    if not _SCHEMA_APPLIED:
+        assert await create_postgres_schema(pool) == 0
+        _SCHEMA_APPLIED.append(True)
+    async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as admin:
+        await admin.execute("DELETE FROM loader_extraction_latch WHERE loader = 'musicbrainz'")
     admission = WriteAdmission(2)
     purge = StaleChildRowPurge(pool, service.logger, tables=((schema, "purge_rows"),), expected_data_types=("artists",), admission=admission)
 
-    connection = await aio_pika.connect(amqp_url)
+    connection = await aio_pika.connect_robust(amqp_url)
     channel = await connection.channel(publisher_confirms=True)
     await channel.set_qos(prefetch_count=4, global_=False)
     name = f"gm-vd2q-{uuid.uuid4().hex[:8]}"
@@ -181,6 +202,12 @@ async def stack() -> AsyncIterator[Stack]:
     service.outage_backoff.reset()
     with (
         patch.object(service, "connection_pool", pool),
+        patch.object(service, "active_connection", connection),
+        patch.object(service, "dead_letters_waiting", _DEAD_LETTERS_WAITING),
+        patch.object(service, "recorded_vetoes", _RECORDED_VETOES),
+        patch.object(service, "record_extraction", _RECORD_EXTRACTION),
+        patch.object(service, "consecutive_vetoes", _CONSECUTIVE_VETOES),
+        patch.object(service, "catalog_dead_letter_queue_name", lambda _consumer, _data_type: dlq.name),
         patch.object(service, "write_admission", admission),
         patch.object(service, "stale_row_purge", purge),
         patch.object(service, "shutdown_requested", False),
@@ -240,8 +267,7 @@ async def test_a_persistent_failure_dead_letters_at_the_budget(stack: Stack) -> 
         await stack.signal()
 
         async def dead() -> bool:
-            queue = await stack.channel.declare_queue(stack.dlq.name, passive=True)
-            return queue.declaration_result.message_count == 1
+            return await _DEAD_LETTERS_WAITING("artists") == 1
 
         await until(dead, 60)
     assert len(stack.deliveries) == 3
@@ -249,27 +275,27 @@ async def test_a_persistent_failure_dead_letters_at_the_budget(stack: Stack) -> 
     assert await stack.rows() == 3
 
 
-async def _dead_letter_the_signal(stack: Stack) -> bytes:
-    """Run the signal through a persistent failure and hand back the body the DLQ holds."""
+async def _dead_letter_the_signal(stack: Stack) -> None:
+    """Run the signal through a persistent failure, so the DLQ holds it."""
     await stack.proxy.cut()
     with patch.object(service, "MAX_REQUEUES", 1):
         await stack.signal()
 
         async def dead() -> bool:
-            queue = await stack.channel.declare_queue(stack.dlq.name, passive=True)
-            return queue.declaration_result.message_count == 1
+            return await _DEAD_LETTERS_WAITING("artists") == 1
 
         await until(dead, 60)
-    message = await stack.dlq.get(fail=True, timeout=5)
-    assert message is not None
-    await message.ack()
     await stack.proxy.open()
-    return message.body
 
 
 async def test_replaying_a_dead_lettered_signal_recovers_the_run(stack: Stack) -> None:
-    body = await _dead_letter_the_signal(stack)
-    await stack.channel.default_exchange.publish(aio_pika.Message(body, delivery_mode=aio_pika.DeliveryMode.PERSISTENT), routing_key=stack.queue.name)
+    await _dead_letter_the_signal(stack)
+    message = await stack.dlq.get(fail=True, timeout=5)
+    assert message is not None
+    await message.ack()
+    await stack.channel.default_exchange.publish(
+        aio_pika.Message(message.body, delivery_mode=aio_pika.DeliveryMode.PERSISTENT), routing_key=stack.queue.name
+    )
 
     async def reconciled() -> bool:
         return await stack.rows() == 2
@@ -277,18 +303,88 @@ async def test_replaying_a_dead_lettered_signal_recovers_the_run(stack: Stack) -
     await until(reconciled, 70)
 
 
-async def test_a_dead_lettered_signal_does_not_veto_the_next_clean_extraction(stack: Stack) -> None:
-    await _dead_letter_the_signal(stack)
+async def _next_extraction(stack: Stack, version: str) -> None:
+    """A later dump: every live row refreshed, the stale one still not."""
     stack.boundary += timedelta(hours=1)
     async with await psycopg.AsyncConnection.connect(stack.dsn) as connection:
         statement = sql.SQL("UPDATE {}.purge_rows SET updated_at = %s WHERE id > 1").format(sql.Identifier(stack.schema))
         await connection.execute(statement, (stack.boundary,))
-    await stack.signal()
+    await stack.signal(version)
 
-    async def reconciled() -> bool:
-        return await stack.rows() == 2
 
-    await until(reconciled, 70)
+async def _settled(stack: Stack) -> None:
+    async def done() -> bool:
+        purge = service.stale_row_purge
+        assert purge is not None
+        return purge.settled_boundary == stack.boundary
+
+    await until(done, 30)
+
+
+async def test_a_dead_lettered_signal_vetoes_until_it_is_cleared(stack: Stack) -> None:
+    """Deliberate, and the same as discogs-sql-loader: a dead letter of any kind holds the purge."""
+    await _dead_letter_the_signal(stack)
+
+    await _next_extraction(stack, "20261205")
+    await _settled(stack)
+    assert await stack.rows() == 3
+    assert await stack.vetoed("20261205") == ["artists"]
+
+    await stack.dlq.purge()
+    await _next_extraction(stack, "20270105")
+    await _settled(stack)
+    assert await stack.rows() == 2
+    assert await stack.vetoed("20270105") == []
+
+
+async def _one_rejected_record(stack: Stack) -> None:
+    """A real rejection through the real handler, left in the DLQ."""
+    await stack.publish({"id": "not-a-uuid", "name": "poison"})
+
+    async def dead() -> bool:
+        return await _DEAD_LETTERS_WAITING("artists") == 1
+
+    await until(dead, 30)
+
+
+async def test_a_restart_between_the_dead_letter_and_the_signal_still_vetoes(stack: Stack) -> None:
+    await _one_rejected_record(stack)
+    original = service.stale_row_purge
+    assert original is not None
+    assert original.dead_lettered == {"artists"}
+    restarted = StaleChildRowPurge(
+        service.connection_pool, service.logger, tables=original._tables, expected_data_types=("artists",), admission=service.write_admission
+    )
+    with patch.object(service, "stale_row_purge", restarted):
+        await stack.signal()
+        await _settled(stack)
+    assert await stack.rows() == 3
+    assert await stack.vetoed() == ["artists"]
+
+
+def _gauge_is(gauge: Any, value: int) -> Any:
+    async def check() -> bool:
+        return bool(gauge.call_args) and gauge.call_args.args == (value,)
+
+    return check
+
+
+async def test_two_vetoed_extractions_alert_and_a_clean_one_ends_the_run(stack: Stack) -> None:
+    await _one_rejected_record(stack)
+    with patch.object(service, "_record_purge_consecutive_vetoes") as gauge, patch.object(service, "logger", wraps=service.logger) as logger:
+        await stack.signal("20261105")
+        await until(_gauge_is(gauge, 1), 10)
+        assert not [call for call in logger.error.call_args_list if "consecutive" in call.args[0]]
+
+        await _next_extraction(stack, "20261205")
+        await until(_gauge_is(gauge, 2), 10)
+        assert len([call for call in logger.error.call_args_list if "consecutive" in call.args[0]]) == 1
+        assert await stack.rows() == 3
+
+        await stack.dlq.purge()
+        await _next_extraction(stack, "20270105")
+        await until(_gauge_is(gauge, 0), 10)
+        assert await stack.rows() == 2
 
 
 async def test_a_rejected_record_still_vetoes_the_run(stack: Stack) -> None:

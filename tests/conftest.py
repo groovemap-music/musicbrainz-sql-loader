@@ -165,3 +165,24 @@ def isolated_delivery_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(service, "consumer_tags", {})
     monkeypatch.setattr(service, "connection_consumer_tags", {})
     monkeypatch.setattr(service, "consumer_cancellation_failed", False)
+
+    async def no_dead_letters(_data_type: str) -> int:
+        return 0
+
+    async def no_vetoes(*_args: object) -> list[str]:
+        return []
+
+    async def nothing(*_args: object) -> None:
+        return None
+
+    async def zero(*_args: object) -> int:
+        return 0
+
+    async def present(*_args: object) -> bool:
+        return True
+
+    monkeypatch.setattr(service, "dead_letters_waiting", no_dead_letters)
+    monkeypatch.setattr(service, "recorded_vetoes", no_vetoes)
+    monkeypatch.setattr(service, "record_extraction", nothing)
+    monkeypatch.setattr(service, "consecutive_vetoes", zero)
+    monkeypatch.setattr(service, "purge_veto_column_present", present)

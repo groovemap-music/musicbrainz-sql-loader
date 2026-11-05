@@ -85,6 +85,14 @@ takes. Both are empirical: they catch the cases seen so far, not the premise. If
 the producer ever gains an incremental mode, this module needs a field on the
 signal saying so, not a tighter cap.
 
+The dead-letter veto survives through the broker and the latch
+---------------------------------------------------------------
+The marks here are process memory. ``brainztableinator`` also reads each entity's dead-letter
+queue from the broker when the fourth signal latches, and records the outcome in
+``purge_vetoed`` (see ``_purge_veto``), so a restart between a dead-letter and the signal still
+vetoes. A dead letter of any kind counts, including a dead-lettered ``extraction_complete``, so a
+run vetoes until its dead letters are replayed or cleared.
+
 The dead-letter veto is not scoped to an extraction
 ---------------------------------------------------
 :meth:`StaleChildRowPurge.record_dead_letter` records a data type, not a data type
@@ -374,6 +382,16 @@ class StaleChildRowPurge:
     def pending_data_types(self) -> list[str]:
         """The entity types whose ``extraction_complete`` is still outstanding."""
         return sorted(self._expected_data_types - self._signals.keys())
+
+    @property
+    def expected_data_types(self) -> frozenset[str]:
+        """The entity types whose signals this purge waits for."""
+        return self._expected_data_types
+
+    @property
+    def is_settled(self) -> bool:
+        """Report whether the extraction being collected has already been decided."""
+        return self._boundary is not None and self._settled_boundary == self._boundary
 
     @property
     def settled_boundary(self) -> datetime | None:

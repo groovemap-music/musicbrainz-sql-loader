@@ -783,6 +783,13 @@ class _RecordingPurge:
     def record_dead_letter(self, data_type: str) -> None:
         self.dead_lettered_types.append(data_type)
 
+    expected_data_types = frozenset(DATA_TYPES)
+    is_settled = False
+
+    @property
+    def dead_lettered(self) -> frozenset[str]:
+        return frozenset(self.dead_lettered_types)
+
     async def purge(self) -> dict[str, int]:
         self.calls += 1
         if self._error is not None:
