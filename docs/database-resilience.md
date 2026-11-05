@@ -57,7 +57,8 @@ restarts during one outage dead-letter a message early, with reason `delivery_li
 failure ends within 500 × (60 s + one attempt), and a message failing while other records succeed
 ends far sooner, because a success resets the backoff. A dead-lettered `extraction_complete`
 leaves no veto, so replaying it from the DLQ once PostgreSQL is back recovers that run's deletes,
-and without a replay the next extraction reconciles them. A rejected record does veto the run,
+but only if the loader has not restarted, because the purge's collected signals live in memory.
+After a restart, or without a replay, the next extraction reconciles them. A rejected record does veto the run,
 because its row was never refreshed. Deterministic
 `DataError` and `IntegrityError` failures are rejected without retry and arrive in the
 dead-letter queue. So are `OperationalError`s in SQLSTATE class 54 (`ProgramLimitExceeded`,

@@ -130,7 +130,7 @@ def test_no_renovate_or_legacy_claude_workflow_exists() -> None:
 
 def test_the_lane_ci_runs_keeps_the_real_broker_proofs_alive() -> None:
     """Without the owned lane the real-broker tests skip, and nothing would say so."""
-    recipe = (ROOT / "justfile").read_text().split("test-integration:\n", 1)[1].split("\n\n", 1)[0]
+    recipe = (ROOT / "Justfile").read_text().split("test-integration:\n", 1)[1].split("\n\n", 1)[0]
     assert "scripts/test-admission-integration.sh" in recipe
     lane = (ROOT / "scripts/test-admission-integration.sh").read_text()
     assert "tests/integration/test_requeue_pacing_rabbitmq.py" in lane
