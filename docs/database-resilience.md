@@ -56,15 +56,43 @@ provided only nacks return it: a channel or connection close does spend `x-deliv
 restarts during one outage dead-letter a message early, with reason `delivery_limit`. A persistent
 failure ends within 500 × (60 s + one attempt), and a message failing while other records succeed
 ends far sooner, because a success resets the backoff. A dead-lettered `extraction_complete`
-leaves no veto, so replaying it from the DLQ once PostgreSQL is back recovers that run's deletes,
-but only if the loader has not restarted, because the purge's collected signals live in memory.
-After a restart, or without a replay, the next extraction reconciles them. A rejected record does veto the run,
-because its row was never refreshed. Deterministic
+is a dead letter like any other, so it vetoes the delete-reconciliation until it is replayed or
+cleared. This is deliberate and matches `discogs-sql-loader`: no DLQ is scanned for message types,
+and the consecutive-veto alert below makes the case loud. Replaying it after a restart needs the
+other signals again, because the collected signals are process memory; otherwise clear it, and the
+next extraction reconciles. Deterministic
 `DataError` and `IntegrityError` failures are rejected without retry and arrive in the
 dead-letter queue. So are `OperationalError`s in SQLSTATE class 54 (`ProgramLimitExceeded`,
 for example an index row larger than the btree maximum): the record itself is the cause, so
 retrying would requeue the same message indefinitely and stall its consumer. The shared
 `is_permanent_operational_error` in `groovemap-runtime` defines that allow-list.
+
+## Purge vetoes
+
+When the fourth signal latches, the delete-reconciliation is vetoed if any entity's `.dlq` holds a
+dead letter, if the broker cannot be read, if this run rejected a record, or if an earlier delivery
+of this extraction recorded a veto. So a veto survives a restart and covers dead letters the broker
+made itself. Every extraction that reaches this point writes one `loader = 'musicbrainz'` row to
+`loader_extraction_latch`, keyed by the signal's version, with the vetoing types in `purge_vetoed`.
+Writing it is part of the decision: if it fails, the signal is requeued.
+
+A dead letter keeps vetoing until someone deals with it, and stale rows stay until then. Deal with it
+only after that run's signals have settled. Replay the records once the cause is fixed: no GrooveMap
+tool does this, so use a shovel from the `.dlq` to the live queue, or the RabbitMQ management UI's
+move-messages action, and enable the `rabbitmq_shovel` plugins first because the deployment does not.
+Or purge the DLQ from the operations console (`POST /admin/api/dlq/purge/{queue}`) if the records are
+not wanted. The next extraction then reconciles.
+
+**`Delete-reconciliation vetoed on consecutive extractions`.** The gauge
+`groovemap.pipeline.purge.consecutive_vetoes` counts the extractions in a row that vetoed the purge,
+from `purge_vetoed`, so it survives restarts and is read again at startup. From 2 the loader logs this
+line at error level. It means a dead letter has stayed for two dumps, or a record is rejected in every
+dump. The veto is right to hold, because it protects live rows: read the `.dlq`, fix the cause and
+replay, or clear it. One veto followed by a clean purge does not reach the threshold. Until a Grafana
+rule covers this loader, this error line is the alert, and nothing pages.
+
+This loader needs the `purge_vetoed` column. Ship the `database-schema` release carrying it first. In
+the wrong order nothing is lost: the delete-reconciliation stays off and loading continues.
 
 ## RabbitMQ and restart
 
