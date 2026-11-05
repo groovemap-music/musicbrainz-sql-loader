@@ -40,8 +40,8 @@ docker start "${rabbitmq_container}" >/dev/null
 ready="false"
 for _attempt in $(seq 1 60); do
     if docker exec "${postgres_container}" pg_isready --quiet --username postgres && \
-       docker exec "${rabbitmq_container}" rabbitmq-diagnostics -q ping && \
-       docker exec "${rabbitmq_container}" rabbitmq-diagnostics -q check_port_listener 5672 >/dev/null 2>&1; then
+       docker exec --user rabbitmq "${rabbitmq_container}" rabbitmq-diagnostics -q ping && \
+       docker exec --user rabbitmq "${rabbitmq_container}" rabbitmq-diagnostics -q check_port_listener 5672 >/dev/null 2>&1; then
         ready="true"
         break
     fi

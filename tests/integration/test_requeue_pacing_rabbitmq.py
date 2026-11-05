@@ -249,6 +249,66 @@ async def test_a_persistent_failure_dead_letters_at_the_budget(stack: Stack) -> 
     assert await stack.rows() == 3
 
 
+async def _dead_letter_the_signal(stack: Stack) -> bytes:
+    """Run the signal through a persistent failure and hand back the body the DLQ holds."""
+    await stack.proxy.cut()
+    with patch.object(service, "MAX_REQUEUES", 1):
+        await stack.signal()
+
+        async def dead() -> bool:
+            queue = await stack.channel.declare_queue(stack.dlq.name, passive=True)
+            return queue.declaration_result.message_count == 1
+
+        await until(dead, 60)
+    message = await stack.dlq.get(fail=True, timeout=5)
+    assert message is not None
+    await message.ack()
+    await stack.proxy.open()
+    return message.body
+
+
+async def test_replaying_a_dead_lettered_signal_recovers_the_run(stack: Stack) -> None:
+    body = await _dead_letter_the_signal(stack)
+    await stack.channel.default_exchange.publish(aio_pika.Message(body, delivery_mode=aio_pika.DeliveryMode.PERSISTENT), routing_key=stack.queue.name)
+
+    async def reconciled() -> bool:
+        return await stack.rows() == 2
+
+    await until(reconciled, 70)
+
+
+async def test_a_dead_lettered_signal_does_not_veto_the_next_clean_extraction(stack: Stack) -> None:
+    await _dead_letter_the_signal(stack)
+    stack.boundary += timedelta(hours=1)
+    async with await psycopg.AsyncConnection.connect(stack.dsn) as connection:
+        statement = sql.SQL("UPDATE {}.purge_rows SET updated_at = %s WHERE id > 1").format(sql.Identifier(stack.schema))
+        await connection.execute(statement, (stack.boundary,))
+    await stack.signal()
+
+    async def reconciled() -> bool:
+        return await stack.rows() == 2
+
+    await until(reconciled, 70)
+
+
+async def test_a_rejected_record_still_vetoes_the_run(stack: Stack) -> None:
+    """A record at its budget never refreshed its row, so purging would delete a live record."""
+
+    async def boom(_connection: Any, _data: dict[str, Any]) -> None:
+        raise RuntimeError("not a database failure")
+
+    with patch.dict(service.PROCESSORS, {"artists": boom}), patch.object(service, "MAX_REQUEUES", 0):
+        await stack.publish({"id": str(uuid.uuid4()), "name": "poison"})
+        assert await stack.dead_letter_reason() == "rejected"
+    await stack.signal()
+
+    async def settled() -> bool:
+        return service.stale_row_purge.settled_boundary is not None
+
+    await until(settled, 30)
+    assert await stack.rows() == 3
+
+
 async def test_the_grace_timer_cannot_strand_a_signal_in_backoff(stack: Stack) -> None:
     """file_complete arms the timer, the signal waits out a failure past it, the consumer stays."""
     await stack.proxy.cut()

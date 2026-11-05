@@ -1190,11 +1190,13 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> D
         headers=message.headers,
         wait_before_requeue=classifier.wait_before_requeue,
     )
-    if result.settlement is Settlement.REJECT and stale_row_purge is not None:
-        # A rejected delivery is dead-lettered with its row never upserted, so that
-        # row's updated_at was never refreshed even though the record is still present
-        # upstream. Purging on top of that would delete a still-current record beyond
-        # the dead-letter queue, so any rejection this run vetoes the reconciliation.
+    if result.settlement is Settlement.REJECT and stale_row_purge is not None and result.error_type != ReconciliationFailed.__name__:
+        # A rejected record is dead-lettered with its row never upserted, so that row's
+        # updated_at was never refreshed even though the record is still present upstream.
+        # Purging on top of that would delete a still-current record beyond the dead-letter
+        # queue, so a rejected record vetoes the reconciliation. A rejected extraction_complete
+        # is different: it carries no row, and a mark from it would veto the next clean
+        # extraction and stop a replay from recovering this one.
         stale_row_purge.record_dead_letter(data_type)
     if result.settlement is Settlement.ACK and result.outcome == "processed":
         outage_backoff.reset()

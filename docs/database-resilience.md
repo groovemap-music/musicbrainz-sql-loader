@@ -40,8 +40,8 @@ builds on earlier local reviewed reference `68851ad31defbe2d24fca28d2354f3b269ea
 the published loader commits, msgpack 1.2.3 security fix, and producer-owned contract
 artifacts remain intact.
 
-The default checks remain service-free. `just test-admission-integration` starts only
-task-owned disposable RabbitMQ and PostgreSQL containers, disables global QoS in RabbitMQ,
+The default checks remain service-free. `just test-admission-integration`, which `just
+test-integration` and so CI run, starts only task-owned disposable RabbitMQ and PostgreSQL containers, disables global QoS in RabbitMQ,
 and exercises the real callback, bounded database activity, cancellation, redelivery, and
 `_recover_consumers` path. It does not accept caller-supplied service URLs.
 
@@ -56,7 +56,9 @@ provided only nacks return it: a channel or connection close does spend `x-deliv
 restarts during one outage dead-letter a message early, with reason `delivery_limit`. A persistent
 failure ends within 500 × (60 s + one attempt), and a message failing while other records succeed
 ends far sooner, because a success resets the backoff. A dead-lettered `extraction_complete`
-vetoes that run's purge, so its deletes do not reconcile until the next extraction. Deterministic
+leaves no veto, so replaying it from the DLQ once PostgreSQL is back recovers that run's deletes,
+and without a replay the next extraction reconciles them. A rejected record does veto the run,
+because its row was never refreshed. Deterministic
 `DataError` and `IntegrityError` failures are rejected without retry and arrive in the
 dead-letter queue. So are `OperationalError`s in SQLSTATE class 54 (`ProgramLimitExceeded`,
 for example an index row larger than the btree maximum): the record itself is the cause, so

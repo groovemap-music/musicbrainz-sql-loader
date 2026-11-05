@@ -126,3 +126,11 @@ def test_no_renovate_or_legacy_claude_workflow_exists() -> None:
     repository_paths = [path.relative_to(ROOT).as_posix().lower() for path in ROOT.rglob("*") if path.is_file()]
     assert not any("renovate" in path for path in repository_paths)
     assert not any(path.startswith(".github/workflows/claude") for path in repository_paths)
+
+
+def test_the_lane_ci_runs_keeps_the_real_broker_proofs_alive() -> None:
+    """Without the owned lane the real-broker tests skip, and nothing would say so."""
+    recipe = (ROOT / "justfile").read_text().split("test-integration:\n", 1)[1].split("\n\n", 1)[0]
+    assert "scripts/test-admission-integration.sh" in recipe
+    lane = (ROOT / "scripts/test-admission-integration.sh").read_text()
+    assert "tests/integration/test_requeue_pacing_rabbitmq.py" in lane
