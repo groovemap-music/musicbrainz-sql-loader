@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from time import perf_counter
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from common import DeliveryResult, FailureKind, Settlement
+from common import MIN_PACED_WAIT_S, DeliveryResult, FailureKind, OutageBackoff, Settlement
 from psycopg.errors import (
     DataError,
     IntegrityError,
@@ -23,7 +24,7 @@ import brainztableinator.brainztableinator as service
 
 
 ROOT = Path(__file__).parent.parent
-RUNTIME_REVISION = "5459343ccaf46da5f71db11cda40d9338ce61d8d"
+RUNTIME_REVISION = "87c0d75ca457bd38b14e6ce6f713098a2b4c5e26"
 
 
 class _UnreviewedClassError(OperationalError):
@@ -277,3 +278,25 @@ def test_runtime_pin_and_private_batch_boundary_are_static() -> None:
     assert "AsyncBatchEngine" not in source
     assert "class BatchObserver" in processor
     assert "class _RuntimeBatchObserver" in source
+
+
+def test_the_pace_stays_above_what_earns_the_default_budget() -> None:
+    """The runtime's default budget needs a wait of MIN_PACED_WAIT_S on every call."""
+    backoff = service.outage_backoff
+    assert backoff.initial_delay >= MIN_PACED_WAIT_S
+    assert backoff.multiplier >= 1
+    assert backoff.max_delay >= backoff.initial_delay
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [RuntimeError("unknown"), OperationalError("outage"), service.ReconciliationFailed("artists"), None])
+async def test_the_wait_really_waits_on_every_call_whatever_failed(error: Exception | None) -> None:
+    """Timed, not mocked: run_delivery measures this call, so a call that returns at once earns no budget."""
+    classifier = service._MusicBrainzFailureClassifier("artists")
+    if error is not None:
+        classifier(error)
+    backoff = OutageBackoff("test", initial_delay=MIN_PACED_WAIT_S, max_delay=MIN_PACED_WAIT_S)
+    with patch.object(service, "outage_backoff", backoff):
+        started = perf_counter()
+        await classifier.wait_before_requeue()
+    assert perf_counter() - started >= MIN_PACED_WAIT_S
