@@ -364,14 +364,44 @@ _delivery_destination: ContextVar[str] = ContextVar("brainztableinator_delivery_
 _delivery_observer = _DeliveryObserver()
 
 
-class _MusicBrainzFailureClassifier:
-    """Classify persistence failures while retaining outage-only requeue throttling."""
+class ReconciliationFailed(Exception):
+    """The delete-reconciliation failed, so its ``extraction_complete`` signal must retry."""
 
-    def __init__(self, data_type: str) -> None:
+
+def _broker_handouts(message: AbstractIncomingMessage) -> int:
+    """Return how often RabbitMQ has handed this message out before this delivery.
+
+    ``x-acquired-count`` rises on every return of any kind. ``x-delivery-count`` misses nacks,
+    so it is only the fallback here. A first delivery carries neither.
+    """
+    headers: object = message.headers
+    if not isinstance(headers, Mapping):
+        return 0
+    counts = (headers.get(name) for name in ("x-acquired-count", "x-delivery-count"))
+    return max((count for count in counts if isinstance(count, int)), default=0)
+
+
+class _MusicBrainzFailureClassifier:
+    """Classify persistence failures, and end a retry once its requeue budget is spent."""
+
+    def __init__(self, data_type: str, handouts: int = 0) -> None:
         self._data_type = data_type
-        self._throttle = False
+        self._handouts = handouts
 
     def __call__(self, error: BaseException) -> FailureKind:
+        kind = self._classify(error)
+        if kind is FailureKind.TRANSIENT and self._handouts >= MAX_REQUEUES:
+            logger.critical(
+                "🚨 Requeue budget spent, dead-lettering a message that kept failing",
+                data_type=self._data_type,
+                deliveries=self._handouts + 1,
+                error_type=type(error).__name__,
+                error=str(error),
+            )
+            return FailureKind.DETERMINISTIC
+        return kind
+
+    def _classify(self, error: BaseException) -> FailureKind:
         if is_permanent_operational_error(error):
             # SQLSTATE class 54 (e.g. ProgramLimitExceeded: index row size) is a verdict on the
             # record, not the connection. Retrying it requeues the same poison message forever and
@@ -385,7 +415,6 @@ class _MusicBrainzFailureClassifier:
             )
             return FailureKind.DETERMINISTIC
         if isinstance(error, (InterfaceError, OperationalError, DatabaseUnavailableError)):
-            self._throttle = True
             logger.warning("⚠️ Database connection issue, will retry", error=str(error))
             return FailureKind.TRANSIENT
         if isinstance(error, (DataError, IntegrityError)):
@@ -399,8 +428,8 @@ class _MusicBrainzFailureClassifier:
         return FailureKind.TRANSIENT
 
     async def wait_before_requeue(self) -> None:
-        if self._throttle:
-            await outage_backoff.wait()
+        """Wait on every call: an unpaced nack comes straight back, hundreds of times a second."""
+        await outage_backoff.wait()
 
 
 config: MusicBrainzSQLLoaderConfig | None = None
@@ -431,8 +460,12 @@ last_message_time = {
 }
 completed_files: set[str] = set()
 
-# Throttle requeues so an outage cannot exhaust the quorum queue's delivery budget.
+# Paces every requeue, because nothing else does: RabbitMQ 4.3.5 and 4.4.0 do not spend
+# x-delivery-limit on nack(requeue=True), so a nacked message comes straight back forever.
 outage_backoff = OutageBackoff(SERVICE_NAME)
+# Requeues a message may use before it is dead-lettered, read from x-acquired-count. At the
+# 60 s backoff cap this is about 8.2 hours, so an outage does not dead-letter good records.
+MAX_REQUEUES = 500
 current_task = None
 current_progress = 0.0
 
@@ -1007,6 +1040,7 @@ async def _reconcile_deleted_child_rows(data_type: str, data: dict[str, Any]) ->
             error=str(error),
         )
         return False
+    outage_backoff.reset()
     return True
 
 
@@ -1060,14 +1094,20 @@ async def _handle_data_message(message: AbstractIncomingMessage, data_type: str)
             data_type=data_type,
             version=data.get("version"),
         )
+        # The grace timer file_complete armed must not fire while this signal waits out a
+        # failure: it would come back to a queue with no consumer. Success re-arms the timer.
+        pending_cancel = consumer_cancel_tasks.pop(data_type, None)
+        if pending_cancel is not None:
+            pending_cancel.cancel()
         completed_files.add(data_type)
         if not await _reconcile_deleted_child_rows(data_type, data):
             # The reconciliation is this run's only chance to remove rows dropped
             # upstream, so a failure requeues the signal rather than acking past it.
             # Completion is withdrawn with it: the signal is still pending, and idle
-            # detection must not treat this type as finished while it is.
+            # detection must not treat this type as finished while it is. Raised, so it
+            # goes through the classifier and the wait like any other failure.
             completed_files.discard(data_type)
-            return DeliveryResult(Settlement.REQUEUE, "failed", "ReconciliationFailed")
+            raise ReconciliationFailed(data_type)
         if CONSUMER_CANCEL_DELAY > 0 and data_type in queues:
             await schedule_consumer_cancellation(data_type, queues[data_type])
         return DeliveryResult(Settlement.ACK, "skipped")
@@ -1128,8 +1168,8 @@ async def _handle_data_message(message: AbstractIncomingMessage, data_type: str)
 async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> DeliveryResult:
     """Process and settle one delivery through the shared settlement authority."""
     if shutdown_requested:
-        # A still-subscribed consumer would immediately redeliver a requeue and burn the
-        # quorum delivery budget. Connection close requeues this unsettled delivery once.
+        # A still-subscribed consumer would immediately redeliver a requeue, in a hot loop.
+        # Connection close requeues this unsettled delivery once, spending one x-delivery-count.
         logger.debug("🛑 Shutdown requested, leaving message unacked for redelivery")
         return DeliveryResult(Settlement.DEFER, "deferred")
 
@@ -1139,7 +1179,7 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> D
     except ValueError:
         destination = "unknown"
 
-    classifier = _MusicBrainzFailureClassifier(data_type)
+    classifier = _MusicBrainzFailureClassifier(data_type, _broker_handouts(message))
     result = await run_delivery(
         message,
         lambda: _handle_data_message(message, data_type),
@@ -1150,11 +1190,13 @@ async def on_data_message(message: AbstractIncomingMessage, data_type: str) -> D
         headers=message.headers,
         wait_before_requeue=classifier.wait_before_requeue,
     )
-    if result.settlement is Settlement.REJECT and stale_row_purge is not None:
-        # A rejected delivery is dead-lettered with its row never upserted, so that
-        # row's updated_at was never refreshed even though the record is still present
-        # upstream. Purging on top of that would delete a still-current record beyond
-        # the dead-letter queue, so any rejection this run vetoes the reconciliation.
+    if result.settlement is Settlement.REJECT and stale_row_purge is not None and result.error_type != ReconciliationFailed.__name__:
+        # A rejected record is dead-lettered with its row never upserted, so that row's
+        # updated_at was never refreshed even though the record is still present upstream.
+        # Purging on top of that would delete a still-current record beyond the dead-letter
+        # queue, so a rejected record vetoes the reconciliation. A rejected extraction_complete
+        # is different: it carries no row, and a mark from it would veto the next clean
+        # extraction and stop a replay from recovering this one.
         stale_row_purge.record_dead_letter(data_type)
     if result.settlement is Settlement.ACK and result.outcome == "processed":
         outage_backoff.reset()

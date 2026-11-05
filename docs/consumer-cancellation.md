@@ -61,7 +61,8 @@ admission budget is owned.
 A delivery that reaches the handler after shutdown begins is deliberately left unsettled; a
 handler already inside its transaction may still finish normally. An immediate
 `nack(requeue=True)` while a subscription remains active would redeliver the same message in
-a tight loop and consume the quorum queue's delivery budget.
+a tight loop. Leaving it unsettled spends one `x-delivery-count` when the connection closes; a
+nack spends none.
 
 Regression coverage for this ordering lives in
 [`tests/test_consumer_cancellation.py`](../tests/test_consumer_cancellation.py),

@@ -916,9 +916,9 @@ class TestServiceLatching:
         monkeypatch.setattr(service, "completed_files", completed)
         monkeypatch.setattr(service, "CONSUMER_CANCEL_DELAY", 0)
 
-        result = await service._handle_data_message(_extraction_complete_message(), "releases")
+        with pytest.raises(service.ReconciliationFailed):
+            await service._handle_data_message(_extraction_complete_message(), "releases")
 
-        assert result == DeliveryResult(Settlement.REQUEUE, "failed", "ReconciliationFailed")
         assert "releases" not in completed
 
     @pytest.mark.asyncio

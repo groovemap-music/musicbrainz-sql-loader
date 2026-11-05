@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -132,7 +133,7 @@ async def test_database_outage_waits_then_requeues_once() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unknown_failure_requeues_immediately() -> None:
+async def test_unknown_failure_waits_before_it_requeues() -> None:
     delivery = StrictDelivery()
     pool = MagicMock()
     pool.connection.side_effect = RuntimeError("unexpected")
@@ -144,7 +145,7 @@ async def test_unknown_failure_requeues_immediately() -> None:
     ):
         result = await service.on_data_message(delivery, "artists")  # type: ignore[arg-type]
     assert result == DeliveryResult(Settlement.REQUEUE, "transient", "RuntimeError")
-    wait.assert_not_awaited()
+    wait.assert_awaited_once()
     assert delivery.calls == [("nack", True)]
 
 
@@ -194,24 +195,47 @@ async def test_settlement_failure_is_visible_without_false_success_or_retry() ->
 
 
 @pytest.mark.parametrize(
-    ("error", "kind", "throttled"),
+    ("error", "kind"),
     [
-        (InterfaceError("interface"), FailureKind.TRANSIENT, True),
-        (OperationalError("operation"), FailureKind.TRANSIENT, True),
-        (InvalidAuthorizationSpecification("credentials"), FailureKind.TRANSIENT, True),
-        (_UnreviewedClassError("unreviewed class"), FailureKind.TRANSIENT, True),
-        (service.DatabaseUnavailableError("pool"), FailureKind.TRANSIENT, True),
+        (InterfaceError("interface"), FailureKind.TRANSIENT),
+        (OperationalError("operation"), FailureKind.TRANSIENT),
+        (InvalidAuthorizationSpecification("credentials"), FailureKind.TRANSIENT),
+        (_UnreviewedClassError("unreviewed class"), FailureKind.TRANSIENT),
+        (service.DatabaseUnavailableError("pool"), FailureKind.TRANSIENT),
         # 54000 program_limit_exceeded is a verdict on the record (index row size), not a connection problem.
-        (ProgramLimitExceeded("index row size exceeds btree maximum"), FailureKind.DETERMINISTIC, False),
-        (DataError("data"), FailureKind.DETERMINISTIC, False),
-        (IntegrityError("integrity"), FailureKind.DETERMINISTIC, False),
-        (RuntimeError("unknown"), FailureKind.TRANSIENT, False),
+        (ProgramLimitExceeded("index row size exceeds btree maximum"), FailureKind.DETERMINISTIC),
+        (DataError("data"), FailureKind.DETERMINISTIC),
+        (IntegrityError("integrity"), FailureKind.DETERMINISTIC),
+        (RuntimeError("unknown"), FailureKind.TRANSIENT),
     ],
 )
-def test_local_failure_classifier_preserves_policy(error: Exception, kind: FailureKind, throttled: bool) -> None:
+def test_local_failure_classifier_preserves_policy(error: Exception, kind: FailureKind) -> None:
     classifier = service._MusicBrainzFailureClassifier("artists")
     assert classifier(error) is kind
-    assert classifier._throttle is throttled
+
+
+@pytest.mark.parametrize("error", [OperationalError("operation"), RuntimeError("unknown"), service.ReconciliationFailed("artists")])
+def test_a_spent_budget_turns_a_transient_failure_into_a_rejection(error: Exception) -> None:
+    assert service._MusicBrainzFailureClassifier("artists", service.MAX_REQUEUES)(error) is FailureKind.DETERMINISTIC
+    assert service._MusicBrainzFailureClassifier("artists", service.MAX_REQUEUES - 1)(error) is FailureKind.TRANSIENT
+
+
+@pytest.mark.parametrize(
+    ("headers", "expected"),
+    [(None, 0), ({}, 0), ({"x-acquired-count": 7}, 7), ({"x-acquired-count": 29, "x-delivery-count": 20}, 29), ({"x-acquired-count": "9"}, 0)],
+)
+def test_handouts_read_the_broker_count(headers: object, expected: int) -> None:
+    assert service._broker_handouts(SimpleNamespace(headers=headers)) == expected  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [RuntimeError("unknown"), OperationalError("outage")])
+async def test_every_failure_kind_waits_before_its_requeue(error: Exception) -> None:
+    classifier = service._MusicBrainzFailureClassifier("artists")
+    classifier(error)
+    with patch.object(service.outage_backoff, "wait", AsyncMock()) as wait:
+        await classifier.wait_before_requeue()
+    wait.assert_awaited_once()
 
 
 @pytest.mark.asyncio

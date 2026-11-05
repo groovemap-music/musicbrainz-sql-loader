@@ -40,9 +40,10 @@ coverage: test
 # It deselects `parity`, which needs a second engine.
 test-integration:
     bash scripts/test-integration.sh
+    bash scripts/test-admission-integration.sh
 
 # Owned RabbitMQ/PostgreSQL controls for shared database admission. This lane starts both
-# disposable services itself and denies RabbitMQ global QoS; it is outside the default check.
+# disposable services itself and denies RabbitMQ global QoS. Outside `check`, but `test-integration` runs it, so CI does.
 test-admission-integration:
     bash scripts/test-admission-integration.sh
 
