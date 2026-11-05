@@ -46,8 +46,17 @@ and exercises the real callback, bounded database activity, cancellation, redeli
 `_recover_consumers` path. It does not accept caller-supplied service URLs.
 
 `InterfaceError`, `OperationalError` (other than SQLSTATE class 54), and
-`DatabaseUnavailableError` are transient. The loader waits before requeueing so a maintenance
-window cannot rapidly consume the quorum queue's finite delivery limit. Deterministic
+`DatabaseUnavailableError` are transient, and so is an unknown exception or a failed
+delete-reconciliation. The loader waits before every requeue, 2 s doubling to 60 s, because
+nothing else paces one: RabbitMQ 4.3.5 and 4.4.0 do not spend `x-delivery-limit` on
+`nack(requeue=True)`, so a nacked message comes straight back and never dead-letters. Once the
+broker's `x-acquired-count` reaches `MAX_REQUEUES` (500) the message is logged at critical level
+and rejected to the DLQ instead. That lets a failure of about 8.2 hours pass with no record lost,
+provided only nacks return it: a channel or connection close does spend `x-delivery-limit`, so 20
+restarts during one outage dead-letter a message early, with reason `delivery_limit`. A persistent
+failure ends within 500 × (60 s + one attempt), and a message failing while other records succeed
+ends far sooner, because a success resets the backoff. A dead-lettered `extraction_complete`
+vetoes that run's purge, so its deletes do not reconcile until the next extraction. Deterministic
 `DataError` and `IntegrityError` failures are rejected without retry and arrive in the
 dead-letter queue. So are `OperationalError`s in SQLSTATE class 54 (`ProgramLimitExceeded`,
 for example an index row larger than the btree maximum): the record itself is the cause, so
@@ -58,8 +67,8 @@ retrying would requeue the same message indefinitely and stall its consumer. The
 
 The broker connection uses heartbeat monitoring and bounded reconnect attempts. Exchanges,
 quorum live queues, dead-letter exchanges, and classic dead-letter queues are durable, matching
-every sibling catalog service. Live-queue bounding comes from `x-delivery-limit` plus the
-fleet's quorum-queue policy; DLQ bounding is a broker policy tracked separately
+every sibling catalog service. `x-delivery-limit` bounds returns from closed channels and
+connections, not nacks or consumer timeouts, plus the fleet's quorum-queue policy; DLQ bounding is a broker policy tracked separately
 (`gm-deployment-8mb`), not a queue-type change here — RabbitMQ cannot change an existing
 queue's type in place. Graceful process shutdown cancels subscriptions before closing the
 connection so unsettled records are redelivered once rather than churned. See

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 postgres_image="postgres:18-alpine@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2"
-rabbitmq_image="rabbitmq:4.1-management-alpine@sha256:54ef5ff505352c1beef05a97ee9bd6ab95b3559a76629ba0119b1d63d8d6e4b2"
+rabbitmq_image="${RABBITMQ_INTEGRATION_IMAGE:-rabbitmq:4-management@sha256:c200fd496482cda18c412be4e6f244830e1e75949b8cf5f0e887cea9ea456109}"
 postgres_container="musicbrainz-admission-postgres-$$"
 rabbitmq_container="musicbrainz-admission-rabbitmq-$$"
 config_dir="$(mktemp -d)"
@@ -59,7 +59,7 @@ rabbitmq_port="$(docker port "${rabbitmq_container}" 5672/tcp)"
 export TEST_DATABASE_URL="postgresql://postgres:integration-test@${postgres_port}/postgres"
 export TEST_RABBITMQ_URL="amqp://guest:guest@${rabbitmq_port}/"
 
-if ! uv run pytest -m "integration and not parity" tests/integration/test_write_admission_rabbitmq.py -q; then
+if ! uv run pytest -m "integration and not parity" tests/integration/test_write_admission_rabbitmq.py tests/integration/test_requeue_pacing_rabbitmq.py -q; then
     docker logs "${rabbitmq_container}" >&2 || true
     exit 1
 fi
