@@ -16,11 +16,19 @@ from psycopg.types.json import Jsonb
 # evidence that this run still saw the row, and `_reconciliation.StaleChildRowPurge` deletes
 # rows that lack it. Leaving it off a no-op conflict would make a live relationship look
 # stale and be purged.
+# The conflict target is the schema's `relationships_key` unique index: `musicbrainz.relationship_key(...)`
+# over the same eight values the old `relationships_natural_key` constraint covers, as one 32-byte hash.
+# PostgreSQL infers the index only when the expression and its arguments appear exactly as the index
+# declares them, so this text is the schema's, argument order included. Naming the index (not the
+# constraint) is what lets the schema drop that constraint, which carries a jsonb column per row, once
+# MusicBrainz is about to be enabled. Until then the constraint still rejects a row the hash calls new,
+# which only happens for a jsonb number written at two scales (`1` and `1.0`).
 _RELATIONSHIP_INSERT = (
     "INSERT INTO musicbrainz.relationships "
     "(source_mbid, source_entity_type, target_mbid, target_entity_type, relationship_type, attributes, begin_date, end_date, ended) "
     "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
-    "ON CONFLICT (source_mbid, target_mbid, source_entity_type, target_entity_type, relationship_type, begin_date, end_date, attributes) "
+    "ON CONFLICT (musicbrainz.relationship_key("
+    "source_mbid, target_mbid, source_entity_type, target_entity_type, relationship_type, begin_date, end_date, attributes)) "
 )
 
 RELATIONSHIP_UPSERTS: dict[bool, str] = {

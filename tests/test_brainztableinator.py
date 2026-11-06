@@ -477,8 +477,8 @@ class TestInsertRelationships:
 
     @pytest.mark.asyncio
     async def test_insert_relationships_conflict_target_includes_discriminating_fields(self):
-        """The ON CONFLICT target must match the widened
-        relationships_natural_key constraint (begin_date/end_date/attributes included)
+        """The ON CONFLICT target is the relationships_key index over the same eight values the widened
+        natural key covers (begin_date/end_date/attributes included)
         so two relationship instances differing only by date range or attributes are
         stored as separate rows instead of one overwriting the other. Only `ended`
         (a mutable flag, not part of the relationship's identity) should be refreshed
@@ -500,8 +500,9 @@ class TestInsertRelationships:
 
         sql = mock_cursor.executemany.call_args[0][0]
         assert (
-            "ON CONFLICT (source_mbid, target_mbid, source_entity_type, target_entity_type, "
-            "relationship_type, begin_date, end_date, attributes)" in sql
+            "ON CONFLICT (musicbrainz.relationship_key("
+            "source_mbid, target_mbid, source_entity_type, target_entity_type, "
+            "relationship_type, begin_date, end_date, attributes)) " in sql
         )
         conflict_action = sql.split("DO UPDATE SET")[1]
         assert "ended = EXCLUDED.ended" in conflict_action
