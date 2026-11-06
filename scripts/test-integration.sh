@@ -46,4 +46,4 @@ if [[ -z "${TEST_DATABASE_URL:-}" ]]; then
 fi
 
 # `parity` needs a Neo4j this script does not start; `just test-parity` owns that lane.
-uv run pytest -m "integration and not parity"
+uv run pytest -m "integration and not parity" ${INTEGRATION_TESTS:-} "$@"
