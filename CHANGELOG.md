@@ -3,6 +3,16 @@
 All notable changes to this repository will be recorded here by Commitizen from
 Conventional Commits.
 
+## v0.6.1 (2026-11-07)
+
+### Release notes
+
+Concurrent messages for one release no longer race on `graph.issued_on`: the prune and insert run under a transaction-scoped advisory lock, so neither message dead-letters. Replaying messages parked by the older race is safe. No schema change.
+
+### Fix
+
+- **persistence**: serialize concurrent writers of one release's issued_on range
+
 ## v0.6.0 (2026-11-06)
 
 ### Release notes
