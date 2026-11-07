@@ -101,6 +101,8 @@ class MusicBrainzWriter(Protocol):
 
     async def upsert_media(self, conn: Any, rows: list[tuple[str, str, str]]) -> None: ...
 
+    async def lock_release_media(self, conn: Any, release_id: str, source: str) -> None: ...
+
     async def replace_release_media_edges(self, conn: Any, release_id: str, source: str, rows: list[tuple[str, str, str, int]]) -> None: ...
 
 
@@ -298,6 +300,27 @@ class PostgreSQLMusicBrainzWriter:
                 rows,
             )
 
+    async def lock_release_media(self, conn: Any, release_id: str, source: str) -> None:
+        """Serialize writers of one native release's `graph.issued_on` range until commit.
+
+        Two MusicBrainz releases can name one Discogs release, so two messages in two
+        transactions can prune and insert the same `(release_id, source)` range. Neither
+        sees the other's uncommitted rows, both delete nothing, and the second insert hits
+        `issued_on_pkey`. A transaction-scoped advisory lock keyed on that range makes the
+        second writer wait for the first to commit, then prune what it wrote and insert its own,
+        so the last committer's edges win. The lock is released by commit or rollback.
+
+        Callers take it before any other write in the transaction. Every writer of the range
+        then acquires it first, so waiting on it can never close a cycle with row locks held
+        by another writer of the same range. One message holds at most one such lock, because
+        one transaction processes one release; taking it again is a no-op.
+        """
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (f"graph.issued_on:{source}:{release_id}",),
+            )
+
     async def replace_release_media_edges(self, conn: Any, release_id: str, source: str, rows: list[tuple[str, str, str, int]]) -> None:
         """Replace one release's media edges for one source, leaving every other source alone.
 
@@ -313,6 +336,7 @@ class PostgreSQLMusicBrainzWriter:
         duplicate here would be a derivation bug, and it should fail rather than quietly
         discard the quantity the second row carried.
         """
+        await self.lock_release_media(conn, release_id, source)
         async with conn.cursor() as cursor:
             await cursor.execute(
                 "DELETE FROM graph.issued_on WHERE release_id = %s AND source = %s",

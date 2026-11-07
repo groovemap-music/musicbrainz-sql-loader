@@ -43,6 +43,7 @@ def _writer() -> MagicMock:
         "insert_external_links",
         "upsert_media_families",
         "upsert_media",
+        "lock_release_media",
         "replace_release_media_edges",
     ):
         setattr(writer, operation, AsyncMock())

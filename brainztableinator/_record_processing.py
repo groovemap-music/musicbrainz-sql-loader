@@ -486,6 +486,10 @@ class MusicBrainzRecordProcessor:
 
     async def process_release(self, conn: Any, record: dict[str, Any]) -> None:
         mbid = record.get("mbid", record.get("id", ""))
+        # First write of the transaction: concurrent releases that resolve to one Discogs
+        # release take the same lock before touching any row, so they serialize without a cycle.
+        if record.get("discogs_release_id") is not None:
+            await self._writer.lock_release_media(conn, str(record["discogs_release_id"]), MEDIA_SOURCE)
         gm_item_id = await self._native_id(conn, "release", mbid, record.get("discogs_release_id"))
         # The block is derived once and both written and projected: the row stored in
         # `musicbrainz.releases.media` and the `graph.issued_on` rows below must describe the
