@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections import Counter
 from typing import TYPE_CHECKING, Any, Protocol
 
 import structlog
@@ -27,8 +28,36 @@ class BatchObserver(Protocol):
 
     def set_outcome(self, span: Any, outcome: str) -> None: ...
 
+    def alias_conflict(self, entity: str, identifier: str) -> None: ...
+
 
 logger = structlog.get_logger(__name__)
+
+# An info summary of alias conflicts is emitted at most this often, so a load that conflicts on
+# nearly every release logs one line a minute instead of one per release.
+ALIAS_CONFLICT_SUMMARY_INTERVAL_S = 60.0
+
+
+class _AliasConflictSummary:
+    """Pending alias conflicts, logged as one info line per interval rather than per record."""
+
+    def __init__(self, interval_s: float = ALIAS_CONFLICT_SUMMARY_INTERVAL_S) -> None:
+        self._interval_s = interval_s
+        self._pending: Counter[tuple[str, str]] = Counter()
+        self._last_emitted = time.monotonic()
+
+    def add(self, entity: str, identifier: str) -> None:
+        self._pending[(entity, identifier)] += 1
+        now = time.monotonic()
+        if now - self._last_emitted < self._interval_s:
+            return
+        logger.info(
+            "🔗 Release identifier alias conflicts since the last summary",
+            conflicts=sum(self._pending.values()),
+            by_kind={f"{entity}/{identifier}": count for (entity, identifier), count in sorted(self._pending.items())},
+        )
+        self._pending.clear()
+        self._last_emitted = now
 
 
 _ENTITY_TYPE_ALIASES = {"release_group": "release-group"}
@@ -226,6 +255,7 @@ class MusicBrainzRecordProcessor:
         self._writer = writer
         self._observer = observer
         self._media_mapper = media_mapper
+        self._alias_conflicts = _AliasConflictSummary()
 
     async def insert_relationships(
         self,
@@ -480,9 +510,11 @@ class MusicBrainzRecordProcessor:
             return
 
         attached = await attach_aliases(conn, dict.fromkeys(refs, native_id))
-        conflicts = sum(1 for resolved in attached.values() if resolved != native_id)
-        emit = logger.warning if conflicts else logger.debug
-        emit("🔗 Attached release identifier aliases", mbid=mbid, attached=len(refs), conflicts=conflicts)
+        conflicting = [ref for ref, resolved in attached.items() if resolved != native_id]
+        for ref in conflicting:
+            self._observer.alias_conflict(ref.entity_kind, ref.provider)
+            self._alias_conflicts.add(ref.entity_kind, ref.provider)
+        logger.debug("🔗 Attached release identifier aliases", mbid=mbid, attached=len(refs), conflicts=len(conflicting))
 
     async def process_release(self, conn: Any, record: dict[str, Any]) -> None:
         mbid = record.get("mbid", record.get("id", ""))

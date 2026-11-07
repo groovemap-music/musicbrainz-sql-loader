@@ -846,3 +846,17 @@ class TestTracingSwitches:
         finally:
             bt.shutdown_telemetry()
             bt.reset_metric_instruments()
+
+
+class TestAliasConflictCounter:
+    """Release identifier alias conflicts count, by entity and identifier kind."""
+
+    def test_each_conflict_adds_one_point_per_entity_and_identifier(self, collector: Collector) -> None:
+        bt._record_alias_conflict("release", "barcode")
+        bt._record_alias_conflict("release", "barcode")
+        bt._record_alias_conflict("release", "catalogue_number")
+
+        barcode = collector.point_for(bt.PIPELINE_ALIAS_CONFLICTS, source="musicbrainz", entity="release", identifier="barcode")
+        catalogue = collector.point_for(bt.PIPELINE_ALIAS_CONFLICTS, source="musicbrainz", entity="release", identifier="catalogue_number")
+        assert barcode.value == 2
+        assert catalogue.value == 1

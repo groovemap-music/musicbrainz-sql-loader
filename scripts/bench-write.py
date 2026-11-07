@@ -78,6 +78,9 @@ class _Observer:
     def record(self, *_args: Any) -> None:
         return None
 
+    def alias_conflict(self, *_args: Any) -> None:
+        return None
+
     def set_outcome(self, *_args: Any) -> None:
         return None
 

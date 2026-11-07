@@ -11,7 +11,11 @@ import structlog
 from common.identifiers import IdentifierValidationError
 from common.identity import AliasRef
 
-from brainztableinator._record_processing import MusicBrainzRecordProcessor, _legacy_identifiers_block
+from brainztableinator._record_processing import (
+    MusicBrainzRecordProcessor,
+    _AliasConflictSummary,
+    _legacy_identifiers_block,
+)
 
 
 ROOT = Path(__file__).parent.parent
@@ -20,6 +24,7 @@ ROOT = Path(__file__).parent.parent
 class _Observer:
     def __init__(self) -> None:
         self.records: list[tuple[str, int, str]] = []
+        self.conflicts: list[tuple[str, str]] = []
 
     @contextmanager
     def flush(self, _entity: str) -> Any:
@@ -27,6 +32,9 @@ class _Observer:
 
     def record(self, entity: str, size: int, _duration_s: float, outcome: str) -> None:
         self.records.append((entity, size, outcome))
+
+    def alias_conflict(self, entity: str, identifier: str) -> None:
+        self.conflicts.append((entity, identifier))
 
     def set_outcome(self, span: Any, outcome: str) -> None:
         span.set_attribute("outcome", outcome)
@@ -353,7 +361,8 @@ async def test_an_identifier_alias_another_catalog_claims_is_counted_rather_than
         attached={BARCODE_REF: incumbent_id, FIRST_CATALOG_NUMBER_REF: native_id, SECOND_CATALOG_NUMBER_REF: native_id},
     )
     writer = _writer()
-    processor = MusicBrainzRecordProcessor(writer, _Observer(), MagicMock())
+    observer = _Observer()
+    processor = MusicBrainzRecordProcessor(writer, observer, MagicMock())
 
     with structlog.testing.capture_logs() as entries:
         await processor.process_release(MagicMock(), _release_with_identifiers())
@@ -366,7 +375,51 @@ async def test_an_identifier_alias_another_catalog_claims_is_counted_rather_than
     # `process_release` also logs the media write, so the alias log is selected by its own key
     # rather than by position.
     conflict_logs = [entry for entry in entries if entry.get("conflicts")]
-    assert [(entry["log_level"], entry["attached"], entry["conflicts"]) for entry in conflict_logs] == [("warning", 3, 1)]
+    assert [(entry["log_level"], entry["attached"], entry["conflicts"]) for entry in conflict_logs] == [("debug", 3, 1)]
+    assert not [entry for entry in entries if entry["log_level"] in ("warning", "error")]
+    assert observer.conflicts == [("release", "barcode")]
+
+
+@pytest.mark.asyncio
+async def test_alias_conflicts_are_summarized_at_info_once_per_interval(monkeypatch: pytest.MonkeyPatch) -> None:
+    musicbrainz_ref = AliasRef("musicbrainz", "release", "release-mbid")
+    native_id, incumbent_id = uuid4(), uuid4()
+    _resolve, _attach = _identity(
+        monkeypatch,
+        resolved={musicbrainz_ref: native_id},
+        attached={BARCODE_REF: incumbent_id, FIRST_CATALOG_NUMBER_REF: native_id, SECOND_CATALOG_NUMBER_REF: native_id},
+    )
+    processor = MusicBrainzRecordProcessor(_writer(), _Observer(), MagicMock())
+    # A zero interval makes every conflict due, so the summary is observable per release.
+    processor._alias_conflicts = _AliasConflictSummary(interval_s=0.0)
+
+    with structlog.testing.capture_logs() as entries:
+        await processor.process_release(MagicMock(), _release_with_identifiers())
+
+    summaries = [entry for entry in entries if entry["event"].startswith("🔗 Release identifier alias conflicts")]
+    assert [(entry["log_level"], entry["conflicts"], entry["by_kind"]) for entry in summaries] == [("info", 1, {"release/barcode": 1})]
+    assert not [entry for entry in entries if entry["log_level"] in ("warning", "error")]
+
+
+@pytest.mark.asyncio
+async def test_alias_conflicts_inside_the_interval_stay_out_of_the_info_log(monkeypatch: pytest.MonkeyPatch) -> None:
+    musicbrainz_ref = AliasRef("musicbrainz", "release", "release-mbid")
+    native_id, incumbent_id = uuid4(), uuid4()
+    _resolve, _attach = _identity(
+        monkeypatch,
+        resolved={musicbrainz_ref: native_id},
+        attached={BARCODE_REF: incumbent_id, FIRST_CATALOG_NUMBER_REF: native_id, SECOND_CATALOG_NUMBER_REF: native_id},
+    )
+    observer = _Observer()
+    processor = MusicBrainzRecordProcessor(_writer(), observer, MagicMock())
+
+    with structlog.testing.capture_logs() as entries:
+        for _ in range(3):
+            await processor.process_release(MagicMock(), _release_with_identifiers())
+
+    # The default interval has not passed, so no summary yet; every conflict still reaches the observer.
+    assert not [entry for entry in entries if entry["event"].startswith("🔗 Release identifier alias conflicts")]
+    assert observer.conflicts == [("release", "barcode")] * 3
 
 
 @pytest.mark.asyncio
