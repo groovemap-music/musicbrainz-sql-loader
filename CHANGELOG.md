@@ -3,6 +3,30 @@
 All notable changes to this repository will be recorded here by Commitizen from
 Conventional Commits.
 
+## v0.6.0 (2026-11-06)
+
+### Release notes
+
+Needs the database-schema release that carries `purge_vetoed`: deploy the schema first. Relations and external links are no longer stored in `data`, and each record's writes are pipelined into one round trip.
+
+### Feat
+
+- **purge**: keep the veto durable and alert on consecutive vetoes
+- **bench**: add a repeatable write-path benchmark
+
+### Fix
+
+- **persistence**: target the hashed relationships key in ON CONFLICT
+- **delivery**: let a replayed signal recover the run and run the proof in CI
+- **delivery**: pace every requeue and bound a message that keeps failing
+- **bench**: compose the emptiness check with psycopg.sql identifiers
+- **musicbrainz**: quarantine SQLSTATE class 54 instead of requeueing forever
+
+### Perf
+
+- **musicbrainz**: stop storing relations and external_links in data
+- **musicbrainz**: pipeline each record's writes into one round trip
+
 ## v0.5.0 (2026-10-31)
 
 ### Feat
