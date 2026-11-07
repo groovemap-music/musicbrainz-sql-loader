@@ -47,6 +47,7 @@ def _writer() -> MagicMock:
         "insert_external_links",
         "upsert_media_families",
         "upsert_media",
+        "lock_release_media",
         "replace_release_media_edges",
     ):
         setattr(writer, operation, AsyncMock())
@@ -325,3 +326,29 @@ def test_the_graph_statements_live_in_the_persistence_module() -> None:
         assert f"INTO {relation}" in persistence or f"FROM {relation}" in persistence
         assert relation not in runtime
         assert f"INSERT INTO {relation}" not in record_processing
+
+
+@pytest.mark.asyncio
+async def test_the_edges_are_written_under_a_transaction_scoped_lock_on_the_range(mock_connection: Any, mock_cursor: Any) -> None:
+    # Two releases that name one Discogs release write one `(release_id, source)` range from two
+    # transactions; the lock is taken before the prune, and it dies with the transaction.
+    await PostgreSQLMusicBrainzWriter().replace_release_media_edges(mock_connection, "4242", "musicbrainz", [])
+
+    first_sql, first_params = mock_cursor.execute.await_args_list[0].args
+    assert "pg_advisory_xact_lock" in first_sql
+    assert first_params == ("graph.issued_on:musicbrainz:4242",)
+    assert mock_cursor.execute.await_args_list[1].args[0].startswith("DELETE FROM graph.issued_on")
+
+
+@pytest.mark.asyncio
+async def test_a_release_takes_the_range_lock_before_any_other_write() -> None:
+    writer = _writer()
+    order: list[str] = []
+    for name in ("lock_release_media", "upsert_release"):
+        getattr(writer, name).side_effect = lambda *_a, _n=name: order.append(_n)
+
+    await _processor(writer).process_release(MagicMock(), {"mbid": "m", "discogs_release_id": 7, "media": _block({"format": "CD"})})
+
+    assert order[0] == "lock_release_media"
+    writer.lock_release_media.assert_awaited_once()
+    assert writer.lock_release_media.await_args.args[1:] == ("7", "musicbrainz")
