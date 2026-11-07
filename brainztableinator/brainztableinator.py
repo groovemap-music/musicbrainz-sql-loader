@@ -100,6 +100,7 @@ PIPELINE_BATCH_SIZE = "groovemap.pipeline.batch.size"
 PIPELINE_BATCH_FLUSH_DURATION = "groovemap.pipeline.batch.flush.duration"
 PIPELINE_CONSUMERS_ACTIVE = "groovemap.pipeline.consumers.active"
 PIPELINE_PURGE_CONSECUTIVE_VETOES = "groovemap.pipeline.purge.consecutive_vetoes"
+PIPELINE_ALIAS_CONFLICTS = "groovemap.pipeline.alias.conflicts"
 
 # The shared delivery runner delegates observation to this service, so these instruments keep
 # their established names and attributes while terminal settlement stays centralized.
@@ -147,6 +148,10 @@ def _build_instruments() -> dict[str, Any]:
         PIPELINE_CONSUMERS_ACTIVE: meter.create_up_down_counter(
             PIPELINE_CONSUMERS_ACTIVE,
             description="Active MusicBrainz pipeline consumers.",
+        ),
+        PIPELINE_ALIAS_CONFLICTS: meter.create_counter(
+            PIPELINE_ALIAS_CONFLICTS,
+            description="Release identifier aliases another catalog already claims, by entity and identifier kind.",
         ),
         PIPELINE_PURGE_CONSECUTIVE_VETOES: meter.create_gauge(
             PIPELINE_PURGE_CONSECUTIVE_VETOES,
@@ -221,6 +226,14 @@ def _record_purge_consecutive_vetoes(count: int) -> None:
         _instrument(PIPELINE_PURGE_CONSECUTIVE_VETOES).set(count, {"source": PIPELINE_SOURCE})
     except Exception:
         logger.debug("Could not record the consecutive purge veto metric", exc_info=True)
+
+
+def _record_alias_conflict(entity: str, identifier: str) -> None:
+    """Count one release identifier alias that another catalog already claims."""
+    try:
+        _instrument(PIPELINE_ALIAS_CONFLICTS).add(1, {"source": PIPELINE_SOURCE, "entity": entity, "identifier": identifier})
+    except Exception:
+        logger.debug("Could not record the alias conflict metric", exc_info=True)
 
 
 def _record_consumer_delta(delta: int) -> None:
@@ -335,6 +348,9 @@ class _RuntimeBatchObserver:
 
     def record(self, entity: str, size: int, duration_s: float, outcome: str) -> None:
         _record_batch_flush(entity, size, duration_s, outcome)
+
+    def alias_conflict(self, entity: str, identifier: str) -> None:
+        _record_alias_conflict(entity, identifier)
 
     def set_outcome(self, span: Any, outcome: str) -> None:
         _set_span_outcome(span, outcome)

@@ -81,6 +81,10 @@ class _NullObserver:
         """Discard the batch measurement."""
         del entity, size, duration_s, outcome
 
+    def alias_conflict(self, entity: str, identifier: str) -> None:
+        """Discard the alias conflict count."""
+        del entity, identifier
+
     def set_outcome(self, span: Any, outcome: str) -> None:
         """Discard the span outcome."""
         del span, outcome
