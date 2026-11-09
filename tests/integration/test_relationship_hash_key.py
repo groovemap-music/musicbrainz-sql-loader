@@ -129,7 +129,8 @@ async def test_a_rerun_refreshes_updated_at_and_changes_only_ended(pool: AsyncPo
 async def test_the_loader_no_longer_depends_on_the_old_eight_column_constraint(pool: AsyncPostgreSQLPool) -> None:
     async with pool.connection() as conn:
         await conn.set_autocommit(True)
-        await conn.execute("ALTER TABLE musicbrainz.relationships DROP CONSTRAINT relationships_natural_key")
+        # A schema from database-schema main onward has already retired it.
+        await conn.execute("ALTER TABLE musicbrainz.relationships DROP CONSTRAINT IF EXISTS relationships_natural_key")
     await _write(pool, BATCH)
     first = await _rows(pool)
 
