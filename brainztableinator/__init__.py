@@ -3,4 +3,4 @@
 The package name remains ``brainztableinator`` for Python import compatibility.
 """
 
-__version__ = "0.6.1"
+__version__ = "0.7.0"
