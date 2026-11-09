@@ -11,6 +11,7 @@ import structlog
 from common.identifiers import IdentifierValidationError
 from common.identity import AliasRef
 
+from brainztableinator import _persistence
 from brainztableinator._record_processing import (
     MusicBrainzRecordProcessor,
     _AliasConflictSummary,
@@ -92,11 +93,19 @@ async def test_record_processor_maps_an_artist_before_delegating_writes() -> Non
 
 def test_runtime_module_contains_no_entity_sql() -> None:
     runtime = (ROOT / "brainztableinator/brainztableinator.py").read_text(encoding="utf-8")
-    persistence = (ROOT / "brainztableinator/_persistence.py").read_text(encoding="utf-8")
+    statements = {
+        "artists": _persistence.ARTIST_WRITE,
+        "labels": _persistence.LABEL_WRITE,
+        "releases": _persistence.RELEASE_WRITE,
+        "release_groups": _persistence.RELEASE_GROUP_WRITE,
+        "relationships": _persistence.RELATIONSHIP_SEEN_INSERT,
+        "external_links": _persistence.EXTERNAL_LINK_SEEN_INSERT,
+    }
 
     assert "INSERT INTO musicbrainz" not in runtime
-    for table in ("artists", "labels", "releases", "release_groups", "relationships", "external_links"):
-        assert f"INSERT INTO musicbrainz.{table}" in persistence
+    assert "UPDATE musicbrainz" not in runtime
+    for table, statement in statements.items():
+        assert f"INSERT INTO musicbrainz.{table}" in statement
 
 
 def _identity(

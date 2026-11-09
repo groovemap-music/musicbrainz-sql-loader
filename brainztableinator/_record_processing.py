@@ -149,10 +149,19 @@ def _source_ref(record: dict[str, Any]) -> str:
 # catalog API and the graph enricher (which reads the message, not this column) were checked.
 _CHILD_ROW_KEYS = frozenset({"relations", "external_links"})
 
+# `dump_version` is the envelope's, not the entity's: it names the dump the message came from and
+# changes every month for a record whose content did not, which is why the producer keeps it out of
+# the record's `sha256`. Stored in `data`, it made every reload look like a change to every entity,
+# so the upserts' no-op check could never skip one. It still reaches the link-change event as its
+# `source_ref` (see `_source_ref`), and no reader takes it from `data`.
+_ENVELOPE_KEYS = frozenset({"dump_version"})
+
+_UNSTORED_KEYS = _CHILD_ROW_KEYS | _ENVELOPE_KEYS
+
 
 def _stored_data(record: dict[str, Any]) -> dict[str, Any]:
-    """Return the record as the entity's `data` document, without the keys that have their own tables."""
-    return {key: value for key, value in record.items() if key not in _CHILD_ROW_KEYS}
+    """Return the record as the entity's `data` document, without child rows or per-dump envelope fields."""
+    return {key: value for key, value in record.items() if key not in _UNSTORED_KEYS}
 
 
 def _life_span(record: dict[str, Any]) -> dict[str, Any]:

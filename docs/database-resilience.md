@@ -91,6 +91,13 @@ dump. The veto is right to hold, because it protects live rows: read the `.dlq`,
 replay, or clear it. One veto followed by a clean purge does not reach the threshold. Until a Grafana
 rule covers this loader, this error line is the alert, and nothing pages.
 
+In `RELOAD_MODE=seen`, a seen list that is not intact for the extraction is a veto too. PostgreSQL
+crash recovery empties the unlogged lists together with their registry, and a list restarted after the
+extraction began misses its first keys, so neither can say what the extraction saw. The purge is
+skipped and the list's name (`loader_seen.musicbrainz_relationships` or
+`loader_seen.musicbrainz_external_links`) is added to `purge_vetoed`, so the consecutive-veto alert
+counts it. The lists are restarted, and the next extraction purges normally. Nothing needs replaying.
+
 This loader needs the `purge_vetoed` column. Ship the `database-schema` release carrying it first. In
 the wrong order nothing is lost: the delete-reconciliation stays off and loading continues.
 

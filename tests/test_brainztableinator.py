@@ -131,7 +131,7 @@ class TestProcessArtist:
         call_args = mock_cursor.execute.call_args_list[0]
         sql = call_args[0][0]
         assert "INSERT INTO musicbrainz.artists" in sql
-        assert "ON CONFLICT (mbid) DO UPDATE" in sql
+        assert "ON CONFLICT (mbid) DO NOTHING" in sql
 
     @pytest.mark.asyncio
     async def test_process_artist_with_relationships(self):
@@ -194,7 +194,7 @@ class TestProcessLabel:
         call_args = mock_cursor.execute.call_args_list[0]
         sql = call_args[0][0]
         assert "INSERT INTO musicbrainz.labels" in sql
-        assert "ON CONFLICT (mbid) DO UPDATE" in sql
+        assert "ON CONFLICT (mbid) DO NOTHING" in sql
 
 
 class TestProcessRelease:
@@ -217,11 +217,11 @@ class TestProcessRelease:
         call_args = mock_cursor.execute.call_args_list[0]
         sql = call_args[0][0]
         assert "INSERT INTO musicbrainz.releases" in sql
-        assert "ON CONFLICT (mbid) DO UPDATE" in sql
+        assert "ON CONFLICT (mbid) DO NOTHING" in sql
 
     @pytest.mark.asyncio
     async def test_process_release_writes_media_column_and_sets_it_on_conflict(self):
-        """The `media` column and its ON CONFLICT update are wired into the upsert."""
+        """The `media` column is written, compared, and rewritten when it changed."""
         mock_conn, mock_cursor = _make_mock_conn()
         record = {
             "mbid": "release-mbid-media",
@@ -244,7 +244,8 @@ class TestProcessRelease:
 
         sql = mock_cursor.execute.call_args_list[0][0][0]
         assert "media" in sql
-        assert "media = EXCLUDED.media" in sql
+        assert "media = src.media" in sql
+        assert "t.media" in sql.split("IS DISTINCT FROM")[0]
 
     @pytest.mark.asyncio
     async def test_process_release_with_canonical_media_writes_it_verbatim(self):
@@ -391,7 +392,7 @@ class TestProcessReleaseGroup:
         call_args = mock_cursor.execute.call_args_list[0]
         sql = call_args[0][0]
         assert "INSERT INTO musicbrainz.release_groups" in sql
-        assert "ON CONFLICT (mbid) DO UPDATE" in sql
+        assert "ON CONFLICT (mbid) DO NOTHING" in sql
 
     @pytest.mark.asyncio
     async def test_process_release_group_with_relationships_and_links(self):

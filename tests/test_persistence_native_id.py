@@ -59,7 +59,7 @@ async def test_every_upsert_inserts_and_refreshes_the_native_id(
 
     assert [column.strip() for column in columns.split(",")][-1] == "gm_item_id"
     assert len(placeholders.split(",")) == len(columns.split(","))
-    assert "gm_item_id = EXCLUDED.gm_item_id" in sql
+    assert "gm_item_id = src.gm_item_id" in sql
     assert len(insert_params) == len(columns.split(","))
     assert params[native_id_position] == native_id
 
