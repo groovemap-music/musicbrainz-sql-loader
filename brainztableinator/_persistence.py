@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from psycopg.errors import DataError
 from psycopg.types.json import Jsonb
 
 from brainztableinator._seen_lists import EXTERNAL_LINK_SEEN_APPEND, RELATIONSHIP_SEEN_APPEND, ReloadMode
@@ -110,6 +111,15 @@ EXTERNAL_LINK_SEEN_INSERT = _EXTERNAL_LINK_INSERT + "DO NOTHING"
 # round trip this design avoids. Two messages for one MBID racing in separate transactions can
 # therefore record the earlier one's stored id as the later one's `before`. Each message is one
 # transaction, so the one `event_at` per transaction never collides within the idempotence key.
+
+
+class DuplicateMediumError(DataError):
+    """One record named the same medium twice for one release: a verdict on the record.
+
+    A `DataError`, so the delivery classifier dead-letters it at once, exactly as the
+    `UniqueViolation` the old insert raised was dead-lettered, instead of requeueing a
+    record that can never succeed.
+    """
 
 
 @dataclass(frozen=True)
@@ -435,19 +445,47 @@ class PostgreSQLMusicBrainzWriter:
         the `MATCH (r)-[stale:ISSUED_ON]->(m:Medium) WHERE stale.source = $source ... DELETE
         stale` prune brainzgraphinator runs before it writes the edges.
 
-        The insert is a plain `INSERT`, with no conflict clause, because the prune has just
-        emptied the range it writes into and `media_edge_rows` yields one row per medium. A
-        duplicate here would be a derivation bug, and it should fail rather than quietly
-        discard the quantity the second row carried.
+        **Only the difference is written.** The stored `(medium_id, qty)` pairs for the range are
+        read (one primary-key range search, after the lock) and compared with the incoming set:
+        an edge that is already stored with the same quantity is not touched, a stored edge the
+        release no longer names is deleted, a new edge is inserted, and an edge whose quantity
+        changed is updated. A reload of an unchanged release therefore writes no edge row, so it
+        produces no WAL, dead tuples or index churn, and the range ends with exactly the incoming
+        edge set either way. The advisory lock makes the read-compare-write safe against another
+        writer of the same range.
+
+        The insert is a plain `INSERT`, with no conflict clause: a medium in `rows` that is not
+        stored is new, and `media_edge_rows` yields one row per medium. A duplicate medium in
+        `rows` is a derivation bug, and it fails with `DuplicateMediumError` rather than quietly discarding
+        the quantity the second row carried.
         """
+        wanted: dict[str, int] = {}
+        for _release_id, medium_id, _source, qty in rows:
+            if medium_id in wanted:
+                raise DuplicateMediumError(f"duplicate medium {medium_id!r} in the edges of release {release_id!r}")
+            wanted[medium_id] = qty
         await self.lock_release_media(conn, release_id, source)
         async with conn.cursor() as cursor:
             await cursor.execute(
-                "DELETE FROM graph.issued_on WHERE release_id = %s AND source = %s",
+                "SELECT medium_id, qty FROM graph.issued_on WHERE release_id = %s AND source = %s",
                 (release_id, source),
             )
-            if rows:
+            stored = dict(await cursor.fetchall())
+            removed = [(release_id, source, medium_id) for medium_id in stored if medium_id not in wanted]
+            changed = [(qty, release_id, medium_id, source) for medium_id, qty in wanted.items() if medium_id in stored and stored[medium_id] != qty]
+            added = [row for row in rows if row[1] not in stored]
+            if removed:
+                await cursor.executemany(
+                    "DELETE FROM graph.issued_on WHERE release_id = %s AND source = %s AND medium_id = %s",
+                    removed,
+                )
+            if changed:
+                await cursor.executemany(
+                    "UPDATE graph.issued_on SET qty = %s WHERE release_id = %s AND medium_id = %s AND source = %s",
+                    changed,
+                )
+            if added:
                 await cursor.executemany(
                     "INSERT INTO graph.issued_on (release_id, medium_id, source, qty) VALUES (%s, %s, %s, %s)",
-                    rows,
+                    added,
                 )
