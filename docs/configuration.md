@@ -32,10 +32,50 @@ Credentials have no defaults.
 | `STARTUP_IDLE_TIMEOUT` | `30` | Seconds without messages before idle mode |
 | `IDLE_LOG_INTERVAL` | `300` | Seconds between idle status logs |
 | `STARTUP_DELAY` | `5` | Seconds to allow dependencies to start |
+| `RELOAD_MODE` | `shadow` | How a reload proves a child row is still upstream: `touch`, `shadow` or `seen` (see below); any other value fails startup |
 
 Pool sizes are clamped so `1 <= min <= max`. Each RabbitMQ consumer's prefetch is tied to
 the maximum pool size; one shared admission budget caps actual PostgreSQL writers across
 all entity consumers and reconciliation work.
+
+## Reload mode
+
+A monthly reload re-sends every record, and the stale-row purge deletes the
+`musicbrainz.relationships` and `musicbrainz.external_links` rows the reload did not reach.
+`RELOAD_MODE` chooses how the loader records that a reload reached a row. The shared design is
+database-schema's [Reload seen lists](https://github.com/groovemap-music/database-schema/blob/main/docs/architecture.md#reload-seen-lists).
+
+| Mode | Child-row writes | Purge |
+| --- | --- | --- |
+| `touch` | Every conflict rewrites the row to refresh `updated_at`, changed or not | Deletes rows whose `updated_at` predates the extraction |
+| `shadow` | As `touch`, and appends each row's key to its `loader_seen` list | As `touch`; logs `loader_seen.<list>_shadow` for both lists first, then restarts both lists |
+| `seen` | Writes only a new row or a changed `ended`; appends each row's key | Deletes `loader_seen.<list>_stale` by id, under the delete-fraction cap; restarts both lists |
+
+At startup the loader probes for the `loader_seen` schema, its lists and functions, and
+`musicbrainz.external_link_key`. If any is missing it runs in `touch` mode whatever `RELOAD_MODE`
+says, and logs a warning, so this release can ship before the database-schema release that adds
+them. The entity upserts skip an unchanged row in every mode: the entity tables are not purged.
+
+Rollout and rollback:
+
+1. Deploy the database-schema release carrying `loader_seen`. The loader then runs `shadow`.
+2. Let one full MusicBrainz reload settle. Read the two `Seen-list shadow comparison` log lines
+   from its purge. The switch needs `intact`, `refreshed_not_seen = 0` and
+   `touch_purge = seen_purge` on both, with every `seen_not_refreshed` row explained.
+3. With operator approval, set `RELOAD_MODE=seen`. Never set it without a matching shadow reload.
+4. To roll back, set `RELOAD_MODE=touch`. The first purge after switching back must follow a
+   reload that ran with the touch: a reload without it leaves every unchanged row looking stale,
+   and the delete-fraction cap is then all that stands between it and the table.
+
+In `seen` mode, a list that is not intact for the extraction (emptied by a PostgreSQL crash, or
+started after the extraction began) skips the purge, records the list in `purge_vetoed` like a
+dead letter, and restarts it. See [Purge vetoes](database-resilience.md#purge-vetoes).
+
+To run the seen-list integration tests before the persistence pin carries `loader_seen`, install a
+database-schema checkout that does into the environment and run without syncing:
+`uv pip install --no-deps <database-schema checkout>`, then
+`TEST_DATABASE_URL=... uv run --no-sync pytest tests/integration/test_reload_seen_lists.py`, then
+`uv sync --frozen` to restore the pin. Against the pinned schema those tests skip.
 
 The promoted [catalog-event contract](../contracts/catalog-events/v1/contract.json) is the
 authority for entity vocabulary, exchange names, queue templates, and producer provenance.

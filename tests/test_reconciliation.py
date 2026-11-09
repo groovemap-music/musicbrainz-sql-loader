@@ -764,6 +764,7 @@ class _RecordingPurge:
         self.completions: list[tuple[str, Any]] = []
         self.dead_lettered_types: list[str] = []
         self.boundary = BOUNDARY
+        self.lost_lists: tuple[str, ...] = ()
         self._error = error
         self._latched = latched
 

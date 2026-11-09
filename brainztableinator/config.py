@@ -11,6 +11,8 @@ from common.config import (
     resolve_postgres_pool_sizes,
 )
 
+from brainztableinator._seen_lists import DEFAULT_RELOAD_MODE, ReloadMode, parse_reload_mode
+
 
 DEFAULT_HEALTH_PORT = 8002
 
@@ -41,6 +43,10 @@ class MusicBrainzSQLLoaderConfig:
     postgres_pool_min_size: int = 2
     postgres_pool_max_size: int = 12
     health_port: int = DEFAULT_HEALTH_PORT
+    # How a reload proves a child row is still upstream: `touch`, `shadow` (the default) or `seen`.
+    # The startup probe narrows it to `touch` while the schema has no `loader_seen` lists. See
+    # `_seen_lists` and docs/configuration.md.
+    reload_mode: ReloadMode = DEFAULT_RELOAD_MODE
 
     @classmethod
     def from_env(cls) -> MusicBrainzSQLLoaderConfig:
@@ -65,6 +71,7 @@ class MusicBrainzSQLLoaderConfig:
         if missing_vars:
             raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
         health_port = _resolve_health_port()
+        reload_mode = parse_reload_mode(getenv("RELOAD_MODE"))
         pool_min, pool_max = resolve_postgres_pool_sizes(default_min=2, default_max=12)
         return cls(
             amqp_connection=_build_amqp_url(),
@@ -75,6 +82,7 @@ class MusicBrainzSQLLoaderConfig:
             postgres_pool_min_size=pool_min,
             postgres_pool_max_size=pool_max,
             health_port=health_port,
+            reload_mode=reload_mode,
         )
 
 

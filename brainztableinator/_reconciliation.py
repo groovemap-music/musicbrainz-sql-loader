@@ -27,16 +27,18 @@ forces.
   the *same* ``started_at``, and the dead-letter veto is global rather than
   per-type for the same reason.
 
-* **The natural key does the endpoint normalization, not the purge.**
+* **The relationship key does the endpoint normalization, not the purge.**
   ``_record_processing.insert_relationships`` swaps the endpoints when a
   relationship arrives with ``direction: backward``, so both endpoints' messages
-  upsert the *one* canonical row named by the ``relationships_natural_key``
-  contract. That is what lets a single ``updated_at`` per row be sufficient: a
-  relationship this run only ever saw from its backward side still refreshes the
-  canonical row, and the purge, which keys on nothing but ``updated_at``, leaves
-  it alone. It follows that the upserts must touch ``updated_at`` on *every*
-  conflict, including the no-op ones -- see ``_persistence.py``. Without that a
-  purge keyed on ``updated_at`` would delete live rows.
+  write the *one* canonical row the ``relationships_key`` index names. That is what
+  lets one sighting per row be sufficient: a relationship this run only ever saw
+  from its backward side still marks the canonical row. In touch and shadow modes
+  the mark is ``updated_at``, so the upserts refresh it on *every* conflict,
+  including the no-op ones, and the purge deletes what lacks it. In seen mode the
+  mark is the row's key in its ``loader_seen`` list, so the upserts write only what
+  changed, and the purge deletes from ``loader_seen.<list>_stale``: rows older than
+  the extraction *and* absent from its list. See ``_seen_lists`` and
+  ``_persistence.py``.
 
 Why the boundary comes from the message
 ---------------------------------------
@@ -138,6 +140,7 @@ from typing import TYPE_CHECKING, Any
 from common import DatabaseUnavailableError
 from psycopg import sql
 
+from brainztableinator._seen_lists import SEEN_LIST_DATA_TYPES, SEEN_LIST_LOADER, ReloadMode, seen_list_relation
 from brainztableinator.queue_names import MUSICBRAINZ_DATA_TYPES
 
 
@@ -183,6 +186,44 @@ _COLUMN_TYPE = """
 _COUNT_ALL = sql.SQL("SELECT count(*) FROM {table}")
 _COUNT_STALE = sql.SQL("SELECT count(*) FROM {table} WHERE updated_at < %s")
 _DELETE_STALE = sql.SQL("DELETE FROM {table} WHERE updated_at < %s")
+
+# The seen-list statements, each through the function database-schema declares for it. The loader
+# never TRUNCATEs or DELETEs from a list itself: `loader_seen.start` is the one way to empty one,
+# because it stamps the registry in the same transaction, and a list emptied behind the registry's
+# back would read as intact.
+_SEEN_INTACT = "SELECT loader_seen.intact(%s, %s, %s)"
+_SEEN_STATUS = "SELECT opened_at, intact, seen_keys FROM loader_seen.status(%s, %s, %s)"
+_SEEN_START = "SELECT loader_seen.start(%s, %s)"
+_SEEN_SHADOW = sql.SQL(
+    "SELECT intact, total_rows, touch_purge, seen_purge, refreshed_not_seen, seen_not_refreshed, "
+    "refreshed_not_seen_sample, seen_not_refreshed_sample FROM {function}(%s)"
+)
+# The purge set is computed once, into a temporary table dropped at commit, and both the cap and the
+# DELETE read it, so the rows counted are the rows deleted. The function refuses a list that is not
+# intact (SQLSTATE 55000), so even a caller that skipped `loader_seen.intact` cannot purge from an
+# emptied list.
+_SEEN_STALE_INTO = sql.SQL("CREATE TEMP TABLE {stale} ON COMMIT DROP AS SELECT id FROM {function}(%s)")
+_SEEN_STALE_COUNT = sql.SQL("SELECT count(*) FROM {stale}")
+_SEEN_DELETE = sql.SQL("DELETE FROM {table} WHERE id IN (SELECT id FROM {stale})")
+
+_SHADOW_COLUMNS = (
+    "intact",
+    "total_rows",
+    "touch_purge",
+    "seen_purge",
+    "refreshed_not_seen",
+    "seen_not_refreshed",
+    "refreshed_not_seen_sample",
+    "seen_not_refreshed_sample",
+)
+
+
+def _seen_data_type(table: str) -> str:
+    return SEEN_LIST_DATA_TYPES[table]
+
+
+def _seen_function(table: str, suffix: str) -> sql.Identifier:
+    return sql.Identifier("loader_seen", f"{SEEN_LIST_LOADER}_{_seen_data_type(table)}_{suffix}")
 
 
 def _identifier(schema: str, table: str) -> sql.Identifier:
@@ -274,8 +315,11 @@ class StaleChildRowPurge:
         tables: Sequence[tuple[str, str]] = RECONCILED_TABLES,
         expected_data_types: Sequence[str] = tuple(MUSICBRAINZ_DATA_TYPES),
         admission: WriteAdmission | None = None,
+        mode: ReloadMode = ReloadMode.TOUCH,
     ) -> None:
         self._connection_pool = connection_pool
+        self._mode = mode
+        self._lost_lists: tuple[str, ...] = ()
         self._admission = admission
         self._logger = logger
         self._max_delete_fraction = max_delete_fraction
@@ -285,6 +329,21 @@ class StaleChildRowPurge:
         self._signals: dict[str, int | None] = {}
         self._dead_lettered: set[str] = set()
         self._settled_boundary: datetime | None = None
+
+    @property
+    def mode(self) -> ReloadMode:
+        """How this purge decides what is stale: touch (``updated_at``), shadow, or seen."""
+        return self._mode
+
+    @property
+    def lost_lists(self) -> tuple[str, ...]:
+        """The seen lists the last seen-mode decision found not intact, so it purged nothing.
+
+        The caller records them in ``purge_vetoed``, like a dead-letter veto, so the
+        consecutive-veto alert counts an extraction a crash or a late list start kept from
+        purging. Kept until the next decision, so a retried recording sees them again.
+        """
+        return self._lost_lists
 
     @property
     def boundary(self) -> datetime | None:
@@ -431,30 +490,61 @@ class StaleChildRowPurge:
         The whole reconciliation runs in one transaction, so either every table's
         deletion commits or none does, and re-running it after a successful pass
         deletes nothing because no row older than the boundary survives.
+
+        In shadow and seen modes the same transaction restarts both seen lists once the
+        extraction is decided, so the next extraction finds them intact. Shadow mode purges
+        exactly as touch mode does and only logs what the seen purge would have deleted;
+        seen mode purges from ``loader_seen.<list>_stale`` and purges nothing at all when
+        either list is not intact.
         """
         veto = self._veto_reason()
         if veto is not None:
             self._logger.warning(f"⚠️ Skipping MusicBrainz delete-reconciliation — {veto}", reason=veto)
             # A latched extraction that is vetoed is finished with, so it settles here
             # and no later signal at that boundary can purge it. An unlatched one is
-            # still being collected and must not settle. See `_settle`.
+            # still being collected and must not settle. See `_settle`. A vetoed
+            # extraction still restarts its lists, in a transaction of their own, so the
+            # next one has intact lists; a duplicate signal for a settled one must not,
+            # because the next extraction may already be appending.
             if self.is_latched():
+                if not self.is_settled:
+                    self._lost_lists = ()
+                    if self._mode.appends:
+                        await self._in_transaction(self._start_lists)
                 self._settle(self._boundary)
             return {}
 
         boundary = self._boundary
+        self._lost_lists = ()
         deleted: dict[str, int] = {}
-        if self._admission is None:
-            raise DatabaseUnavailableError("write admission is not initialized")
-        try:
-            async with AsyncExitStack() as stack:
-                await stack.enter_async_context(self._admission.slot())
-                conn = await stack.enter_async_context(self._connection_pool.connection())
-                await conn.set_autocommit(False)
-                await stack.enter_async_context(conn.transaction())
-                cursor = await stack.enter_async_context(conn.cursor())
-                for schema, table in self._tables:
+
+        async def reconcile(cursor: Any) -> None:
+            if self._mode is ReloadMode.SEEN:
+                lost = await self._lists_not_intact(cursor, boundary)
+                if lost:
+                    self._lost_lists = lost
+                    self._logger.error(
+                        f"🛡️ Skipping MusicBrainz delete-reconciliation — seen lists not intact for this extraction: {', '.join(lost)} "
+                        "(emptied by a crash, or started after the extraction began); vetoed like a dead letter",
+                        lost=list(lost),
+                        boundary=boundary.isoformat() if boundary else None,
+                    )
+                    await self._start_lists(cursor)
+                    return
+            for schema, table in self._tables:
+                if self._mode is ReloadMode.SHADOW:
+                    await self._log_shadow(cursor, table, boundary)
+                if self._mode is ReloadMode.SEEN:
+                    deleted[_qualified(schema, table)] = await self._purge_table_seen(cursor, schema, table, boundary)
+                else:
                     deleted[_qualified(schema, table)] = await self._purge_table(cursor, schema, table, boundary)
+            if self._mode is ReloadMode.SHADOW:
+                await self._isolated(cursor, "restart the seen lists", self._start_lists)
+            elif self._mode is ReloadMode.SEEN:
+                await self._start_lists(cursor)
+
+        try:
+            await self._in_transaction(reconcile)
         except Exception as exc:
             self._logger.error(
                 "❌ MusicBrainz delete-reconciliation failed",
@@ -466,10 +556,159 @@ class StaleChildRowPurge:
         self._logger.info(
             "🧹 MusicBrainz delete-reconciliation complete",
             boundary=boundary.isoformat() if boundary else None,
+            reload_mode=self._mode.value,
             deleted=deleted,
             total_deleted=sum(deleted.values()),
         )
         return deleted
+
+    async def _in_transaction(self, work: Any) -> None:
+        """Run ``work(cursor)`` in one transaction under a write-admission slot."""
+        if self._admission is None:
+            raise DatabaseUnavailableError("write admission is not initialized")
+        async with AsyncExitStack() as stack:
+            await stack.enter_async_context(self._admission.slot())
+            conn = await stack.enter_async_context(self._connection_pool.connection())
+            await conn.set_autocommit(False)
+            await stack.enter_async_context(conn.transaction())
+            cursor = await stack.enter_async_context(conn.cursor())
+            await work(cursor)
+
+    async def _isolated(self, cursor: Any, action: str, work: Any) -> None:
+        """Run shadow-only ``work(cursor)`` under a savepoint, logging rather than raising a failure.
+
+        Shadow mode's comparison and list restart are evidence for the switch, not part of the
+        purge it keeps running, so neither may roll back the touch purge or requeue its signal.
+        """
+        try:
+            async with cursor.connection.transaction():
+                await work(cursor)
+        except Exception as error:
+            self._logger.error(f"❌ Shadow mode could not {action}; the touch purge is unaffected", error=str(error))
+
+    async def _start_lists(self, cursor: Any) -> None:
+        """Empty both seen lists and stamp when they started, in the caller's transaction."""
+        for _schema, table in self._tables:
+            await cursor.execute(_SEEN_START, (SEEN_LIST_LOADER, _seen_data_type(table)))
+        self._logger.info(
+            "🔄 Restarted the reload seen lists for the next extraction",
+            lists=[seen_list_relation(_seen_data_type(table)) for _schema, table in self._tables],
+        )
+
+    async def _lists_not_intact(self, cursor: Any, boundary: Any) -> tuple[str, ...]:
+        """Return the seen lists that do not hold every key appended since ``boundary``."""
+        lost: list[str] = []
+        for _schema, table in self._tables:
+            await cursor.execute(_SEEN_INTACT, (SEEN_LIST_LOADER, _seen_data_type(table), boundary))
+            row = await cursor.fetchone()
+            if not (row and row[0]):
+                lost.append(seen_list_relation(_seen_data_type(table)))
+        return tuple(lost)
+
+    async def _list_status(self, cursor: Any, table: str, boundary: Any) -> dict[str, Any]:
+        """Return when one list started, whether it is intact, and its distinct keys since ``boundary``."""
+        await cursor.execute(_SEEN_STATUS, (SEEN_LIST_LOADER, _seen_data_type(table), boundary))
+        row = await cursor.fetchone()
+        if not row:
+            return {}
+        opened_at, intact, seen_keys = row
+        return {"opened_at": opened_at.isoformat() if opened_at else None, "intact": intact, "seen_keys": seen_keys}
+
+    async def _log_shadow(self, cursor: Any, table: str, boundary: Any) -> None:
+        """Log the shadow comparison of one table's two purge sets, before the touch purge runs.
+
+        The switch to seen mode needs ``intact``, ``refreshed_not_seen = 0`` and
+        ``touch_purge = seen_purge`` (every ``seen_not_refreshed`` row explained) on both
+        lists, recorded here on a real reload, and the operator's approval.
+        """
+
+        async def compare(cursor: Any) -> None:
+            await cursor.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+                _SEEN_SHADOW.format(function=_seen_function(table, "shadow")),
+                (boundary,),
+            )
+            row = await cursor.fetchone()
+            shadow = dict(zip(_SHADOW_COLUMNS, row, strict=True)) if row else {}
+            for sample in ("refreshed_not_seen_sample", "seen_not_refreshed_sample"):
+                if shadow.get(sample) is not None:
+                    shadow[sample] = list(shadow[sample])
+            status = await self._list_status(cursor, table, boundary)
+            matches = bool(shadow.get("intact")) and shadow.get("refreshed_not_seen") == 0 and shadow.get("touch_purge") == shadow.get("seen_purge")
+            log = self._logger.info if matches else self._logger.warning
+            log(
+                f"🔍 Seen-list shadow comparison for musicbrainz.{table}: "
+                f"{'the seen purge matches the touch purge' if matches else 'the seen purge differs from the touch purge'}",
+                table=f"musicbrainz.{table}",
+                seen_list=seen_list_relation(_seen_data_type(table)),
+                boundary=boundary.isoformat() if boundary else None,
+                matches=matches,
+                status=status,
+                **shadow,
+            )
+
+        await self._isolated(cursor, f"compare the musicbrainz.{table} purge sets", compare)
+
+    async def _purge_table_seen(self, cursor: Any, schema: str, table: str, boundary: Any) -> int:
+        """Delete one table's rows the extraction did not see, refusing at the delete-fraction cap.
+
+        MusicBrainz has no producer count per child table, so the cap is the count guard: a
+        list that lost most of its keys without a crash makes most rows look stale, and the cap
+        refuses that shrink.
+        """
+        qualified = _qualified(schema, table)
+        identifier = _identifier(schema, table)
+        stale = sql.Identifier(f"stale_{table}")
+
+        await cursor.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+            _COUNT_ALL.format(table=identifier)
+        )
+        total_row = await cursor.fetchone()
+        total_count = total_row[0] if total_row else 0
+        status = await self._list_status(cursor, table, boundary)
+        if total_count == 0:
+            self._logger.info(f"✅ No {qualified} rows to reconcile (table empty)", table=qualified, status=status)
+            return 0
+
+        await cursor.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+            _SEEN_STALE_INTO.format(stale=stale, function=_seen_function(table, "stale")),
+            (boundary,),
+        )
+        await cursor.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+            _SEEN_STALE_COUNT.format(stale=stale)
+        )
+        stale_row = await cursor.fetchone()
+        stale_count = stale_row[0] if stale_row else 0
+        if stale_count == 0:
+            self._logger.info(f"✅ No stale {qualified} rows to reconcile", table=qualified, status=status)
+            return 0
+
+        delete_fraction = stale_count / total_count
+        if delete_fraction >= self._max_delete_fraction:
+            self._logger.error(
+                f"🛡️ Refusing to reconcile {stale_count}/{total_count} {qualified} rows "
+                f"({delete_fraction:.1%} of table) — exceeds safety cap, likely a resumed "
+                f"or partial extraction, or a seen list that lost keys, rather than an upstream deletion",
+                table=qualified,
+                stale=stale_count,
+                total=total_count,
+                fraction=round(delete_fraction, 4),
+                cap=self._max_delete_fraction,
+                status=status,
+            )
+            return 0
+
+        await cursor.execute(  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+            _SEEN_DELETE.format(table=identifier, stale=stale)
+        )
+        deleted_count = int(cursor.rowcount)
+        self._logger.info(
+            f"🧹 Reconciled {deleted_count} stale {qualified} rows (older than the extraction and not in its seen list)",
+            table=qualified,
+            deleted=deleted_count,
+            total=total_count,
+            status=status,
+        )
+        return deleted_count
 
     async def _purge_table(self, cursor: Any, schema: str, table: str, boundary: Any) -> int:
         """Delete one table's stale rows, refusing when the delete fraction hits the cap."""

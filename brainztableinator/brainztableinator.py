@@ -53,6 +53,7 @@ from brainztableinator._purge_veto import (
 )
 from brainztableinator._reconciliation import StaleChildRowPurge, reconciliation_columns_present
 from brainztableinator._record_processing import MusicBrainzRecordProcessor
+from brainztableinator._seen_lists import resolve_reload_mode
 from brainztableinator.config import MusicBrainzSQLLoaderConfig
 from brainztableinator.queue_names import (
     AMQP_EXCHANGE_TYPE,
@@ -1105,6 +1106,28 @@ async def _settle_purge_veto(purge: StaleChildRowPurge, data: dict[str, Any]) ->
         await record_extraction(pool, version, sorted(purge.dead_lettered))
 
 
+async def _record_lost_seen_lists(purge: StaleChildRowPurge, data: dict[str, Any]) -> None:
+    """Record a seen-mode purge that a lost seen list skipped, as a dead-letter veto is recorded.
+
+    A list a crash emptied, or one started after the extraction began, cannot say what the
+    extraction saw, so the purge skipped it. Recording the list in ``purge_vetoed`` lets the
+    consecutive-veto alert count it: stale rows are not clearing.
+
+    Raises:
+        Exception: Whatever PostgreSQL raised. The caller requeues the signal; the purge is
+            already settled, so the retry only records again, and the record is a union.
+    """
+    pool = connection_pool
+    version = extraction_key(data)
+    if not purge.lost_lists or pool is None or version is None:
+        return
+    admission = write_admission
+    if admission is None:
+        raise DatabaseUnavailableError("Write admission not initialized")
+    async with admission.slot():
+        await record_extraction(pool, version, sorted(purge.lost_lists))
+
+
 async def _report_purge_vetoes() -> None:
     """Report how many extractions in a row vetoed the purge, and shout at the threshold.
 
@@ -1158,6 +1181,7 @@ async def _reconcile_deleted_child_rows(data_type: str, data: dict[str, Any]) ->
     try:
         await _settle_purge_veto(purge, data)
         await purge.purge()
+        await _record_lost_seen_lists(purge, data)
     except Exception as error:
         logger.error(
             "❌ Delete-reconciliation failed, requeueing extraction_complete",
@@ -1563,7 +1587,11 @@ async def main() -> None:
         if await reconciliation_columns_present(connection_pool, logger):
             if await purge_veto_column_present(connection_pool):
                 _persistence_writer.set_refresh_updated_at(True)
-                stale_row_purge = StaleChildRowPurge(connection_pool, logger, admission=write_admission)
+                # Shadow by default, narrowed to touch while the schema has no seen lists, so this
+                # loader can ship before the schema that carries them. See `_seen_lists`.
+                reload_mode = await resolve_reload_mode(connection_pool, logger, config.reload_mode)
+                _persistence_writer.set_reload_mode(reload_mode)
+                stale_row_purge = StaleChildRowPurge(connection_pool, logger, admission=write_admission, mode=reload_mode)
                 # The gauge lives in this process, so a restart must not read as the problem going away.
                 await _report_purge_vetoes()
             else:

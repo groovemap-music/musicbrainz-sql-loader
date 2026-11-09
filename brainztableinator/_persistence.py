@@ -1,44 +1,63 @@
 """Private PostgreSQL writes for normalized MusicBrainz records."""
 
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from psycopg.types.json import Jsonb
 
+from brainztableinator._seen_lists import EXTERNAL_LINK_SEEN_APPEND, RELATIONSHIP_SEEN_APPEND, ReloadMode
 
-# Both child-row upserts come in two spellings, chosen by whether the startup probe found
-# `updated_at`. The pair is written out rather than composed at the call site: the column
-# belongs to a table this loader never issues DDL against, so the statement that names it
-# must be a literal a reader can check against the schema, not a string assembled at runtime.
-#
-# The relationship conflict target is the relationships_natural_key contract in
-# database-schema; dates and attributes distinguish separate relationships. `updated_at` is
-# refreshed on every conflict, including the ones that change nothing else: it is the only
-# evidence that this run still saw the row, and `_reconciliation.StaleChildRowPurge` deletes
-# rows that lack it. Leaving it off a no-op conflict would make a live relationship look
-# stale and be purged.
-# The conflict target is the schema's `relationships_key` unique index: `musicbrainz.relationship_key(...)`
-# over the same eight values the old `relationships_natural_key` constraint covers, as one 32-byte hash.
-# PostgreSQL infers the index only when the expression and its arguments appear exactly as the index
-# declares them, so this text is the schema's, argument order included. Naming the index (not the
-# constraint) is what lets the schema drop that constraint, which carries a jsonb column per row, once
-# MusicBrainz is about to be enabled. Until then the constraint still rejects a row the hash calls new,
-# which only happens for a jsonb number written at two scales (`1` and `1.0`).
-_RELATIONSHIP_INSERT = (
-    "INSERT INTO musicbrainz.relationships "
-    "(source_mbid, source_entity_type, target_mbid, target_entity_type, relationship_type, attributes, begin_date, end_date, ended) "
-    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
-    "ON CONFLICT (musicbrainz.relationship_key("
-    "source_mbid, target_mbid, source_entity_type, target_entity_type, relationship_type, begin_date, end_date, attributes)) "
+
+# The relationship conflict target is database-schema's `musicbrainz.relationships_key` unique index:
+# `musicbrainz.relationship_key(...)`, one 32-byte hash over the eight values that identify a relationship
+# (both endpoints and their entity types, the relationship type, the date range and the attributes), so two
+# instances that differ only by dates or attributes are separate rows. PostgreSQL infers the index only when
+# the expression and its arguments appear exactly as the index declares them, so this text is the schema's,
+# argument order included, and so is the key the seen-mode UPDATE below matches on. The index replaced the
+# eight-column `relationships_natural_key` constraint, which database-schema retires before MusicBrainz is
+# enabled; while a schema still carries it, it also rejects a row the hash calls new, which only happens for
+# a jsonb number written at two scales (`1` and `1.0`).
+_RELATIONSHIP_KEY_COLUMNS = (
+    "musicbrainz.relationship_key("
+    "source_mbid, target_mbid, source_entity_type, target_entity_type, relationship_type, begin_date, end_date, attributes)"
 )
 
+_RELATIONSHIP_INSERT = (
+    "INSERT INTO musicbrainz.relationships "  # noqa: S608 -- module constants only
+    "(source_mbid, source_entity_type, target_mbid, target_entity_type, relationship_type, attributes, begin_date, end_date, ended) "
+    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+    f"ON CONFLICT ({_RELATIONSHIP_KEY_COLUMNS}) "
+)
+
+# Touch and shadow modes: every conflict refreshes `updated_at`, changed or not, because the touch
+# purge deletes the rows that lack the refresh. Both spellings are written out rather than composed
+# at the call site: the `False` one is for a schema whose probe found no `updated_at`, and the
+# column belongs to a table this loader never issues DDL against.
 RELATIONSHIP_UPSERTS: dict[bool, str] = {
     False: _RELATIONSHIP_INSERT + "DO UPDATE SET ended = EXCLUDED.ended",
     True: _RELATIONSHIP_INSERT + "DO UPDATE SET ended = EXCLUDED.ended, updated_at = NOW()",
 }
 
-# The external-link conflict target already covers every column, so the assignment to `url`
-# is a no-op; it is there so the clause is valid, and the refresh beside it is what marks
-# the link as still present this run.
+# Seen mode: the seen list is the evidence of a sighting, so an unchanged row is not written at all.
+# `ended` is the only column outside the key, so the UPDATE writes a row only when `ended` changed,
+# and the INSERT adds a row only when there is none. `ON CONFLICT ... DO UPDATE ... WHERE` would skip
+# the update but still lock the conflicting row, and the lock writes the tuple's `xmax`: every heap
+# page dirtied and logged whole after a checkpoint. A plain UPDATE locks only the rows its WHERE keeps
+# and `DO NOTHING` locks none, so an unchanged reload writes almost no WAL and no dead tuples
+# (database-schema docs/architecture.md, "MusicBrainz: the no-op check"). The parameters are `ended`,
+# the eight key values in `relationship_key`'s order, then `ended` again.
+RELATIONSHIP_SEEN_UPDATE = (
+    "UPDATE musicbrainz.relationships SET ended = %s, updated_at = NOW() "  # noqa: S608 -- module constants only
+    f"WHERE {_RELATIONSHIP_KEY_COLUMNS} = musicbrainz.relationship_key("
+    "%s::uuid, %s::uuid, %s::text, %s::text, %s::text, %s::text, %s::text, %s::jsonb) "
+    "AND ended IS DISTINCT FROM %s::boolean"
+)
+RELATIONSHIP_SEEN_INSERT = _RELATIONSHIP_INSERT + "DO NOTHING"
+
+# The external-link conflict target covers every column, so a conflict is always an unchanged row.
+# In touch and shadow modes the refresh of `updated_at` is what marks the link as still present (the
+# assignment to `url` is a no-op that keeps the clause valid without the column); in seen mode the
+# seen list does, and the insert does nothing on conflict.
 _EXTERNAL_LINK_INSERT = (
     "INSERT INTO musicbrainz.external_links "
     "(mbid, entity_type, url, service_name) "
@@ -50,22 +69,33 @@ EXTERNAL_LINK_UPSERTS: dict[bool, str] = {
     False: _EXTERNAL_LINK_INSERT + "DO UPDATE SET url = EXCLUDED.url",
     True: _EXTERNAL_LINK_INSERT + "DO UPDATE SET url = EXCLUDED.url, updated_at = NOW()",
 }
+EXTERNAL_LINK_SEEN_INSERT = _EXTERNAL_LINK_INSERT + "DO NOTHING"
 
 
-# The Identity Ledger's live half. A load that changes an existing row's Discogs id records the
-# change in `public.identity_link_events` in the same statement as the upsert, so the event
-# commits or rolls back with the row it describes and costs no second round trip.
+# Each entity write is one statement that skips an unchanged row without writing or locking it.
+# The MusicBrainz entity tables are not purged, so nothing reads their `updated_at` as evidence that
+# a reload saw the row, and rewriting an unchanged row only cost WAL, a dead tuple and, for
+# `musicbrainz.releases`, a pass through the identity ledger's capture trigger. `src` holds the
+# record's values once, typed as the table declares them. `updated` rewrites the row only when some
+# column differs from the stored one (`jsonb` compares semantically, so key order does not count as a
+# change), and `inserted` adds the row only when there is none: `ON CONFLICT DO NOTHING` takes no lock
+# on the existing row, where `DO UPDATE ... WHERE` would lock, dirty and log every page it skipped.
+# When the row exists and differs, `inserted` meets it (or the version `updated` just wrote) and does
+# nothing, so at most one of the two returns a row. Two messages inserting the same new MBID at once
+# both reach `DO NOTHING` after the first commits, and the second's values wait for the next reload;
+# both come from one extraction, so they carry the same record.
 #
-# Each upsert below is a three-part statement: `upsert` is the unchanged INSERT ... ON CONFLICT
-# with a RETURNING of the id it stored, `old` reads the id the row held, and the final INSERT
-# writes one event when the two differ. The parameters are the upsert's own, then the MBID
-# `old` looks up, then the `source_ref`. All three see one snapshot, so `old` is the id the row
-# held before this statement whatever `upsert` does. A brand-new row has no `old` row and the
-# join yields nothing, so it writes no event; an unchanged id compares equal and writes none; a
-# redelivered message finds its own id already stored and compares equal, which is what keeps
-# a reprocess from duplicating an event. The event kind is read off the two ids, matching the
-# table's `identity_link_events_link_matches_event` CHECK: no before id is an add, no after id a
-# removal, anything else a change.
+# The Identity Ledger's live half rides on the same statement. A load that changes an existing row's
+# Discogs id records the change in `public.identity_link_events`, so the event commits or rolls back
+# with the row it describes and costs no second round trip. `upsert` is the row `updated` or
+# `inserted` returned, `old` reads the id the row held, and the final INSERT writes one event when
+# the two differ. The parameters are `src`'s, then the MBID `old` looks up, then the `source_ref`.
+# Every part sees one snapshot, so `old` is the id the row held before this statement. A brand-new
+# row has no `old` row and the join yields nothing, so it writes no event; an unchanged row returns
+# nothing from either part and writes none; a redelivered message finds its own values stored and
+# writes none, which is what keeps a reprocess from duplicating an event. The event kind is read off
+# the two ids, matching the table's `identity_link_events_link_matches_event` CHECK: no before id is
+# an add, no after id a removal, anything else a change.
 #
 # `event_at` is `now()`, the load transaction's own start, which is how `dated_from =
 # 'groovemap_load'` dates an event. `ON CONFLICT ON CONSTRAINT identity_link_events_idempotence_key
@@ -76,10 +106,136 @@ EXTERNAL_LINK_UPSERTS: dict[bool, str] = {
 # release group, as `_record_processing.RELEASE_GROUP_ENTITY_KIND` states.
 #
 # `old` takes no row lock: a lock taken inside this statement could be skipped as
-# self-modified if `upsert` ran first, and taking it in a statement of its own would add the
+# self-modified if `updated` ran first, and taking it in a statement of its own would add the
 # round trip this design avoids. Two messages for one MBID racing in separate transactions can
 # therefore record the earlier one's stored id as the later one's `before`. Each message is one
 # transaction, so the one `event_at` per transaction never collides within the idempotence key.
+
+
+@dataclass(frozen=True)
+class _EntityTable:
+    """One MusicBrainz entity table: its columns as the schema types them, and its Discogs link."""
+
+    table: str
+    entity_kind: str
+    link_column: str
+    # (column, type), `mbid` first, in the order the writer's values arrive.
+    columns: tuple[tuple[str, str], ...]
+
+
+def _entity_write(entity: _EntityTable) -> str:
+    """Return the no-op-skipping write of one entity row, with its link-change event."""
+    names = [name for name, _type in entity.columns]
+    compared = [name for name in names if name != "mbid"]
+    link = entity.link_column
+    return (
+        f"WITH src ({', '.join(names)}) AS (VALUES ({', '.join(f'%s::{type_}' for _name, type_ in entity.columns)})), "  # noqa: S608 -- module constants only
+        f"old AS (SELECT {link} FROM {entity.table} WHERE mbid = %s), "
+        f"updated AS (UPDATE {entity.table} AS t SET {', '.join(f'{name} = src.{name}' for name in compared)}, updated_at = NOW() "
+        f"FROM src WHERE t.mbid = src.mbid "
+        f"AND ({', '.join(f't.{name}' for name in compared)}) IS DISTINCT FROM ({', '.join(f'src.{name}' for name in compared)}) "
+        f"RETURNING t.mbid, t.{link}), "
+        f"inserted AS (INSERT INTO {entity.table} ({', '.join(names)}) SELECT {', '.join(names)} FROM src "
+        f"ON CONFLICT (mbid) DO NOTHING RETURNING mbid, {link}), "
+        f"upsert AS (SELECT mbid, {link} FROM updated UNION ALL SELECT mbid, {link} FROM inserted) "
+        "INSERT INTO public.identity_link_events "
+        "(provider, entity_kind, external_id, event, discogs_id_before, discogs_id_after, event_at, dated_from, source_ref) "
+        f"SELECT 'musicbrainz', '{entity.entity_kind}', upsert.mbid::text, "
+        f"CASE WHEN old.{link} IS NULL THEN 'link_added' "
+        f"WHEN upsert.{link} IS NULL THEN 'link_removed' ELSE 'link_changed' END, "
+        f"old.{link}, upsert.{link}, NOW(), 'groovemap_load', %s "
+        "FROM upsert CROSS JOIN old "
+        f"WHERE old.{link} IS DISTINCT FROM upsert.{link} "
+        "ON CONFLICT ON CONSTRAINT identity_link_events_idempotence_key DO NOTHING"
+    )
+
+
+ARTIST_WRITE = _entity_write(
+    _EntityTable(
+        "musicbrainz.artists",
+        "artist",
+        "discogs_artist_id",
+        (
+            ("mbid", "uuid"),
+            ("name", "text"),
+            ("sort_name", "text"),
+            ("type", "text"),
+            ("gender", "text"),
+            ("begin_date", "text"),
+            ("end_date", "text"),
+            ("ended", "boolean"),
+            ("area", "text"),
+            ("begin_area", "text"),
+            ("end_area", "text"),
+            ("disambiguation", "text"),
+            ("discogs_artist_id", "bigint"),
+            ("aliases", "jsonb"),
+            ("tags", "jsonb"),
+            ("data", "jsonb"),
+            ("gm_item_id", "uuid"),
+        ),
+    )
+)
+
+LABEL_WRITE = _entity_write(
+    _EntityTable(
+        "musicbrainz.labels",
+        "label",
+        "discogs_label_id",
+        (
+            ("mbid", "uuid"),
+            ("name", "text"),
+            ("type", "text"),
+            ("label_code", "integer"),
+            ("begin_date", "text"),
+            ("end_date", "text"),
+            ("ended", "boolean"),
+            ("area", "text"),
+            ("disambiguation", "text"),
+            ("discogs_label_id", "bigint"),
+            ("data", "jsonb"),
+            ("gm_item_id", "uuid"),
+        ),
+    )
+)
+
+RELEASE_WRITE = _entity_write(
+    _EntityTable(
+        "musicbrainz.releases",
+        "release",
+        "discogs_release_id",
+        (
+            ("mbid", "uuid"),
+            ("name", "text"),
+            ("barcode", "text"),
+            ("status", "text"),
+            ("release_group_mbid", "uuid"),
+            ("discogs_release_id", "bigint"),
+            ("media", "jsonb"),
+            ("data", "jsonb"),
+            ("gm_item_id", "uuid"),
+        ),
+    )
+)
+
+RELEASE_GROUP_WRITE = _entity_write(
+    _EntityTable(
+        "musicbrainz.release_groups",
+        "master",
+        "discogs_master_id",
+        (
+            ("mbid", "uuid"),
+            ("name", "text"),
+            ("type", "text"),
+            ("secondary_types", "jsonb"),
+            ("first_release_date", "text"),
+            ("disambiguation", "text"),
+            ("discogs_master_id", "bigint"),
+            ("data", "jsonb"),
+            ("gm_item_id", "uuid"),
+        ),
+    )
+)
 
 
 class MusicBrainzWriter(Protocol):
@@ -109,14 +265,14 @@ class MusicBrainzWriter(Protocol):
 class PostgreSQLMusicBrainzWriter:
     """Execute the MusicBrainz schema's entity-specific write statements."""
 
-    def __init__(self, refresh_updated_at: bool = False) -> None:
-        # `updated_at` is not yet declared on musicbrainz.relationships or
-        # musicbrainz.external_links: groovemap-database-schema owns every DDL
-        # statement against them and is adding it under gm-database-schema-uvs. This
-        # loader issues no DDL, so the clause that refreshes the column is emitted
-        # only once a startup probe has seen it, and the service runs unchanged
-        # against the currently pinned schema. See `_reconciliation`.
+    def __init__(self, refresh_updated_at: bool = False, reload_mode: ReloadMode = ReloadMode.TOUCH) -> None:
+        # `updated_at` on musicbrainz.relationships and musicbrainz.external_links, and the
+        # `loader_seen` lists, belong to groovemap-database-schema, which owns every DDL
+        # statement against them. This loader issues no DDL, so the clauses that name them are
+        # emitted only once a startup probe has seen them, and the service runs unchanged
+        # against an older schema. See `_reconciliation` and `_seen_lists`.
         self._refresh_updated_at = refresh_updated_at
+        self._reload_mode = reload_mode
 
     @property
     def refresh_updated_at(self) -> bool:
@@ -127,139 +283,87 @@ class PostgreSQLMusicBrainzWriter:
         """Enable the refresh once the startup probe has found the column."""
         self._refresh_updated_at = enabled
 
+    @property
+    def reload_mode(self) -> ReloadMode:
+        """How child-row writes prove a row is still upstream: touch, shadow or seen."""
+        return self._reload_mode
+
+    def set_reload_mode(self, mode: ReloadMode) -> None:
+        """Set the mode the startup probe resolved; `touch` unless the schema carries the seen lists."""
+        self._reload_mode = mode
+
     async def upsert_artist(self, conn: Any, values: tuple[Any, ...], source_ref: str) -> None:
         params = (*values[:13], Jsonb(values[13]), Jsonb(values[14]), Jsonb(values[15]), values[16], values[0], source_ref)
         async with conn.cursor() as cursor:
-            await cursor.execute(
-                "WITH upsert AS ("
-                "INSERT INTO musicbrainz.artists "
-                "(mbid, name, sort_name, type, gender, begin_date, end_date, ended, "
-                "area, begin_area, end_area, disambiguation, discogs_artist_id, aliases, tags, data, gm_item_id) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
-                "ON CONFLICT (mbid) DO UPDATE SET "
-                "name = EXCLUDED.name, sort_name = EXCLUDED.sort_name, "
-                "type = EXCLUDED.type, gender = EXCLUDED.gender, "
-                "begin_date = EXCLUDED.begin_date, end_date = EXCLUDED.end_date, "
-                "ended = EXCLUDED.ended, area = EXCLUDED.area, "
-                "begin_area = EXCLUDED.begin_area, end_area = EXCLUDED.end_area, "
-                "disambiguation = EXCLUDED.disambiguation, "
-                "discogs_artist_id = EXCLUDED.discogs_artist_id, "
-                "aliases = EXCLUDED.aliases, tags = EXCLUDED.tags, "
-                "gm_item_id = EXCLUDED.gm_item_id, "
-                "data = EXCLUDED.data, updated_at = NOW() "
-                "RETURNING mbid, discogs_artist_id), "
-                "old AS (SELECT discogs_artist_id FROM musicbrainz.artists WHERE mbid = %s) "
-                "INSERT INTO public.identity_link_events "
-                "(provider, entity_kind, external_id, event, discogs_id_before, discogs_id_after, event_at, dated_from, source_ref) "
-                "SELECT 'musicbrainz', 'artist', upsert.mbid::text, "
-                "CASE WHEN old.discogs_artist_id IS NULL THEN 'link_added' "
-                "WHEN upsert.discogs_artist_id IS NULL THEN 'link_removed' ELSE 'link_changed' END, "
-                "old.discogs_artist_id, upsert.discogs_artist_id, NOW(), 'groovemap_load', %s "
-                "FROM upsert CROSS JOIN old "
-                "WHERE old.discogs_artist_id IS DISTINCT FROM upsert.discogs_artist_id "
-                "ON CONFLICT ON CONSTRAINT identity_link_events_idempotence_key DO NOTHING",
-                params,
-            )
+            await cursor.execute(ARTIST_WRITE, params)
 
     async def upsert_label(self, conn: Any, values: tuple[Any, ...], source_ref: str) -> None:
         params = (*values[:10], Jsonb(values[10]), values[11], values[0], source_ref)
         async with conn.cursor() as cursor:
-            await cursor.execute(
-                "WITH upsert AS ("
-                "INSERT INTO musicbrainz.labels "
-                "(mbid, name, type, label_code, begin_date, end_date, ended, area, disambiguation, discogs_label_id, data, gm_item_id) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
-                "ON CONFLICT (mbid) DO UPDATE SET "
-                "name = EXCLUDED.name, type = EXCLUDED.type, "
-                "label_code = EXCLUDED.label_code, "
-                "begin_date = EXCLUDED.begin_date, end_date = EXCLUDED.end_date, "
-                "ended = EXCLUDED.ended, area = EXCLUDED.area, "
-                "disambiguation = EXCLUDED.disambiguation, "
-                "discogs_label_id = EXCLUDED.discogs_label_id, "
-                "gm_item_id = EXCLUDED.gm_item_id, "
-                "data = EXCLUDED.data, updated_at = NOW() "
-                "RETURNING mbid, discogs_label_id), "
-                "old AS (SELECT discogs_label_id FROM musicbrainz.labels WHERE mbid = %s) "
-                "INSERT INTO public.identity_link_events "
-                "(provider, entity_kind, external_id, event, discogs_id_before, discogs_id_after, event_at, dated_from, source_ref) "
-                "SELECT 'musicbrainz', 'label', upsert.mbid::text, "
-                "CASE WHEN old.discogs_label_id IS NULL THEN 'link_added' "
-                "WHEN upsert.discogs_label_id IS NULL THEN 'link_removed' ELSE 'link_changed' END, "
-                "old.discogs_label_id, upsert.discogs_label_id, NOW(), 'groovemap_load', %s "
-                "FROM upsert CROSS JOIN old "
-                "WHERE old.discogs_label_id IS DISTINCT FROM upsert.discogs_label_id "
-                "ON CONFLICT ON CONSTRAINT identity_link_events_idempotence_key DO NOTHING",
-                params,
-            )
+            await cursor.execute(LABEL_WRITE, params)
 
     async def upsert_release(self, conn: Any, values: tuple[Any, ...], source_ref: str) -> None:
         params = (*values[:6], Jsonb(values[6]), Jsonb(values[7]), values[8], values[0], source_ref)
         async with conn.cursor() as cursor:
-            await cursor.execute(
-                "WITH upsert AS ("
-                "INSERT INTO musicbrainz.releases "
-                "(mbid, name, barcode, status, release_group_mbid, discogs_release_id, media, data, gm_item_id) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
-                "ON CONFLICT (mbid) DO UPDATE SET "
-                "name = EXCLUDED.name, barcode = EXCLUDED.barcode, "
-                "status = EXCLUDED.status, "
-                "release_group_mbid = EXCLUDED.release_group_mbid, "
-                "discogs_release_id = EXCLUDED.discogs_release_id, "
-                "media = EXCLUDED.media, "
-                "gm_item_id = EXCLUDED.gm_item_id, "
-                "data = EXCLUDED.data, updated_at = NOW() "
-                "RETURNING mbid, discogs_release_id), "
-                "old AS (SELECT discogs_release_id FROM musicbrainz.releases WHERE mbid = %s) "
-                "INSERT INTO public.identity_link_events "
-                "(provider, entity_kind, external_id, event, discogs_id_before, discogs_id_after, event_at, dated_from, source_ref) "
-                "SELECT 'musicbrainz', 'release', upsert.mbid::text, "
-                "CASE WHEN old.discogs_release_id IS NULL THEN 'link_added' "
-                "WHEN upsert.discogs_release_id IS NULL THEN 'link_removed' ELSE 'link_changed' END, "
-                "old.discogs_release_id, upsert.discogs_release_id, NOW(), 'groovemap_load', %s "
-                "FROM upsert CROSS JOIN old "
-                "WHERE old.discogs_release_id IS DISTINCT FROM upsert.discogs_release_id "
-                "ON CONFLICT ON CONSTRAINT identity_link_events_idempotence_key DO NOTHING",
-                params,
-            )
+            await cursor.execute(RELEASE_WRITE, params)
 
     async def upsert_release_group(self, conn: Any, values: tuple[Any, ...], source_ref: str) -> None:
         params = (*values[:3], Jsonb(values[3]), *values[4:7], Jsonb(values[7]), values[8], values[0], source_ref)
         async with conn.cursor() as cursor:
-            await cursor.execute(
-                "WITH upsert AS ("
-                "INSERT INTO musicbrainz.release_groups "
-                "(mbid, name, type, secondary_types, first_release_date, disambiguation, discogs_master_id, data, gm_item_id) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
-                "ON CONFLICT (mbid) DO UPDATE SET "
-                "name = EXCLUDED.name, type = EXCLUDED.type, "
-                "secondary_types = EXCLUDED.secondary_types, "
-                "first_release_date = EXCLUDED.first_release_date, "
-                "disambiguation = EXCLUDED.disambiguation, "
-                "discogs_master_id = EXCLUDED.discogs_master_id, "
-                "gm_item_id = EXCLUDED.gm_item_id, "
-                "data = EXCLUDED.data, updated_at = NOW() "
-                "RETURNING mbid, discogs_master_id), "
-                "old AS (SELECT discogs_master_id FROM musicbrainz.release_groups WHERE mbid = %s) "
-                "INSERT INTO public.identity_link_events "
-                "(provider, entity_kind, external_id, event, discogs_id_before, discogs_id_after, event_at, dated_from, source_ref) "
-                "SELECT 'musicbrainz', 'master', upsert.mbid::text, "
-                "CASE WHEN old.discogs_master_id IS NULL THEN 'link_added' "
-                "WHEN upsert.discogs_master_id IS NULL THEN 'link_removed' ELSE 'link_changed' END, "
-                "old.discogs_master_id, upsert.discogs_master_id, NOW(), 'groovemap_load', %s "
-                "FROM upsert CROSS JOIN old "
-                "WHERE old.discogs_master_id IS DISTINCT FROM upsert.discogs_master_id "
-                "ON CONFLICT ON CONSTRAINT identity_link_events_idempotence_key DO NOTHING",
-                params,
-            )
+            await cursor.execute(RELEASE_GROUP_WRITE, params)
 
     async def insert_relationships(self, conn: Any, rows: list[tuple[Any, ...]]) -> None:
+        """Write one message's relationships, then append every one of them to the seen list.
+
+        Each row is `(source_mbid, source_entity_type, target_mbid, target_entity_type,
+        relationship_type, attributes, begin_date, end_date, ended)`, already normalized to its
+        canonical direction. The append covers every row, changed or not: in shadow and seen
+        modes the list is what the purge reads as this extraction's sighting of the row.
+        """
         params = [(*row[:5], Jsonb(row[5]), *row[6:]) for row in rows]
         async with conn.cursor() as cursor:
-            await cursor.executemany(RELATIONSHIP_UPSERTS[self._refresh_updated_at], params)
+            if self._reload_mode.touches:
+                await cursor.executemany(RELATIONSHIP_UPSERTS[self._refresh_updated_at], params)
+            else:
+                await cursor.executemany(
+                    RELATIONSHIP_SEEN_UPDATE,
+                    [
+                        (ended, source, target, source_type, target_type, kind, begin, end, attributes, ended)
+                        for (source, source_type, target, target_type, kind, attributes, begin, end, ended) in params
+                    ],
+                )
+                await cursor.executemany(RELATIONSHIP_SEEN_INSERT, params)
+            if self._reload_mode.appends:
+                await cursor.execute(
+                    RELATIONSHIP_SEEN_APPEND,
+                    (
+                        [row[0] for row in params],
+                        [row[2] for row in params],
+                        [row[1] for row in params],
+                        [row[3] for row in params],
+                        [row[4] for row in params],
+                        [row[6] for row in params],
+                        [row[7] for row in params],
+                        [row[5] for row in params],
+                    ),
+                )
 
     async def insert_external_links(self, conn: Any, rows: list[tuple[Any, ...]]) -> None:
+        """Write one message's external links, then append every one of them to the seen list.
+
+        Each row is `(mbid, entity_type, url, service_name)`. The key function takes the link's
+        unique key in its own order, `(mbid, entity_type, service_name, url)`.
+        """
         async with conn.cursor() as cursor:
-            await cursor.executemany(EXTERNAL_LINK_UPSERTS[self._refresh_updated_at], rows)
+            if self._reload_mode.touches:
+                await cursor.executemany(EXTERNAL_LINK_UPSERTS[self._refresh_updated_at], rows)
+            else:
+                await cursor.executemany(EXTERNAL_LINK_SEEN_INSERT, rows)
+            if self._reload_mode.appends:
+                await cursor.execute(
+                    EXTERNAL_LINK_SEEN_APPEND,
+                    ([row[0] for row in rows], [row[1] for row in rows], [row[3] for row in rows], [row[2] for row in rows]),
+                )
 
     # ── The shared graph relations ───────────────────────────────────────────
     # Everything below writes into the `graph` schema rather than `musicbrainz`,
