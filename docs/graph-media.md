@@ -44,10 +44,12 @@ has not ingested yet, exactly as the enricher merges a target node as it writes 
 
 `graph.issued_on` is keyed on `(release_id, medium_id, source)`. The `source` column is in the
 key precisely so each loader's prune reaches only its own rows. This loader writes
-`source = 'musicbrainz'` as a delete-then-insert whose `DELETE` names both the release and the
-source, so a row `discogs-sql-loader` wrote under `source = 'discogs'` is never in range. A
-release whose media block no longer names a medium prunes to nothing rather than keeping a stale
-row.
+`source = 'musicbrainz'` as a diff against the stored range: it reads the release's stored
+`(medium_id, qty)` pairs for that source, then deletes only edges the release no longer names,
+inserts only new ones and updates a changed quantity. Every statement names both the release and
+the source, so a row `discogs-sql-loader` wrote under `source = 'discogs'` is never in range. An
+unchanged reload writes no edge row (no WAL, dead tuples or index churn), and a release whose media
+block no longer names a medium prunes to nothing rather than keeping a stale row.
 
 `graph.medium` and `graph.media_family` are one vocabulary shared across catalogs, so both go in
 with `ON CONFLICT DO NOTHING`. That mirrors the enricher's

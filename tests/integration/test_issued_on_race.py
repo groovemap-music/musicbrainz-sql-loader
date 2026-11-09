@@ -20,7 +20,6 @@ import pytest_asyncio
 from common import AsyncPostgreSQLPool
 from common.media import map_musicbrainz_release
 from groovemap_schema.postgres import create_postgres_schema
-from psycopg import errors
 from psycopg.conninfo import conninfo_to_dict
 
 from brainztableinator._persistence import PostgreSQLMusicBrainzWriter
@@ -121,5 +120,41 @@ async def test_a_duplicate_inside_one_records_rows_still_fails(database_url: str
     async with await psycopg.AsyncConnection.connect(database_url) as conn:
         await conn.set_autocommit(False)
         rows = [(RELEASE_ID, "optical_cd", "musicbrainz", 1), (RELEASE_ID, "optical_cd", "musicbrainz", 2)]
-        with pytest.raises(errors.UniqueViolation):
+        with pytest.raises(ValueError, match="duplicate medium"):
             await PostgreSQLMusicBrainzWriter().replace_release_media_edges(conn, RELEASE_ID, "musicbrainz", rows)
+
+
+async def _write(url: str, media: list[dict[str, Any]]) -> None:
+    async with await psycopg.AsyncConnection.connect(url) as conn:
+        await _processor().process_release(conn, _record(MBID_FIRST, media))
+        await conn.commit()
+
+
+async def _edge_versions(url: str) -> dict[str, str]:
+    """Each stored edge's `xmin`: a row that was rewritten carries a new one."""
+    async with await psycopg.AsyncConnection.connect(url) as conn, conn.cursor() as cursor:
+        await cursor.execute("SELECT medium_id, xmin::text FROM graph.issued_on WHERE release_id = %s AND source = 'musicbrainz'", (RELEASE_ID,))
+        return {row[0]: row[1] for row in await cursor.fetchall()}
+
+
+async def test_an_unchanged_reload_rewrites_no_edge_and_a_changed_one_touches_only_the_difference(database_url: str) -> None:
+    await _write(database_url, [{"format": "CD"}, {"format": '12" Vinyl'}])
+    first = await _edge_versions(database_url)
+    assert set(first) == {"optical_cd", "vinyl_12"}
+
+    # Unchanged: every edge row keeps the transaction that wrote it, so nothing was rewritten.
+    await _write(database_url, [{"format": "CD"}, {"format": '12" Vinyl'}])
+    assert await _edge_versions(database_url) == first
+
+    # Changed: the vinyl edge is removed, a second CD changes a quantity, a cassette is added.
+    await _write(database_url, [{"format": "CD"}, {"format": "CD"}, {"format": "Cassette"}])
+    after = await _edge_versions(database_url)
+    assert await _edges(database_url) == [("optical_cd", 2), ("tape_cassette", 1)]
+    assert "vinyl_12" not in after
+    assert after["optical_cd"] != first["optical_cd"]
+
+    # Unchanged again, and a release that lost every medium ends with no edge at all.
+    await _write(database_url, [{"format": "CD"}, {"format": "CD"}, {"format": "Cassette"}])
+    assert await _edge_versions(database_url) == after
+    await _write(database_url, [])
+    assert await _edges(database_url) == []

@@ -261,28 +261,81 @@ async def test_the_stored_media_block_and_the_media_rows_describe_the_same_media
 # ── The statements ───────────────────────────────────────────────────────────
 
 
+def _statements(mock_cursor: Any) -> dict[str, Any]:
+    """Every executemany call by statement verb, so a test names what was and was not written."""
+    return {call.args[0].split()[0]: call.args[1] for call in mock_cursor.executemany.await_args_list}
+
+
 @pytest.mark.asyncio
-async def test_the_prune_names_both_the_release_and_the_source(mock_connection: Any, mock_cursor: Any) -> None:
-    # `source` is in the primary key of `graph.issued_on` so that this DELETE cannot reach a
-    # row `discogs-sql-loader` wrote. A prune that named only the release would delete them.
+async def test_the_stored_edges_are_read_by_release_and_source(mock_connection: Any, mock_cursor: Any) -> None:
+    # `source` is in the primary key of `graph.issued_on` so that the range cannot reach a row
+    # `discogs-sql-loader` wrote. A read or delete that named only the release would.
     await PostgreSQLMusicBrainzWriter().replace_release_media_edges(mock_connection, "4242", "musicbrainz", [])
 
-    sql, params = mock_cursor.execute.await_args.args
-    assert sql == "DELETE FROM graph.issued_on WHERE release_id = %s AND source = %s"
+    sql, params = mock_cursor.execute.await_args_list[1].args
+    assert sql == "SELECT medium_id, qty FROM graph.issued_on WHERE release_id = %s AND source = %s"
     assert params == ("4242", "musicbrainz")
     mock_cursor.executemany.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_the_edges_are_inserted_after_the_prune_with_no_conflict_clause(mock_connection: Any, mock_cursor: Any) -> None:
+async def test_an_unchanged_release_writes_no_edge_row(mock_connection: Any, mock_cursor: Any) -> None:
+    mock_cursor.fetchall.return_value = [("optical_cd", 2), ("vinyl_12", 1)]
+    rows = [("4242", "optical_cd", "musicbrainz", 2), ("4242", "vinyl_12", "musicbrainz", 1)]
+
+    await PostgreSQLMusicBrainzWriter().replace_release_media_edges(mock_connection, "4242", "musicbrainz", rows)
+
+    mock_cursor.executemany.assert_not_awaited()
+    assert [call.args[0].split()[0] for call in mock_cursor.execute.await_args_list] == ["SELECT", "SELECT"]
+
+
+@pytest.mark.asyncio
+async def test_a_changed_release_writes_only_added_removed_and_requantified_edges(mock_connection: Any, mock_cursor: Any) -> None:
+    mock_cursor.fetchall.return_value = [("optical_cd", 2), ("vinyl_12", 1), ("cassette", 1)]
+    rows = [
+        ("4242", "optical_cd", "musicbrainz", 2),  # unchanged
+        ("4242", "vinyl_12", "musicbrainz", 3),  # quantity changed
+        ("4242", "digital", "musicbrainz", 1),  # added
+    ]
+
+    await PostgreSQLMusicBrainzWriter().replace_release_media_edges(mock_connection, "4242", "musicbrainz", rows)
+
+    written = _statements(mock_cursor)
+    assert written["DELETE"] == [("4242", "musicbrainz", "cassette")]
+    assert written["UPDATE"] == [(3, "4242", "vinyl_12", "musicbrainz")]
+    assert written["INSERT"] == [("4242", "digital", "musicbrainz", 1)]
+    sqls = [call.args[0] for call in mock_cursor.executemany.await_args_list]
+    assert "DELETE FROM graph.issued_on WHERE release_id = %s AND source = %s AND medium_id = %s" in sqls
+    assert all("ON CONFLICT" not in sql for sql in sqls)
+
+
+@pytest.mark.asyncio
+async def test_a_release_that_lost_all_its_media_prunes_every_stored_edge(mock_connection: Any, mock_cursor: Any) -> None:
+    mock_cursor.fetchall.return_value = [("optical_cd", 2)]
+
+    await PostgreSQLMusicBrainzWriter().replace_release_media_edges(mock_connection, "4242", "musicbrainz", [])
+
+    assert _statements(mock_cursor) == {"DELETE": [("4242", "musicbrainz", "optical_cd")]}
+
+
+@pytest.mark.asyncio
+async def test_a_new_release_inserts_every_edge(mock_connection: Any, mock_cursor: Any) -> None:
     rows = [("4242", "optical_cd", "musicbrainz", 2)]
 
     await PostgreSQLMusicBrainzWriter().replace_release_media_edges(mock_connection, "4242", "musicbrainz", rows)
 
-    sql, params = mock_cursor.executemany.await_args.args
-    assert sql == "INSERT INTO graph.issued_on (release_id, medium_id, source, qty) VALUES (%s, %s, %s, %s)"
-    assert params == rows
-    assert "ON CONFLICT" not in sql
+    assert _statements(mock_cursor) == {"INSERT": rows}
+
+
+@pytest.mark.asyncio
+async def test_a_duplicate_medium_in_one_records_rows_fails_before_any_write(mock_connection: Any, mock_cursor: Any) -> None:
+    rows = [("4242", "optical_cd", "musicbrainz", 1), ("4242", "optical_cd", "musicbrainz", 2)]
+
+    with pytest.raises(ValueError, match="duplicate medium"):
+        await PostgreSQLMusicBrainzWriter().replace_release_media_edges(mock_connection, "4242", "musicbrainz", rows)
+
+    mock_cursor.execute.assert_not_awaited()
+    mock_cursor.executemany.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -337,7 +390,7 @@ async def test_the_edges_are_written_under_a_transaction_scoped_lock_on_the_rang
     first_sql, first_params = mock_cursor.execute.await_args_list[0].args
     assert "pg_advisory_xact_lock" in first_sql
     assert first_params == ("graph.issued_on:musicbrainz:4242",)
-    assert mock_cursor.execute.await_args_list[1].args[0].startswith("DELETE FROM graph.issued_on")
+    assert mock_cursor.execute.await_args_list[1].args[0].startswith("SELECT medium_id, qty FROM graph.issued_on")
 
 
 @pytest.mark.asyncio
