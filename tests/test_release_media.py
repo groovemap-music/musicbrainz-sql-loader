@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from common.media import map_musicbrainz_release
 
-from brainztableinator._persistence import PostgreSQLMusicBrainzWriter
+from brainztableinator._persistence import DuplicateMediumError, PostgreSQLMusicBrainzWriter
 from brainztableinator._record_processing import MEDIA_SOURCE, MusicBrainzRecordProcessor, media_edge_rows
 
 
@@ -331,7 +331,7 @@ async def test_a_new_release_inserts_every_edge(mock_connection: Any, mock_curso
 async def test_a_duplicate_medium_in_one_records_rows_fails_before_any_write(mock_connection: Any, mock_cursor: Any) -> None:
     rows = [("4242", "optical_cd", "musicbrainz", 1), ("4242", "optical_cd", "musicbrainz", 2)]
 
-    with pytest.raises(ValueError, match="duplicate medium"):
+    with pytest.raises(DuplicateMediumError, match="duplicate medium"):
         await PostgreSQLMusicBrainzWriter().replace_release_media_edges(mock_connection, "4242", "musicbrainz", rows)
 
     mock_cursor.execute.assert_not_awaited()

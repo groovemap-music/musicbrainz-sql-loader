@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from psycopg.errors import DataError
 from psycopg.types.json import Jsonb
 
 from brainztableinator._seen_lists import EXTERNAL_LINK_SEEN_APPEND, RELATIONSHIP_SEEN_APPEND, ReloadMode
@@ -110,6 +111,15 @@ EXTERNAL_LINK_SEEN_INSERT = _EXTERNAL_LINK_INSERT + "DO NOTHING"
 # round trip this design avoids. Two messages for one MBID racing in separate transactions can
 # therefore record the earlier one's stored id as the later one's `before`. Each message is one
 # transaction, so the one `event_at` per transaction never collides within the idempotence key.
+
+
+class DuplicateMediumError(DataError):
+    """One record named the same medium twice for one release: a verdict on the record.
+
+    A `DataError`, so the delivery classifier dead-letters it at once, exactly as the
+    `UniqueViolation` the old insert raised was dead-lettered, instead of requeueing a
+    record that can never succeed.
+    """
 
 
 @dataclass(frozen=True)
@@ -446,13 +456,13 @@ class PostgreSQLMusicBrainzWriter:
 
         The insert is a plain `INSERT`, with no conflict clause: a medium in `rows` that is not
         stored is new, and `media_edge_rows` yields one row per medium. A duplicate medium in
-        `rows` is a derivation bug, and it fails with `ValueError` rather than quietly discarding
+        `rows` is a derivation bug, and it fails with `DuplicateMediumError` rather than quietly discarding
         the quantity the second row carried.
         """
         wanted: dict[str, int] = {}
         for _release_id, medium_id, _source, qty in rows:
             if medium_id in wanted:
-                raise ValueError(f"duplicate medium {medium_id!r} in the edges of release {release_id!r}")
+                raise DuplicateMediumError(f"duplicate medium {medium_id!r} in the edges of release {release_id!r}")
             wanted[medium_id] = qty
         await self.lock_release_media(conn, release_id, source)
         async with conn.cursor() as cursor:

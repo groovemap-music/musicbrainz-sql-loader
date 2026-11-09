@@ -22,7 +22,7 @@ from common.media import map_musicbrainz_release
 from groovemap_schema.postgres import create_postgres_schema
 from psycopg.conninfo import conninfo_to_dict
 
-from brainztableinator._persistence import PostgreSQLMusicBrainzWriter
+from brainztableinator._persistence import DuplicateMediumError, PostgreSQLMusicBrainzWriter
 from brainztableinator._record_processing import MusicBrainzRecordProcessor
 
 
@@ -120,7 +120,7 @@ async def test_a_duplicate_inside_one_records_rows_still_fails(database_url: str
     async with await psycopg.AsyncConnection.connect(database_url) as conn:
         await conn.set_autocommit(False)
         rows = [(RELEASE_ID, "optical_cd", "musicbrainz", 1), (RELEASE_ID, "optical_cd", "musicbrainz", 2)]
-        with pytest.raises(ValueError, match="duplicate medium"):
+        with pytest.raises(DuplicateMediumError, match="duplicate medium"):
             await PostgreSQLMusicBrainzWriter().replace_release_media_edges(conn, RELEASE_ID, "musicbrainz", rows)
 
 

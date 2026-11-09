@@ -1247,6 +1247,55 @@ class TestOnDataMessage:
 
             mock_message.nack.assert_called_once_with(requeue=True)
 
+    @pytest.mark.asyncio
+    async def test_duplicate_medium_record_is_dead_lettered_like_the_unique_violation_it_replaced(self):
+        """A record whose edges name one medium twice goes through the real writer and handler.
+
+        It must settle as a deterministic rejection (nack, requeue=False, so the broker
+        dead-letters it): never acked, never requeued, and the handler returns instead of
+        raising so the consumer keeps running. A requeue would retry a record that cannot
+        succeed until the requeue budget is spent.
+        """
+        from brainztableinator._persistence import PostgreSQLMusicBrainzWriter
+
+        mock_message = AsyncMock()
+        mock_message.body = b'{"id": "550e8400-e29b-41d4-a716-446655440000", "name": "Test"}'
+        mock_message.headers = {}
+
+        mock_cursor = AsyncMock()
+        mock_cursor.__aenter__.return_value = mock_cursor
+        mock_cursor.fetchall.return_value = []
+        mock_conn = AsyncMock()
+        mock_conn.cursor = MagicMock(return_value=mock_cursor)
+        mock_conn.transaction = MagicMock(return_value=AsyncMock())
+        mock_conn_cm = AsyncMock()
+        mock_conn_cm.__aenter__ = AsyncMock(return_value=mock_conn)
+        mock_conn_cm.__aexit__ = AsyncMock(return_value=None)
+        mock_pool = MagicMock()
+        mock_pool.connection = MagicMock(return_value=mock_conn_cm)
+
+        async def process(conn, _data):
+            rows = [("4242", "optical_cd", "musicbrainz", 1), ("4242", "optical_cd", "musicbrainz", 2)]
+            await PostgreSQLMusicBrainzWriter().replace_release_media_edges(conn, "4242", "musicbrainz", rows)
+
+        with (
+            patch("brainztableinator.brainztableinator.shutdown_requested", False),
+            patch("brainztableinator.brainztableinator.completed_files", set()),
+            patch("brainztableinator.brainztableinator.connection_pool", mock_pool),
+            patch("brainztableinator.brainztableinator.message_counts", {"artists": 0, "labels": 0, "release-groups": 0, "releases": 0}),
+            patch(
+                "brainztableinator.brainztableinator.last_message_time",
+                {"artists": 0.0, "labels": 0.0, "release-groups": 0.0, "releases": 0.0},
+            ),
+            patch.dict("brainztableinator.brainztableinator.PROCESSORS", {"releases": process}),
+        ):
+            result = await on_data_message(mock_message, "releases")
+
+        mock_message.nack.assert_called_once_with(requeue=False)
+        mock_message.ack.assert_not_called()
+        assert result.settlement.name == "REJECT"
+        mock_cursor.executemany.assert_not_awaited()
+
 
 # ===========================================================================
 # make_data_handler tests
