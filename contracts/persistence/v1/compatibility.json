@@ -206,6 +206,7 @@
     "owner": "database-schema declares DDL; each loader owns only its discriminator's rows",
     "semantics": "The future loader commits the final signal and pending job before acknowledging its delivery. It scans due and expired jobs at startup and periodically, claims transactionally with row locking, and fences on both lease token/epoch and the per-loader cursor at the refresh transaction's commit. Refresh, latch stamp, and completed state commit atomically. A failure rolls back or schedules bounded retry; a superseded generation cannot stamp refreshed_at. No delivery may be acknowledged while its sole refresh obligation is in process memory.",
     "rollout": "Schema first. Existing latch rows have NULL generation and remain readable by the current inline writer; the loader cutover must reconcile any unfinished legacy latch before acknowledging a terminal signal under the new protocol. Neither relation schedules work until a loader adopts it. Reverting the loader to inline behavior is safe while retaining these additive objects.",
+    "musicbrainz_job": "A public.loader_derived_refresh_job row with loader = 'musicbrainz' is accepted: no CHECK restricts loader, and the latch foreign key reaches the loader's own loader_extraction_latch row. musicbrainz-sql-loader runs graph.refresh_artist_member_of() then graph.refresh_vertex_degree() in that job's refresh transaction.",
     "failure_visibility": "The loader must expose pending age, current and last completed versions, attempt count, lease expiry, retry due, sanitized last failure, and superseded count; the schema stores these facts but does not report health itself."
   },
   "identity_link_events": {
@@ -681,7 +682,14 @@
       "kind": "additive",
       "note": "Neo4j holds a Discogs band membership and a MusicBrainz member-of-band assertion in one MEMBER_OF relationship space, so shortestPath traverses both without knowing which is which. On the relational side they are two relations in two key spaces: graph.member_of is Discogs-only and keyed on Discogs artist ids, while the MusicBrainz half lives in musicbrainz.relationships keyed on MBIDs and reaches a Discogs id only through musicbrainz.artists.discogs_artist_id. Spike gm-database-schema-gkt.1 measured 22,577 Discogs rows against 36,189 MusicBrainz ones, so 61.6% of that edge class is MusicBrainz provenance and a traversal over graph.member_of alone returns different paths from the Cypher it replaces. This relation resolves the crossing once at build time, with source in the key so the same membership asserted by both providers is two rows rather than a collision. It binds no property-graph label: a second artist-to-artist edge label overlapping member_of would double-count every Discogs membership in a pattern that matched both. The refresh is truncate-and-insert, so it converges in both directions and reports a row count per provenance; discogs-sql-loader calls it on the extraction_complete latch it already handles, the same latch the counter relations are recomputed on.",
       "refresh_latch": "extraction_complete",
+      "refresh_lock": {
+        "kind": "pg_advisory_xact_lock",
+        "key": "hashtextextended('graph.refresh_artist_member_of', 0)",
+        "meaning": "The function takes this transaction-scoped advisory lock before TRUNCATE, so two loaders refreshing at once queue and each rebuilds from the sources as the other left them."
+      },
+      "refresh_order": ["graph.refresh_artist_member_of", "graph.refresh_vertex_degree"],
       "refresh_owner": "discogs-sql-loader",
+      "refresh_owners": ["discogs-sql-loader", "musicbrainz-sql-loader"],
       "relation": "graph.artist_member_of",
       "reverse_index": "(group_artist_id, member_artist_id)",
       "sources": [
@@ -1069,7 +1077,14 @@
       "kind": "additive",
       "note": "One bigint per vertex of the path traversal surface, holding its undirected degree. It decides expansion order only - which side of a bidirectional search to expand next, and which vertex of that side's frontier to expand first - and changes no answer. Spike gm-database-schema-gkt.1 measured the distance-5 variance falling from 1,774 ms to 334 ms with it and unchanged answers; it does not help distance 6 and made it slightly worse, so it is a variance reducer rather than a fix. It is 97 MB at catalog scale against the 1,649 MB spike gm-database-schema-9c8.3 priced for a dense adjacency copy. kind is a one-byte discriminator rather than a prefix on the key because the pathfinder's node identity is the pair and an equality on a concatenated token cannot use the edge tables' text indexes. Only a vertex carrying an edge has a row; a lookup that misses reads as degree zero. A membership both provenances assert counts twice, because graph.artist_member_of carries source in its key and an expansion of that vertex really does scan two rows. It binds no property-graph label: it is an ordering heuristic for the path functions, not a property of any Neo4j node. The refresh is truncate-and-insert, so it converges in both directions and reports a row count per vertex kind; discogs-sql-loader calls it on the extraction_complete latch it already handles, the same latch the counter relations are recomputed on and after graph.refresh_artist_member_of, which writes one of the ten relations it sums.",
       "refresh_latch": "extraction_complete",
+      "refresh_lock": {
+        "kind": "pg_advisory_xact_lock",
+        "key": "hashtextextended('graph.refresh_vertex_degree', 0)",
+        "meaning": "The function takes this transaction-scoped advisory lock before TRUNCATE, so two loaders refreshing at once queue and each rebuilds from the sources as the other left them."
+      },
+      "refresh_order": ["graph.refresh_artist_member_of", "graph.refresh_vertex_degree"],
       "refresh_owner": "discogs-sql-loader",
+      "refresh_owners": ["discogs-sql-loader", "musicbrainz-sql-loader"],
       "relation": "graph.vertex_degree",
       "sources": [
         "graph.by_artist",
