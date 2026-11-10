@@ -3,6 +3,24 @@
 All notable changes to this repository will be recorded here by Commitizen from
 Conventional Commits.
 
+## v0.8.0 (2026-11-10)
+
+### Release notes
+
+Needs database-schema 0.14.0: apply it first, with the loaders stopped. When a MusicBrainz extraction completes, the loader now runs `graph.refresh_artist_member_of()` and then `graph.refresh_vertex_degree()` in one transaction, right after the delete reconciliation. It records the job in `loader_derived_refresh_job` with `loader='musicbrainz'`. On an older schema, a Discogs refresh and a MusicBrainz refresh could interleave their `TRUNCATE`s, because those schemas lack the refresh lock. A failed refresh is marked retry and its `extraction_complete` is requeued. An unchanged release reload no longer rewrites its `issued_on` edges: in 20,000 unchanged reloads, WAL fell from 17.4 MB to 120 B and dead tuples from 27,826 to 0. A record with a duplicate medium is now dead-lettered, not requeued forever. Seen-mode behavior is unchanged (shadow by default).
+
+### Feat
+
+- **graph**: refresh artist_member_of and vertex_degree when a MusicBrainz extraction completes
+
+### Fix
+
+- **graph**: dead-letter a duplicate-medium record like the unique violation it replaced
+
+### Perf
+
+- **graph**: write only the changed media edges of a release
+
 ## v0.7.0 (2026-11-09)
 
 ### Release notes
