@@ -52,7 +52,11 @@ schedule its consumer for cancellation after a configurable grace period. The pr
 publishes the version-level `extraction_complete` signal to all four exchanges. Once all
 four streams have delivered it for the same extraction, the loader removes the
 `musicbrainz.relationships` and `musicbrainz.external_links` rows that extraction did not
-refresh, behind dead-letter, record-count, and delete-fraction guards. A graceful
+refresh, behind dead-letter, record-count, and delete-fraction guards. Right after
+that purge it rebuilds `graph.artist_member_of` and then `graph.vertex_degree` in one transaction and
+records the job in `public.loader_derived_refresh_job` (`loader = 'musicbrainz'`), once per extraction;
+a failed pass is marked `retry` and the signal is requeued. The refresh functions take an advisory lock,
+so a concurrent Discogs refresh queues instead of interleaving. A graceful
 shutdown cancels subscriptions before closing the connection; a delivery that reaches the
 shutdown guard is left unsettled so RabbitMQ can redeliver it once after restart. Completion
 state is intentionally in memory, while records and queues remain durable.

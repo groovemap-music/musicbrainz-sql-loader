@@ -43,6 +43,7 @@ from opentelemetry.trace import SpanKind, Status, StatusCode
 from orjson import loads
 from psycopg.errors import DataError, IntegrityError, InterfaceError, OperationalError
 
+from brainztableinator._derived_refresh import derived_refresh_available, refresh_derived_relations
 from brainztableinator._persistence import PostgreSQLMusicBrainzWriter
 from brainztableinator._purge_veto import (
     consecutive_vetoes,
@@ -540,6 +541,7 @@ _lifecycle_cleanup_uncertain = False
 # read from the database clock. None until then, which is what makes every consumer of
 # it a no-op in the unit suite and in any process that never reached a live database.
 stale_row_purge: StaleChildRowPurge | None = None
+derived_refresh_enabled: bool = False
 
 rabbitmq_manager: Any = None  # Will hold AsyncResilientRabbitMQ instance
 active_connection: Any = None
@@ -1128,6 +1130,30 @@ async def _record_lost_seen_lists(purge: StaleChildRowPurge, data: dict[str, Any
         await record_extraction(pool, version, sorted(purge.lost_lists))
 
 
+async def _refresh_derived_graph(data: dict[str, Any]) -> bool:
+    """Rebuild ``graph.artist_member_of`` then ``graph.vertex_degree`` for a completed extraction.
+
+    Runs after the purge, so the rebuild sees the rows the reconciliation left. Returns ``False``
+    only when the refresh failed, which is the case the signal must be requeued for: the job is
+    already recorded as ``retry`` and a redelivery runs the same pass again.
+    """
+    pool = connection_pool
+    admission = write_admission
+    version = extraction_key(data)
+    if not derived_refresh_enabled or pool is None or admission is None:
+        return True
+    if version is None:
+        logger.warning("⚠️ extraction_complete carried no version or started_at — derived graph refresh skipped")
+        return True
+    try:
+        async with admission.slot():
+            await refresh_derived_relations(pool, logger, version)
+    except Exception as error:
+        logger.error("❌ Derived graph refresh failed, requeueing extraction_complete", version=version, error=str(error))
+        return False
+    return True
+
+
 async def _report_purge_vetoes() -> None:
     """Report how many extractions in a row vetoed the purge, and shout at the threshold.
 
@@ -1187,6 +1213,8 @@ async def _reconcile_deleted_child_rows(data_type: str, data: dict[str, Any]) ->
             "❌ Delete-reconciliation failed, requeueing extraction_complete",
             error=str(error),
         )
+        return False
+    if not await _refresh_derived_graph(data):
         return False
     outage_backoff.reset()
     await _report_purge_vetoes()
@@ -1456,7 +1484,7 @@ async def _close_pool_and_health(health_server: HealthServer) -> None:
 
 async def _dispose_retained_delivery_lifecycle() -> bool:
     """Close the broker, drain shared work, then release this lifespan's pool."""
-    global connection_pool, write_admission, stale_row_purge, _lifecycle_cleanup_uncertain
+    global connection_pool, write_admission, stale_row_purge, derived_refresh_enabled, _lifecycle_cleanup_uncertain
 
     broker_closed = await close_rabbitmq_connection()
     admission = write_admission
@@ -1495,6 +1523,7 @@ async def main() -> None:
         connection_check_task, \
         consumer_watch_started_at, \
         stale_row_purge, \
+        derived_refresh_enabled, \
         _lifecycle_cleanup_uncertain
 
     if (
@@ -1583,6 +1612,13 @@ async def main() -> None:
     # `stale_row_purge` None, so every call site no-ops, the upserts emit no reference to
     # a column the schema has not declared, and the loader keeps loading either way.
     stale_row_purge = None
+    derived_refresh_enabled = False
+    try:
+        derived_refresh_enabled = await derived_refresh_available(connection_pool)
+        if not derived_refresh_enabled:
+            logger.warning("⚠️ Derived graph refresh disabled — the schema lacks the refresh job relations or functions; loading continues")
+    except Exception as e:
+        logger.error("❌ Derived graph refresh unavailable this run", error=str(e))
     try:
         if await reconciliation_columns_present(connection_pool, logger):
             if await purge_veto_column_present(connection_pool):
